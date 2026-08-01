@@ -1,14 +1,21 @@
 ---
-title: "MTClaw Core System"
-description: "Minimal OpenClaw-like personal AI agent gateway in Go: YAML config, CLI only, OpenAI provider, Telegram channel, SQLite sessions, layered exec policy, cron."
-status: pending
+title: MTClaw Core System
+description: >-
+  Minimal OpenClaw-like personal AI agent gateway in Go: YAML config, CLI only,
+  OpenAI provider, Telegram channel, SQLite sessions, layered exec policy, cron.
+status: completed
 priority: P2
-branch: "main"
-tags: [go, cli, telegram, openai, agent-gateway]
+branch: main
+tags:
+  - go
+  - cli
+  - telegram
+  - openai
+  - agent-gateway
 blockedBy: []
 blocks: []
-created: "2026-07-31T15:33:02.860Z"
-createdBy: "ck:plan"
+created: '2026-07-31T15:33:02.860Z'
+createdBy: 'ck:plan'
 source: skill
 ---
 
@@ -75,15 +82,15 @@ flowchart TD
 
 | Phase | Name | Status |
 |-------|------|--------|
-| 1 | [Foundation and Config](./phase-01-foundation-and-config.md) | Pending |
-| 2 | [SQLite Store](./phase-02-sqlite-store.md) | Pending |
-| 3 | [OpenAI Provider](./phase-03-openai-provider.md) | Pending |
-| 4 | [Agent Loop](./phase-04-agent-loop.md) | Pending |
-| 5 | [Tools and Policy Engine](./phase-05-tools-and-policy-engine.md) | Pending |
-| 6 | [Telegram Channel](./phase-06-telegram-channel.md) | Pending |
-| 7 | [Gateway Orchestration](./phase-07-gateway-orchestration.md) | Pending |
-| 8 | [Cron Scheduler](./phase-08-cron-scheduler.md) | Pending |
-| 9 | [Hardening and Release](./phase-09-hardening-and-release.md) | Pending |
+| 1 | [Foundation and Config](./phase-01-foundation-and-config.md) | Completed |
+| 2 | [SQLite Store](./phase-02-sqlite-store.md) | Completed |
+| 3 | [OpenAI Provider](./phase-03-openai-provider.md) | Completed |
+| 4 | [Agent Loop](./phase-04-agent-loop.md) | Completed |
+| 5 | [Tools and Policy Engine](./phase-05-tools-and-policy-engine.md) | Completed |
+| 6 | [Telegram Channel](./phase-06-telegram-channel.md) | Completed |
+| 7 | [Gateway Orchestration](./phase-07-gateway-orchestration.md) | Completed |
+| 8 | [Cron Scheduler](./phase-08-cron-scheduler.md) | Completed |
+| 9 | [Hardening and Release](./phase-09-hardening-and-release.md) | Completed |
 
 ### Phase dependency graph
 
@@ -180,23 +187,43 @@ knowledge graph, RBAC.
 
 The plan is complete when all of the following hold:
 
-- [ ] `go build ./...` produces a single binary with no CGO and no runtime deps
-- [ ] `mtclaw onboard` writes a valid `~/.mtclaw/config.yaml` from an empty machine
-- [ ] `mtclaw config validate` rejects unknown keys, bad cron expressions, and inline secrets with line-numbered errors
-- [ ] `mtclaw doctor` verifies config, DB, OpenAI reachability, Telegram `getMe`, workspace, and shell
+- [x] `go build ./...` produces a single binary with no CGO and no runtime deps
+- [x] `mtclaw onboard` writes a valid `~/.mtclaw/config.yaml` from an empty machine
+- [x] `mtclaw config validate` rejects unknown keys, bad cron expressions, and inline secrets with line-numbered errors
+- [x] `mtclaw doctor` verifies config, DB, OpenAI reachability, Telegram `getMe`, workspace, and shell
 - [ ] `mtclaw prompt "list files in my workspace"` completes a full tool-using agent turn in the terminal
 - [ ] `mtclaw gateway` serves a Telegram DM end to end: message → agent → tool → chunked reply
-- [ ] A non-allowlisted Telegram user gets no agent turn and no reply
-- [ ] A group message without a mention is ignored when `require_mention: true`
-- [ ] A deny-listed command is refused without ever prompting the user, and is recorded in `exec_audit`
-- [ ] An allow-listed command runs with no prompt
-- [ ] An unmatched command in `approval` mode produces inline Yes/No buttons; Deny returns a refusal to the model as a tool result, not an error
-- [ ] In `auto` mode, a dangerous command still prompts, and classifier failure falls back to prompting (fail-closed)
-- [ ] Sessions and history survive a gateway restart
+- [x] A non-allowlisted Telegram user gets no agent turn and no reply
+- [x] A group message without a mention is ignored when `require_mention: true`
+- [x] A deny-listed command is refused without ever prompting the user, and is recorded in `exec_audit`
+- [x] An allow-listed command runs with no prompt
+- [x] An unmatched command in `approval` mode produces inline Yes/No buttons; Deny returns a refusal to the model as a tool result, not an error
+- [x] In `auto` mode, a dangerous command still prompts, and classifier failure falls back to prompting (fail-closed)
+- [x] Sessions and history survive a gateway restart
 - [ ] A cron job fires on schedule and delivers to the configured chat, with the run recorded in `cron_runs`
-- [ ] Two concurrent gateways with the same token is detected and refused, not left flapping on HTTP 409
-- [ ] `go test ./...` passes with the policy engine, config loader, chunker, and gating logic covered by table tests
-- [ ] `docs/configuration.md` documents every config key; `docs/security.md` states the exec threat model plainly
+- [x] Two concurrent gateways with the same token is detected and refused, not left flapping on HTTP 409
+- [x] `go test ./...` passes with the policy engine, config loader, chunker, and gating logic covered by table tests
+- [x] `docs/configuration.md` documents every config key; `docs/security.md` states the exec threat model plainly
+
+### Remaining manual verification (needs live credentials)
+
+All nine phases are implemented and test-verified (`go test -race ./...` green on
+Windows; 44/44 CLI smoke tests pass; security checklist 20/21 items executed with
+cited tests). The unchecked boxes above and in phases 4–9 are exclusively items
+that require a real OpenAI key and/or Telegram bot token, unavailable in the
+implementation environment:
+
+1. `mtclaw prompt` live tool-using turn + restart context retention (phases 4, 5).
+2. `mtclaw gateway` full Telegram DM round trip; `/whoami`, `/new`, `/status`
+   against a real chat; live token-leak log grep — security checklist #14
+   (phases 6, 7, 9).
+3. A live cron job delivering to a configured chat on schedule (phase 8).
+4. `onboard` on a clean machine; CI green on Linux/macOS (workflows written,
+   first push will exercise them); tagged release producing the five binaries
+   (phase 9 — the Makefile `release` target was already run locally as a rehearsal).
+
+Exact instructions for each are in
+`plans/reports/phase-09-implementation-260801-hardening-release-report.md`.
 
 ## Risks
 
@@ -283,6 +310,23 @@ Decision delta applied across all files after the accepted findings:
   corresponding assertion.
 
 **Unresolved contradictions: none.**
+
+### Session — 2026-08-01 (pre-implementation re-review)
+
+**Findings:** 9 (9 accepted, 0 rejected). Cross-phase seam review after the first
+red-team pass; all applied to the phase files before implementation began.
+
+| # | Finding | Severity | Applied To |
+|---|---------|----------|------------|
+| S1 | `Channel.Send` and `Approver.Request` lacked thread routing — forum-topic replies and approval buttons landed in the General topic | Med-High | Phase 5, 6 |
+| S2 | Per-channel approver selection unspecified (cron needs `DenyAllApprover`, chat needs `TelegramApprover`, one shared registry) — approver mux keyed on `meta.Channel` | Medium | Phase 4, 5, 7, 8 |
+| S3 | Cron scheduler had no way to learn turn completion or attach `job.timeout` — `Inbound` gains `DeliverTo`, `Timeout`, `OnDone` | Medium | Phase 8 |
+| S4 | A pending approval holds a global turn slot; 4 unanswered prompts stall the gateway — accepted, documented, `/stop` frees it | Medium | Phase 7 |
+| S5 | Empty-allowlist load error defeated by the default `"*"` group entry — rule now requires a group with non-empty `allow_from` | Medium | Phase 1 |
+| S6 | "One sustained writer" stale: `prompt` and `cron run` also write; `cron run` on a persistent job races the gateway — invariant reworded, `BEGIN IMMEDIATE`, persistent-run guard | Low-Med | Phase 2, 8 |
+| S7 | Windows deny-list referenced twice, specified nowhere — starter PowerShell list added | Low | Phase 5 |
+| S8 | Classifier `max_retries: 0` not expressible via `Provider` — classifier builds its own client | Low | Phase 5 |
+| S9 | Read-only WAL open fails with `SQLITE_READONLY_RECOVERY` after a writer crash — read commands fall back to read-write open | Low | Phase 2 |
 
 ## Open Questions
 

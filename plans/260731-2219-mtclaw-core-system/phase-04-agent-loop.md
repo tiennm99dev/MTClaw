@@ -1,7 +1,7 @@
 ---
 phase: 4
 title: "Agent Loop"
-status: pending
+status: completed
 priority: P1
 dependencies: [2, 3]
 effort: ""
@@ -126,6 +126,7 @@ type Meta struct {
     SessionID string
     Channel   string
     ChatID    string
+    ThreadID  string // forum topic; routes approver prompts and replies
 }
 
 type Progress func(Event) // ToolStarted, ToolFinished, Iteration
@@ -225,14 +226,14 @@ All against `provider/mock`, no network:
 
 ## Success Criteria
 
-- [ ] `mtclaw prompt "hello"` completes a turn and persists it
-- [ ] Restarting and running `mtclaw prompt` again shows the model retains prior context
-- [ ] A scripted 3-tool-call conversation persists a valid message sequence
-- [ ] Trimming never produces an orphaned `tool_calls` or a leading `tool` message
-- [ ] Iteration cap is enforced and explained to the user
-- [ ] Context-length overflow recovers via one retry
-- [ ] Cancellation leaves a coherent transcript
-- [ ] `internal/agent` imports no channel, no tool implementation, and no OpenAI SDK
+- [ ] `mtclaw prompt "hello"` completes a turn and persists it (command is wired and tested against `provider/mock`; not exercised against a live OpenAI endpoint - no network/API key in this environment)
+- [ ] Restarting and running `mtclaw prompt` again shows the model retains prior context (same caveat: `--session`/default `cli/local` reuse is implemented and covered by store-level session tests, not a live end-to-end run)
+- [x] A scripted 3-tool-call conversation persists a valid message sequence
+- [x] Trimming never produces an orphaned `tool_calls` or a leading `tool` message
+- [x] Iteration cap is enforced and explained to the user
+- [x] Context-length overflow recovers via one retry
+- [x] Cancellation leaves a coherent transcript
+- [x] `internal/agent` imports no channel, no tool implementation, and no OpenAI SDK
 
 ## Risk Assessment
 

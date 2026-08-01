@@ -1,7 +1,7 @@
 ---
 phase: 1
 title: "Foundation and Config"
-status: pending
+status: completed
 priority: P1
 dependencies: []
 effort: ""
@@ -156,7 +156,7 @@ log:
    - `agent.model` non-empty; `max_iterations` in 1..100; `max_history_turns` >= 2; `temperature` in 0..2
    - `openai.base_url` parses as absolute http/https URL; timeout > 0
    - inline `api_key`/`token` keys present → error naming the correct `*_env` key
-   - `telegram.enabled` with empty `allow_from` and no group entries → error: "would accept no one; set channels.telegram.allow_from"
+   - `telegram.enabled`, empty channel `allow_from`, and no group with a non-empty `allow_from` → error: "would accept no one; set channels.telegram.allow_from". The default `"*"` group entry carries an empty `allow_from` (it inherits the channel list), so its mere presence must **not** satisfy this check
    - group keys parse as int64; `-100…` supergroup form noted in the error text when a bare positive ID looks like a group
    - `tools.exec.mode` in {approval, auto, off}; every `deny`/`allow` entry compiles as a regex, with the failing pattern quoted
    - `tools.filesystem.roots` non-empty when filesystem enabled; each is absolute after expansion
@@ -182,14 +182,14 @@ log:
 
 ## Success Criteria
 
-- [ ] `CGO_ENABLED=0 go build ./...` succeeds
-- [ ] `mtclaw version` works with no config file present
-- [ ] `mtclaw config validate` reports every error in one pass with line numbers
-- [ ] An unknown YAML key fails the load
-- [ ] An inline `api_key` fails the load with a message naming `openai.api_key_env`
-- [ ] Telegram enabled with an empty allowlist fails the load
-- [ ] `mtclaw config show` never prints secret material
-- [ ] `mtclaw --config ./other.yaml config path` resolves and reports the flag as the source
+- [x] `CGO_ENABLED=0 go build ./...` succeeds
+- [x] `mtclaw version` works with no config file present
+- [x] `mtclaw config validate` reports every error in one pass with line numbers
+- [x] An unknown YAML key fails the load
+- [x] An inline `api_key` fails the load with a message naming `openai.api_key_env`
+- [x] Telegram enabled with an empty allowlist fails the load
+- [x] `mtclaw config show` never prints secret material
+- [x] `mtclaw --config ./other.yaml config path` resolves and reports the flag as the source
 
 ## Risk Assessment
 

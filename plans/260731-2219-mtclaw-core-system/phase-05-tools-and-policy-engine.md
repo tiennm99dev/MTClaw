@@ -1,7 +1,7 @@
 ---
 phase: 5
 title: "Tools and Policy Engine"
-status: pending
+status: completed
 priority: P1
 dependencies: [4]
 effort: ""
@@ -160,6 +160,26 @@ and intervening arguments. **The lesson generalizes: hand-written deny regexes a
 wrong until proven otherwise by a corpus.** The test corpus below is therefore a
 required deliverable of this phase, not optional coverage.
 
+**Windows (PowerShell) starter deny-list**, written by `onboard` when the default
+shell is PowerShell. PowerShell is case-insensitive, so every pattern carries `(?i)`:
+
+```yaml
+deny:
+  - '(?i)\bremove-item\b[^|;&]*\s-(recurse|force)\b'
+  - '(?i)\b(rd|rmdir)\b[^|;&]*\s/s\b'
+  - '(?i)\bdel\b[^|;&]*\s/[fsq]\b'
+  - '(?i)\b(format-volume|clear-disk|initialize-disk|diskpart)\b'
+  - '(?i)\b(stop-computer|restart-computer|shutdown)\b'
+  - '(?i)\breg\s+delete\b'
+  - '(?i)\bset-executionpolicy\b'
+  - '(?i)\b(iwr|invoke-webrequest|curl|wget)\b.*\|\s*(iex|invoke-expression)\b'
+  - '(?i)\b(iex|invoke-expression)\b\s*\(\s*(iwr|invoke-webrequest)\b'
+  - '(?i)\bgit\s+push\b.*(--force(-with-lease)?|-f)\b'
+```
+
+It gets a must-catch/must-not-catch corpus on Windows exactly as the POSIX list does;
+`Remove-Item foo.txt` and `del build\out.txt` must pass through to the next stage.
+
 ## Related Code Files
 
 - Create: `internal/tools/registry.go` — `Registry`, `Register`, `Specs`, `Run` (implements `agent.ToolRunner`)
@@ -230,6 +250,8 @@ required deliverable of this phase, not optional coverage.
    keep the classifier behind an interface so tests inject a fake.
 6. `classifier.go`: build the JSON-only prompt, call the provider with
    `auto.model` (falling back to `agent.model`), 10s timeout, unmarshal strictly.
+   Retry count is fixed at client construction in the SDK, so the classifier builds
+   its **own** provider client with `max_retries: 0` rather than reusing the agent's.
    Any error, timeout, or unparseable response → `VerdictAsk` with
    `Reason: "risk classification unavailable"`. Never returns `VerdictRun` on error.
 7. `approver.go` — and note that an approval prompt **leaves the host**. The command is
@@ -246,7 +268,7 @@ required deliverable of this phase, not optional coverage.
    and stored. Document that redaction is best-effort pattern matching, so the real rule
    stays "do not let the agent handle credentials as command arguments".
    ```go
-   type Request struct { SessionID, Channel, ChatID, Tool, Command, Reason string }
+   type Request struct { SessionID, Channel, ChatID, ThreadID, Tool, Command, Reason string }
    type Approver interface {
        Ask(ctx context.Context, req Request) (approved bool, err error)
    }
@@ -254,7 +276,10 @@ required deliverable of this phase, not optional coverage.
    `TerminalApprover` prints the command plus reason and reads `y/N` from stdin with
    the configured `approval_timeout`. `DenyAllApprover` is the default when no
    approver is wired (used by cron — see phase 8) and always denies with a message
-   telling the model no interactive approver is available.
+   telling the model no interactive approver is available. One registry serves both
+   chat and cron turns inside the gateway, so the gateway wires an **approver mux**
+   that selects by `meta.Channel` — `telegram` → `TelegramApprover` (phase 6),
+   `cron` → `DenyAllApprover`; `mtclaw prompt` wires `TerminalApprover` directly.
 8. `exec.go`:
    - resolve shell: `tools.exec.shell` if set, else `[/bin/bash, -lc]` on POSIX and
      `[powershell, -NoProfile, -Command]` on Windows
@@ -327,21 +352,21 @@ required deliverable of this phase, not optional coverage.
 ## Success Criteria
 
 - [ ] `mtclaw prompt "what files are in my workspace"` completes a real tool-using turn
-- [ ] A deny-listed command is refused with no prompt, audited as `denied_rule`
-- [ ] Deny wins over an allow-list entry matching the same command
-- [ ] An allow-listed command runs with no prompt
-- [ ] In `approval` mode an unmatched command prompts at the terminal; `n` returns a refusal to the model as a result
-- [ ] In `auto` mode a benign command runs unprompted and a destructive one prompts with the classifier's reason
-- [ ] Classifier timeout or malformed output results in a prompt, never a silent run
-- [ ] The full deny-list corpus passes: every must-catch command denied, every must-not-catch command allowed through to the next policy stage
-- [ ] `rm --recursive --force /` and `/bin/rm -rf /` are both denied
-- [ ] Path traversal, symlink escape, and prefix-confusion attempts all fail
-- [ ] `web_fetch` refuses loopback, unspecified, link-local, private, and IPv4-mapped-IPv6 targets, including via redirect, while still fetching a normal public URL
-- [ ] Exec timeout leaves no surviving child processes
-- [ ] Cancelling the turn context kills the running command and its children
-- [ ] Approval prompts and audit rows are secret-redacted; the executed command is not modified
-- [ ] Every exec attempt appears in `exec_audit` with a decision label
-- [ ] `mode: off` produces a registry with no exec tool and a system prompt that says so
+- [x] A deny-listed command is refused with no prompt, audited as `denied_rule`
+- [x] Deny wins over an allow-list entry matching the same command
+- [x] An allow-listed command runs with no prompt
+- [x] In `approval` mode an unmatched command prompts at the terminal; `n` returns a refusal to the model as a result
+- [x] In `auto` mode a benign command runs unprompted and a destructive one prompts with the classifier's reason
+- [x] Classifier timeout or malformed output results in a prompt, never a silent run
+- [x] The full deny-list corpus passes: every must-catch command denied, every must-not-catch command allowed through to the next policy stage
+- [x] `rm --recursive --force /` and `/bin/rm -rf /` are both denied
+- [x] Path traversal, symlink escape, and prefix-confusion attempts all fail
+- [x] `web_fetch` refuses loopback, unspecified, link-local, private, and IPv4-mapped-IPv6 targets, including via redirect, while still fetching a normal public URL
+- [x] Exec timeout leaves no surviving child processes
+- [x] Cancelling the turn context kills the running command and its children
+- [x] Approval prompts and audit rows are secret-redacted; the executed command is not modified
+- [x] Every exec attempt appears in `exec_audit` with a decision label
+- [x] `mode: off` produces a registry with no exec tool and a system prompt that says so
 
 ## Risk Assessment
 

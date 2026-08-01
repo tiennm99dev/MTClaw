@@ -1,7 +1,7 @@
 ---
 phase: 6
 title: "Telegram Channel"
-status: pending
+status: completed
 priority: P1
 dependencies: [5]
 effort: ""
@@ -123,9 +123,10 @@ formatting failed.
 `TelegramApprover` implements `tools.Approver`:
 
 1. Create the `approvals` row (phase 2) with a random id and `expires_at`.
-2. Send the prompt to the originating chat: the command in a code block, the
-   classifier reason when present, and the two inline buttons carrying
-   `ok:<id>` / `no:<id>`.
+2. Send the prompt to the originating chat **and thread** (a forum-topic approval
+   must carry `message_thread_id`, or the buttons land in the General topic): the
+   command in a code block, the classifier reason when present, and the two inline
+   buttons carrying `ok:<id>` / `no:<id>`.
 3. Register a waiter channel in an in-memory `map[id]chan bool` under a mutex, then
    block in a `select` over **three** cases: the waiter channel, an
    `approval_timeout` timer, and **`ctx.Done()`**. The context case is not optional
@@ -177,7 +178,9 @@ Pending waiters are process-local. A gateway restart abandons them, so startup r
        Name() string
        // Start pumps accepted inbound messages into out until ctx is done.
        Start(ctx context.Context, out chan<- Inbound) error
-       Send(ctx context.Context, chatID, text string, replyTo string) error
+       // threadID routes forum-topic replies (Telegram message_thread_id);
+       // "" targets the chat's general timeline.
+       Send(ctx context.Context, chatID, threadID, text string, replyTo string) error
    }
    ```
 3. Startup: `getMe` to learn the username and id; cache both. Register commands via
@@ -199,12 +202,16 @@ Pending waiters are process-local. A gateway restart abandons them, so startup r
    - `/stop` — cancel the in-flight turn for this session (phase 7 provides the cancel
      handle; until then, reply that nothing is running)
    Commands arrive as `/cmd@botname` in groups — strip the suffix before matching.
+   Command handlers take a narrow deps struct injected by the gateway (session
+   reader/reset, cancel registry) rather than importing the store or loop internals,
+   keeping the channel boundary honest.
 7. `chunk.go`: `Split(text string, limit int) []string` with the boundary preferences
    and code-fence awareness above.
 8. `format.go`: `EscapeMarkdownV2(s string) string` leaving fenced and inline code
    intact.
 9. `send.go`: `Send` chunks, sends serially with MarkdownV2, and on a 400 parse error
-   resends that chunk unformatted. Normal replies do not quote the triggering message;
+   resends that chunk unformatted. Every send passes the session's thread id as
+   `message_thread_id` when non-empty, so forum-topic replies land in their topic. Normal replies do not quote the triggering message;
    approval prompts always do, so it is unambiguous which message a command came from.
    (There is no `reply_to_message` config key — an earlier draft had one and it was cut
    as a knob nobody would turn.) `SendTyping(chatID)` issues
@@ -233,24 +240,26 @@ Pending waiters are process-local. A gateway restart abandons them, so startup r
   promptly (well under `approval_timeout`) and marks the row `expired`.
 - **Send fallback**: a stubbed transport returning 400-parse on the first attempt and
   200 on the retry results in the message being delivered exactly once.
+- **Thread routing**: a turn originating in a forum topic sends its reply and its
+  approval prompt with that topic's `message_thread_id`.
 - Manual: DM the bot, add it to a group, confirm `/whoami` reports usable ids.
 
 ## Success Criteria
 
 - [ ] Gateway connects by long polling with no inbound network exposure
 - [ ] An allowlisted DM produces a full agent turn and a reply
-- [ ] A non-allowlisted user gets no reply and no agent turn
-- [ ] A group message without a mention is ignored under `require_mention: true`
-- [ ] A reply to the bot in a group is treated as a mention
-- [ ] Forum topics map to distinct sessions
-- [ ] A 10k-character reply arrives as ordered chunks with balanced code fences
-- [ ] Malformed markdown still gets delivered, unformatted
+- [x] A non-allowlisted user gets no reply and no agent turn
+- [x] A group message without a mention is ignored under `require_mention: true`
+- [x] A reply to the bot in a group is treated as a mention
+- [x] Forum topics map to distinct sessions, and replies + approval prompts land in the originating topic
+- [x] A 10k-character reply arrives as ordered chunks with balanced code fences
+- [x] Malformed markdown still gets delivered, unformatted
 - [ ] `/whoami` reports the ids needed to configure `allow_from` and `groups`
 - [ ] `/new` resets the conversation; `/status` reports real numbers
-- [ ] An exec approval shows inline buttons; Approve runs, Deny refuses, timeout expires
-- [ ] A pending approval does not delay shutdown: cancelling the context returns within seconds, not `approval_timeout`
-- [ ] A second tap on a decided approval changes nothing
-- [ ] A different user in the same group cannot approve someone else's command
+- [x] An exec approval shows inline buttons; Approve runs, Deny refuses, timeout expires
+- [x] A pending approval does not delay shutdown: cancelling the context returns within seconds, not `approval_timeout`
+- [x] A second tap on a decided approval changes nothing
+- [x] A different user in the same group cannot approve someone else's command
 - [ ] The token never appears in any log line at any level
 
 ## Risk Assessment

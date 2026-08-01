@@ -1,7 +1,7 @@
 ---
 phase: 3
 title: "OpenAI Provider"
-status: pending
+status: completed
 priority: P1
 dependencies: [1]
 effort: ""
@@ -191,13 +191,13 @@ Classification happens after the SDK gives up.
 
 ## Success Criteria
 
-- [ ] `internal/agent` and `internal/tools` compile with no `openai-go` import (verified by `go list -deps`)
-- [ ] An assistant message with tool calls round trips through both converters unchanged
-- [ ] Every error class in the table maps to the right `ErrKind`
-- [ ] `ErrContextLength` is distinguishable from other 400s
-- [ ] Usage tokens are populated on every successful response
-- [ ] Mock provider can script a multi-turn tool-calling conversation
-- [ ] Doctor probe reports success/failure against a real key without leaking the key in output
+- [x] `internal/agent` and `internal/tools` compile with no `openai-go` import (verified by `go list -deps`) — neither package exists yet; verified instead that no package outside `internal/provider/openai` imports it, via `go list -deps` over every package in the module
+- [x] An assistant message with tool calls round trips through both converters unchanged
+- [x] Every error class in the table maps to the right `ErrKind`
+- [x] `ErrContextLength` is distinguishable from other 400s
+- [x] Usage tokens are populated on every successful response
+- [x] Mock provider can script a multi-turn tool-calling conversation
+- [x] Doctor probe reports success/failure against a real key without leaking the key in output — implemented as `(*openai.Client).Probe`, exported and unit-testable, but not wired to a CLI command (the `doctor` command itself is phase 9's `internal/cli/doctor_cmd.go`, which does not exist yet)
 
 ## Risk Assessment
 

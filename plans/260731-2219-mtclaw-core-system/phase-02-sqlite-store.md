@@ -1,10 +1,11 @@
 ---
 phase: 2
-title: "SQLite Store"
-status: pending
+title: SQLite Store
+status: completed
 priority: P1
-dependencies: [1]
-effort: ""
+dependencies:
+  - 1
+effort: ''
 ---
 
 # Phase 2: SQLite Store
@@ -33,15 +34,23 @@ binary stays static.
 
 ## Architecture
 
-The gateway process owns all writes **during normal operation**. CLI commands
-(`sessions list/show`, `approvals list`) open the file read-only, and WAL makes
-concurrent reads safe.
+The gateway process owns all writes **during normal operation**. Read commands
+(`sessions list/show`, `approvals list`, `cron list`) open the file read-only, and
+WAL makes concurrent reads safe. One caveat: a read-only open fails with
+`SQLITE_READONLY_RECOVERY` when the last writer crashed mid-WAL; read commands fall
+back to a read-write open in that case rather than erroring out.
 
-`sessions rm` is the one exception — a second writer, by design, so a user can drop a
-poisoned session without stopping the gateway. WAL permits one writer at a time, so
-this is correct rather than merely tolerated, but it means the invariant is "one
-*sustained* writer", not "one writer". Do not build anything on the stronger claim:
-`busy_timeout` is what makes `rm` wait for an in-flight turn instead of failing.
+Three CLI commands are second writers, by design: `sessions rm` (drop a poisoned
+session without stopping the gateway), `mtclaw prompt` (writes the `cli`/`local`
+session), and `mtclaw cron run` (test path, phase 8). WAL serializes them at the DB
+level, so the invariant is "one *sustained* writer", not "one writer" — do not build
+anything on the stronger claim. Two rules keep this safe above the DB level: CLI
+writers touch only sessions the gateway does not own (`cli` channel; `cron run`
+guards the persistent-job case — phase 8), and every read-then-write transaction
+opens with `BEGIN IMMEDIATE` — a deferred transaction that upgrades to a write while
+another writer is active fails `SQLITE_BUSY` at upgrade time *without* honoring
+`busy_timeout`. `busy_timeout` is what makes a second writer wait for an in-flight
+turn instead of failing.
 
 Pragmas applied on every connection, in this order:
 
@@ -205,7 +214,7 @@ which the OpenAI API rejects on the next request.
 4. `types.go`: timestamps as `time.Time` in Go, unix millis in SQLite; conversion
    helpers in one place.
 5. `sessions.go`: `Ensure` uses `INSERT … ON CONFLICT(channel, chat_id, thread_id) DO UPDATE SET updated_at=? RETURNING *`.
-6. `messages.go`: `Append` opens a tx, reads `COALESCE(MAX(seq),0)`, inserts with
+6. `messages.go`: `Append` opens a `BEGIN IMMEDIATE` tx, reads `COALESCE(MAX(seq),0)`, inserts with
    incrementing seq, commits. `Recent` selects with `ORDER BY seq DESC LIMIT n` then
    reverses in Go.
 7. `approvals.go`: `Create`, `Get`, `Decide(id, state, by)` guarded by
@@ -230,14 +239,14 @@ which the OpenAI API rejects on the next request.
 
 ## Success Criteria
 
-- [ ] `Open` creates, migrates, and opens a DB at a fresh path
-- [ ] Re-opening an up-to-date DB applies no migrations
-- [ ] Opening a DB from a newer schema version fails loudly
-- [ ] `foreign_keys` is verifiably ON on the live connection (asserted in a test, not assumed)
-- [ ] A tool-call turn is atomically visible: never an assistant `tool_calls` row without its `tool` rows
-- [ ] `mtclaw sessions list` works while the gateway is running and writing
-- [ ] `mtclaw sessions rm` cascades messages, preserves audit rows
-- [ ] Binary still builds with `CGO_ENABLED=0`
+- [x] `Open` creates, migrates, and opens a DB at a fresh path
+- [x] Re-opening an up-to-date DB applies no migrations
+- [x] Opening a DB from a newer schema version fails loudly
+- [x] `foreign_keys` is verifiably ON on the live connection (asserted in a test, not assumed)
+- [x] A tool-call turn is atomically visible: never an assistant `tool_calls` row without its `tool` rows
+- [x] `mtclaw sessions list` works while the gateway is running and writing
+- [x] `mtclaw sessions rm` cascades messages, preserves audit rows
+- [x] Binary still builds with `CGO_ENABLED=0`
 
 ## Risk Assessment
 

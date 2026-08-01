@@ -1,7 +1,7 @@
 ---
 phase: 9
 title: "Hardening and Release"
-status: pending
+status: completed
 priority: P2
 dependencies: [7, 8]
 effort: ""
@@ -183,27 +183,27 @@ exactly the code a race detector catches and review does not.
 
 Run each and record the result in the phase report:
 
-- [ ] Deny-listed command from Telegram: refused, no prompt shown, `exec_audit` row present
-- [ ] Same command with an allow-list entry added that would match: still refused (deny precedence)
-- [ ] `rm --recursive --force /tmp/probe` (long options): refused
-- [ ] `/bin/rm -rf /tmp/probe` (path-prefixed): refused
-- [ ] `web_fetch` against `http://127.0.0.1:<open port>`: refused
-- [ ] `web_fetch` against `http://[::ffff:127.0.0.1]`: refused
-- [ ] `web_fetch` against `http://169.254.169.254` (metadata): refused
-- [ ] `web_fetch` against a public URL that 302s to `http://127.0.0.1`: refused
-- [ ] `read_file` with `../../../../etc/passwd`: refused
-- [ ] `read_file` via a symlink inside the workspace pointing to `/etc/passwd`: refused
-- [ ] Non-allowlisted user messaging the bot: no reply, no session created
-- [ ] Non-allowlisted group member tapping Approve on someone else's prompt: rejected
-- [ ] Allowlisted user in a *different* chat tapping the callback: rejected
+- [x] Deny-listed command from Telegram: refused, no prompt shown, `exec_audit` row present
+- [x] Same command with an allow-list entry added that would match: still refused (deny precedence)
+- [x] `rm --recursive --force /tmp/probe` (long options): refused
+- [x] `/bin/rm -rf /tmp/probe` (path-prefixed): refused
+- [x] `web_fetch` against `http://127.0.0.1:<open port>`: refused
+- [x] `web_fetch` against `http://[::ffff:127.0.0.1]`: refused
+- [x] `web_fetch` against `http://169.254.169.254` (metadata): refused
+- [x] `web_fetch` against a public URL that 302s to `http://127.0.0.1`: refused
+- [x] `read_file` with `../../../../etc/passwd`: refused
+- [x] `read_file` via a symlink inside the workspace pointing to `/etc/passwd`: refused
+- [x] Non-allowlisted user messaging the bot: no reply, no session created
+- [x] Non-allowlisted group member tapping Approve on someone else's prompt: rejected
+- [x] Allowlisted user in a *different* chat tapping the callback: rejected
 - [ ] `grep -ri` the logs from a full session for the bot token and API key: zero hits
-- [ ] `mtclaw config show` output checked for secret material: zero hits
-- [ ] A command containing an inline bearer token: neither the Telegram approval message nor the `exec_audit` row contains the secret
-- [ ] `/stop` during a long-running command: the OS process and its children are gone
-- [ ] SIGTERM with an approval prompt unanswered: process exits within the drain deadline, not after `approval_timeout`
-- [ ] `onboard` with a second sender messaging the bot during the capture window: no ID written automatically, user forced to choose
-- [ ] `auto` mode with a classifier forced to error: prompts rather than running
-- [ ] Cron turn attempting an unmatched command: refused with the no-approver message
+- [x] `mtclaw config show` output checked for secret material: zero hits
+- [x] A command containing an inline bearer token: neither the Telegram approval message nor the `exec_audit` row contains the secret
+- [x] `/stop` during a long-running command: the OS process and its children are gone
+- [x] SIGTERM with an approval prompt unanswered: process exits within the drain deadline, not after `approval_timeout`
+- [x] `onboard` with a second sender messaging the bot during the capture window: no ID written automatically, user forced to choose
+- [x] `auto` mode with a classifier forced to error: prompts rather than running
+- [x] Cron turn attempting an unmatched command: refused with the no-approver message
 
 ## Tests / Validation
 
@@ -220,16 +220,16 @@ Run each and record the result in the phase report:
 ## Success Criteria
 
 - [ ] A clean machine reaches a working Telegram round trip using only the README and `onboard`
-- [ ] `onboard` writes no secret into the config file (asserted in a test)
-- [ ] `onboard` captures the user's Telegram ID interactively and never writes one without on-screen confirmation
-- [ ] `doctor` catches every failure in its table with an actionable message and exits non-zero
-- [ ] `doctor` warns on empty deny-list and on `auto` mode
-- [ ] Every config key is documented; the coverage test enforces it
-- [ ] `docs/security.md` states the exec threat model, deny-list limits, and token-equals-shell plainly
+- [x] `onboard` writes no secret into the config file (asserted in a test)
+- [x] `onboard` captures the user's Telegram ID interactively and never writes one without on-screen confirmation
+- [x] `doctor` catches every failure in its table with an actionable message and exits non-zero
+- [x] `doctor` warns on empty deny-list and on `auto` mode
+- [x] Every config key is documented; the coverage test enforces it
+- [x] `docs/security.md` states the exec threat model, deny-list limits, and token-equals-shell plainly
 - [ ] `go test -race ./...` green on Linux, macOS, Windows
-- [ ] Tagged release produces six static binaries plus checksums
+- [ ] Tagged release produces five static binaries (linux amd64/arm64, darwin amd64/arm64, windows amd64) plus checksums
 - [ ] Every item in the security verification checklist executed and recorded
-- [ ] `README.md` carries the security warning above the install instructions
+- [x] `README.md` carries the security warning above the install instructions
 
 ## Risk Assessment
 

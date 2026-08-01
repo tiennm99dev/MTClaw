@@ -1,7 +1,7 @@
 ---
 phase: 8
 title: "Cron Scheduler"
-status: pending
+status: completed
 priority: P2
 dependencies: [7]
 effort: ""
@@ -124,7 +124,8 @@ A cron turn has no interactive user waiting. Wiring `TelegramApprover` would sen
 approval buttons to a chat where nobody is expecting them, then block for
 `approval_timeout`.
 
-Cron turns therefore use **`DenyAllApprover`** (phase 5): any command reaching the ask
+Cron turns therefore use **`DenyAllApprover`** (phase 5), selected by the gateway's
+approver mux on `meta.Channel == "cron"`: any command reaching the ask
 branch is refused, and the model is told no interactive approver is available so it can
 report that in its output. Consequence, and it must be documented: a cron job can only
 run commands matched by `tools.exec.allow`. That is the correct default for unattended
@@ -159,18 +160,21 @@ quiet.
 2. Extend phase-1 validation: unique non-empty names; `gronx.IsValid(schedule)`;
    `time.LoadLocation(timezone)`; `deliver_to.channel == "telegram"` and telegram
    enabled; `chat_id` reachable per the rule above; `timeout > 0`; prompt non-empty.
-3. `job.go`: resolve the session per `session:` mode; build the synthetic inbound;
-   carry the delivery target on the inbound struct (add a `DeliverTo` field used only by
-   cron) so the dispatcher does not need to know about cron.
+3. `job.go`: resolve the session per `session:` mode; build the synthetic inbound.
+   `Inbound` gains three cron-only fields — `DeliverTo`, `Timeout`, and
+   `OnDone func(error)` — so the dispatcher does not need to know about cron: the
+   worker applies `Timeout` when deriving the turn context and invokes `OnDone` when
+   the turn finishes. Completion is only knowable via this callback, because the
+   dispatcher runs the turn asynchronously in a worker goroutine.
 4. `scheduler.go`:
    - `Start(ctx)` sleeps until the next minute boundary, then ticks every minute
    - per tick, for each enabled job, `gron.IsDue(schedule, now)` — handle the error return
    - on due: check the per-job `lastFired` minute guard first, then `CompareAndSwap` the
      running flag; if the flag was already set, write `cron_runs{status: skipped}` and
      continue. Set `lastFired` before enqueueing.
-   - otherwise write a `started` run row, enqueue, and on completion update the row with
-     `ok`/`error` plus finished timestamp
-   - per-job `context.WithTimeout(job.Timeout)`
+   - otherwise write a `started` run row and enqueue with `Timeout: job.Timeout` and
+     an `OnDone` that updates the row to `ok`/`error` with the finished timestamp and
+     clears the running flag
    - exit on `ctx.Done()`
 5. Dispatcher change: when an inbound carries `DeliverTo`, send the result there;
    suppress delivery on `NoReply`.
@@ -180,7 +184,10 @@ quiet.
    - `run <name>` — fire once immediately. Runs in-process against the same store, which
      means it does **not** go through a running gateway; it is a test/debug path and
      `--deliver` opts into actually sending rather than printing to stdout. Default is
-     print-only, so `cron run` is safe to experiment with.
+     print-only, so `cron run` is safe to experiment with. For a `persistent` job it
+     refuses to run while the gateway lock is held — the gateway may fire the same
+     job's session concurrently and nothing serializes two processes appending to one
+     session; pass `--ephemeral` or stop the gateway.
 7. Gateway integration: start the scheduler in the run group when `cron.enabled`, log
    each job's next due time at startup so a wrong timezone is obvious immediately.
 
@@ -210,19 +217,19 @@ quiet.
 
 ## Success Criteria
 
-- [ ] A job with `* * * * *` fires once per minute, aligned to the boundary
-- [ ] Result is delivered to the configured chat, chunked
-- [ ] `NoReply` from a cron turn sends nothing
-- [ ] A long-running job's next due tick records `skipped`, never a double run
-- [ ] Two ticks inside one due minute produce exactly one run
-- [ ] Persistent jobs accumulate history; ephemeral jobs leave no session behind
-- [ ] A cron turn cannot run an unmatched command, and says why
-- [ ] An allow-listed command runs unattended
-- [ ] `mtclaw cron list` shows correct next-due times in the configured timezone
-- [ ] `mtclaw cron run <name>` prints without delivering unless `--deliver` is passed
-- [ ] Gateway startup logs each job's next due time
-- [ ] Config errors in `cron.jobs` name the offending job
-- [ ] A gateway restart does not replay missed runs
+- [x] A job with `* * * * *` fires once per minute, aligned to the boundary
+- [x] Result is delivered to the configured chat, chunked
+- [x] `NoReply` from a cron turn sends nothing
+- [x] A long-running job's next due tick records `skipped`, never a double run
+- [x] Two ticks inside one due minute produce exactly one run
+- [x] Persistent jobs accumulate history; ephemeral jobs leave no session behind
+- [x] A cron turn cannot run an unmatched command, and says why
+- [x] An allow-listed command runs unattended
+- [x] `mtclaw cron list` shows correct next-due times in the configured timezone
+- [x] `mtclaw cron run <name>` prints without delivering unless `--deliver` is passed
+- [x] Gateway startup logs each job's next due time
+- [x] Config errors in `cron.jobs` name the offending job
+- [x] A gateway restart does not replay missed runs
 
 ## Risk Assessment
 

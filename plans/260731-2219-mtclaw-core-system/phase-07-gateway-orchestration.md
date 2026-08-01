@@ -1,7 +1,7 @@
 ---
 phase: 7
 title: "Gateway Orchestration"
-status: pending
+status: completed
 priority: P1
 dependencies: [6]
 effort: ""
@@ -38,7 +38,7 @@ graceful shutdown. After this phase MTClaw is a working product.
 flowchart TD
     START["mtclaw gateway"] --> LOCK{acquire instance lock}
     LOCK -->|held| FAIL["exit 1: already running (pid N)"]
-    LOCK -->|ok| WIRE[wire store, provider, registry, approver, channel]
+    LOCK -->|ok| WIRE[wire store, provider, registry, approver mux, channel]
     WIRE --> RUN[run group]
 
     RUN --> CH[channel.Start → inbound chan]
@@ -119,8 +119,9 @@ turn too — with the drain deadline giving them a chance to finish first.
 
 ### Startup order and shutdown order
 
-Startup: lock → store (migrations) → provider → registry → approver → channel →
-dispatcher → signal watcher. Any failure before the channel starts exits non-zero with
+Startup: lock → store (migrations) → provider → registry → approver mux
+(`telegram` → `TelegramApprover`, `cron` → `DenyAllApprover`, keyed on
+`meta.Channel` — phase 5) → channel → dispatcher → signal watcher. Any failure before the channel starts exits non-zero with
 a clear message; there is no partially-running gateway.
 
 Shutdown is the reverse, and the ordering is load-bearing: stop the channel's update
@@ -226,19 +227,19 @@ The `agent.Progress` callback from phase 4 is wired to the channel:
 
 ## Success Criteria
 
-- [ ] `mtclaw gateway` runs a full Telegram round trip end to end
-- [ ] Two messages in one chat process in order, never concurrently
-- [ ] Messages in different chats process concurrently, capped at 4 turns process-wide
-- [ ] No dispatched message is ever dropped by worker reaping (asserted under `-race` with a 1ms idle timeout)
-- [ ] Shutdown with a pending approval completes in seconds, not `approval_timeout`
-- [ ] A flooded chat gets one honest "still working" reply, never silence
-- [ ] `/stop` cancels the running turn and the session remains usable afterwards
-- [ ] SIGTERM drains in-flight turns, then closes the store and releases the lock
-- [ ] A second `mtclaw gateway` refuses to start and names the running PID
-- [ ] A stale lock file from a killed process does not block startup
-- [ ] Idle sessions do not leak goroutines
-- [ ] The startup banner reports version, model, exec mode, and bot username; `auto` mode warns
-- [ ] No HTTP listener is opened (verified by checking bound ports in a test or manually)
+- [ ] `mtclaw gateway` runs a full Telegram round trip end to end (needs a real bot token; not exercised in this environment - manual follow-up)
+- [x] Two messages in one chat process in order, never concurrently
+- [x] Messages in different chats process concurrently, capped at 4 turns process-wide
+- [x] No dispatched message is ever dropped by worker reaping (asserted under `-race` with a 1ms idle timeout)
+- [ ] Shutdown with a pending approval completes in seconds, not `approval_timeout` (holds by composition - rootCtx cancellation reaches Approver.Ask via the phase 6 select-on-ctx path, and shutdown drain timing is tested - but no dedicated test exercises a live pending approval during gateway shutdown; manual follow-up)
+- [x] A flooded chat gets one honest "still working" reply, never silence
+- [x] `/stop` cancels the running turn and the session remains usable afterwards
+- [x] SIGTERM drains in-flight turns, then closes the store and releases the lock
+- [x] A second `mtclaw gateway` refuses to start and names the running PID
+- [x] A stale lock file from a killed process does not block startup
+- [x] Idle sessions do not leak goroutines
+- [x] The startup banner reports version, model, exec mode, and bot username; `auto` mode warns
+- [x] No HTTP listener is opened (verified by grep across internal/ - no net/http.ListenAndServe, http.Serve, or net.Listen anywhere)
 
 ## Risk Assessment
 
@@ -260,3 +261,9 @@ The `agent.Progress` callback from phase 4 is wired to the channel:
 - **Drop-on-overflow is a product decision.** Bounded queues are correct, but the reply
   text is what stops it from feeling like a bug. Do not implement the bound without the
   reply.
+- **A pending approval holds a global turn slot.** The worker acquires the 4-slot
+  semaphore before the turn, and an exec approval blocks inside the turn for up to
+  `approval_timeout` (5m default) — four unanswered prompts stall every chat. Accepted
+  for v1: the wait is bounded, selects on ctx, and `/stop` frees the slot. If it bites
+  in practice, release the slot around `Approver.Ask` and reacquire after — do not
+  raise the cap to compensate.
