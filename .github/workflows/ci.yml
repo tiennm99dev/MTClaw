@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # go vet and go build stay CGO-free, matching how mtclaw is actually
+      # released (see release.yml): a plain matrix loop, no cross-toolchain
+      # problem, because modernc.org/sqlite is pure Go.
+      - name: go vet (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+        run: go vet ./...
+
+      - name: go build (CGO_ENABLED=0)
+        env:
+          CGO_ENABLED: "0"
+        run: go build ./...
+
+      - name: gofmt check
+        if: runner.os != 'Windows'
+        run: |
+          fmtOut="$(gofmt -l .)"
+          if [ -n "$fmtOut" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$fmtOut"
+            exit 1
+          fi
+
+      - name: gofmt check (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $fmtOut = gofmt -l .
+          if ($fmtOut) {
+            Write-Host "gofmt found unformatted files:"
+            Write-Host $fmtOut
+            exit 1
+          }
+
+      # -race needs cgo (a real C compiler), independent of the CGO-free
+      # release build above. windows-latest does not ship one by default -
+      # see https://github.com/actions/runner-images/issues/2549 - so this
+      # installs mingw-w64 gcc only for that leg.
+      - name: Install a C compiler for -race (Windows)
+        if: runner.os == 'Windows'
+        uses: egor-tensin/setup-mingw@v2
+        with:
+          platform: x64
+
+      - name: go test -race ./...
+        env:
+          CGO_ENABLED: "1"
+        run: go test -race -v ./... 2>&1 | tee test-output.log
+        shell: bash
+
+      - name: Upload test output on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-output-${{ matrix.os }}
+          path: test-output.log

@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0" # cross-compiling this matrix stays a plain loop, no
+                        # cross-toolchain problem, because modernc.org/sqlite
+                        # is pure Go (see docs/architecture.md).
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # full history, so `git describe`-style tooling and Commit below work
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build all release targets
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+          # -X paths match internal/version's package-level vars exactly;
+          # -s -w strip debug info and the symbol table (smaller static
+          # binaries, matching the CGO_ENABLED=0 single-binary story).
+          LDFLAGS="-s -w"
+          LDFLAGS="$LDFLAGS -X github.com/tiennm99/MTClaw/internal/version.Version=${VERSION}"
+          LDFLAGS="$LDFLAGS -X github.com/tiennm99/MTClaw/internal/version.Commit=${COMMIT}"
+          LDFLAGS="$LDFLAGS -X github.com/tiennm99/MTClaw/internal/version.Date=${DATE}"
+
+          mkdir -p dist
+
+          # linux amd64/arm64, darwin amd64/arm64, windows amd64 - the exact
+          # matrix from phase-09-hardening-and-release.md.
+          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
+          for target in $targets; do
+            GOOS="${target%/*}"
+            GOARCH="${target#*/}"
+            ext=""
+            if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+            out="dist/mtclaw-${VERSION}-${GOOS}-${GOARCH}${ext}"
+            echo "building ${out}"
+            GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "$LDFLAGS" -o "$out" .
+          done
+
+          ls -la dist
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*
+          generate_release_notes: true
+          body: |
+            Untested cross-compiled targets: only linux/amd64 and the
+            release runner's own host binary are actually executed as part
+            of this workflow. The other four targets build cleanly
+            (CGO_ENABLED=0, pure-Go sqlite driver) but are not run here -
+            see docs/architecture.md and the phase 9 implementation report
+            for what was verified and how.
