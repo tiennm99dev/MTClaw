@@ -17,7 +17,12 @@ import (
 	"github.com/tiennm99/MTClaw/internal/agent"
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/store"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+
+	// Blank import: registers "sqlite" with store.Open's driver registry.
+	// Nothing else in this package's own dependency graph imports the
+	// sqlite backend package, so this test file is the one place that
+	// has to.
+	_ "github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
 // newTestExecTool builds an execTool wired against a real (temp-file)
@@ -28,10 +33,9 @@ func newTestExecTool(t *testing.T, approver Approver, cfgFn func(*config.ExecCon
 	t.Helper()
 
 	dbPath := filepath.Join(t.TempDir(), "test.db")
-	db, err := sqlite.Open(context.Background(), dbPath, false)
+	st, err := store.Open(context.Background(), config.StorageConfig{Driver: "sqlite", DSN: dbPath}, false)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	st := sqlite.New(db)
+	t.Cleanup(func() { _ = st.Close() })
 
 	cfg := config.ExecConfig{
 		Mode:            "approval",
@@ -189,6 +193,28 @@ func TestExec_TokenizeFailureFailsClosedToAsk(t *testing.T) {
 	assert.Contains(t, out, "denied")
 }
 
+// TestExec_NilApproverFailsClosedInsteadOfPanicking pins the guard in ask():
+// a nil approver must produce the same ErrNoApprover refusal DenyAllApprover
+// gives, never a nil dereference. This is reachable in practice - the
+// tokenize-failure path below forces VerdictAsk regardless of policy, so any
+// caller that omits an approver crashes on the exact input the fail-closed
+// branch exists to handle.
+func TestExec_NilApproverFailsClosedInsteadOfPanicking(t *testing.T) {
+	et, st := newTestExecTool(t, nil, func(c *config.ExecConfig) {
+		c.Allow = []string{".*"} // even a blanket allow must not rescue this
+	})
+
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: `echo "unterminated`}), testMeta())
+	require.NoError(t, err, "an absent approver is a refusal, not a Go error")
+	assert.Contains(t, out, "no approval decision was reached")
+
+	rows, err := st.Audit().List(context.Background(), 0)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "expired", rows[0].Decision,
+		`nobody was asked, so the audit label must be "expired", not "denied_user"`)
+}
+
 func TestExec_InvalidArgsReturnsResultString(t *testing.T) {
 	et, _ := newTestExecTool(t, nil, nil)
 	out, err := et.run(context.Background(), []byte(`{not json`), testMeta())
@@ -246,7 +272,15 @@ func childSurvivalScript(markerPath string, childDelay, parentSleep time.Duratio
 			int(childDelay.Seconds()), markerPath, int(parentSleep.Seconds()),
 		)
 	}
-	return fmt.Sprintf(`(sleep %d && echo done > %s) & sleep %d`,
+	// Deliberately parenthesis-free. `(cmd && cmd) & cmd` is the natural way
+	// to write this, but github.com/mattn/go-shellwords rejects parentheses
+	// with "invalid command line string", and exec.run tokenizes every
+	// command before evaluating policy - so the parenthesized form never
+	// reached execution on POSIX at all. It failed closed to VerdictAsk and
+	// this test asserted nothing about process trees on the one platform
+	// where process groups are the actual mechanism. `sh -c "..." &` spawns
+	// the same detached grandchild and tokenizes cleanly.
+	return fmt.Sprintf(`sh -c "sleep %d; echo done > %s" & sleep %d`,
 		int(childDelay.Seconds()), markerPath, int(parentSleep.Seconds()))
 }
 
