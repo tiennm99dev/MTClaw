@@ -1,11 +1,18 @@
 # Configuration reference
 
 MTClaw reads one YAML file, by default `~/.mtclaw/config.yaml` (override with
-`--config <path>` or the `MTCLAW_CONFIG` environment variable). This document
-lists every key: its type, its default, what it controls, and what breaks if
-it is wrong. A test (`internal/config/docs_coverage_test.go`) asserts every
-field in the config struct appears verbatim on this page, so a new key
-cannot ship undocumented.
+`--config <path>` or the `MTCLAW_CONFIG` environment variable). If
+`config.yaml` does not exist but `config.yml` does, the `.yml` file is used
+instead - useful if you generated the file with a tool that defaults to that
+extension. If both exist, `config.yaml` wins and `mtclaw` prints one warning
+to stderr naming the ignored `config.yml`, so an edit to the wrong file is
+never silent. This alias applies **only** to the default (no-flag, no-env)
+path: `--config <path>` and `MTCLAW_CONFIG` are always used exactly as given,
+with no extension substitution - a typo there is an honest "file not found."
+This document lists every key: its type, its default, what it controls, and
+what breaks if it is wrong. A test (`internal/config/docs_coverage_test.go`)
+asserts every field in the config struct appears verbatim on this page, so a
+new key cannot ship undocumented.
 
 Precedence for everything except secrets: **config file value > built-in
 default**. Secrets (the OpenAI key, the Telegram token) use a separate env/file
@@ -65,6 +72,7 @@ The only channel in v1.
 | `channels.telegram.groups` | map, keyed by chat ID string | `{"*": {require_mention: true}}` | Per-group settings, keyed by the group's chat ID (e.g. `"-1001234567890"` for a supergroup). The key `"*"` is a default applied to any group not otherwise listed. | A non-`"*"` key that does not parse as an integer, or that parses positive (a user ID, not a group ID - groups are negative), is a load error naming the offending key. |
 | `channels.telegram.groups.*.require_mention` | bool | `true` (for the default group) | In a group chat, requires the bot be `@mentioned` (or replied to) before it responds - without this, every group message would be sent to the model. | Setting it `false` on a busy group means the bot reads and may respond to *every* message in that group, which is rarely what you want and burns API calls on irrelevant chatter. |
 | `channels.telegram.groups.*.allow_from` | list of int64 | `[]` (inherits channel-level list) | Per-group allowlist override. Empty means "use `channels.telegram.allow_from`", not "deny everyone" - only the channel-level list's own emptiness is treated as deny-all. | A typo'd or stale entry here silently excludes someone who is on the channel-level list from that one group only; there is no doctor check for this specifically today. |
+| `channels.telegram.api_base_url` | string (URL) | *(empty)* | Points the Telegram client at a Bot API server other than `https://api.telegram.org` - empty means the real thing. Supports a self-hosted [Bot API server](https://github.com/tdlib/telegram-bot-api), and is how MTClaw's own automated tests point the real client at a local fake with no network. **This is a token-trust boundary: whoever runs the named host receives your bot token on every request.** | Non-empty and not an absolute `http(s)` URL fails validation. Pointing it at an untrusted host hands that host your bot token; only ever set this to a server you run or explicitly trust. |
 
 ## `tools.filesystem`
 
@@ -126,9 +134,33 @@ anything here.
 
 ## `storage`
 
+`storage.driver` selects the persistence backend; `storage.dsn` is the
+canonical connection string. `storage.path` is `storage.dsn`'s
+**deprecated** predecessor, kept as a working alias with no removal
+planned: every config written before `storage.dsn` existed keeps loading
+with no user action. Set only one of `storage.dsn` / `storage.path` -
+setting both is a load error naming both keys, since silently preferring
+one could let you edit the wrong key and think you moved your database.
+Only `storage.driver: sqlite` is registered by this binary today, and only
+for that driver is a DSN a filesystem path subject to `~`/relative
+expansion and the parent-directory-creatable check below - a future
+second driver's DSN would be a connection string with different rules.
+
+**Downgrade note.** Once `mtclaw onboard` has been run with a binary new
+enough to write `storage.driver`/`storage.dsn` (or you add either key by
+hand), reverting to an older binary is not a plain rollback: that older
+binary's config loader rejects any unrecognized key outright, so it refuses
+to start against a config containing `driver:`/`dsn:` at all - not merely
+ignore them. Your database file itself is unaffected and safe either way
+(SQLite's own on-disk format did not change). To actually downgrade, edit
+the config first: delete the `driver:` line and rename `dsn:` back to
+`path:` with the same value, then run the older binary.
+
 | Key | Type | Default | Effect | If wrong |
 |---|---|---|---|---|
-| `storage.path` | path | `~/.mtclaw/mtclaw.db` | The SQLite database file: sessions, messages, approvals, exec audit, cron run history. | The parent directory must be creatable or load fails. A file written by a *newer* binary (higher schema version) is refused outright rather than risk corrupting data this binary does not understand - `mtclaw doctor`'s "DB opens and migrates" check surfaces this. |
+| `storage.driver` | string | `sqlite` | Selects the backend `store.Open` dispatches to. Only `sqlite` is registered by this binary. | Any other value fails to load, naming the supported set. |
+| `storage.dsn` | path (for the `sqlite` driver) | `~/.mtclaw/mtclaw.db` | The SQLite database file: sessions, messages, approvals, exec audit, cron run history. | The parent directory must be creatable or load fails. Setting both `storage.dsn` and `storage.path` fails to load, naming both keys. A file written by a *newer* binary (higher schema version) is refused outright rather than risk corrupting data this binary does not understand - `mtclaw doctor`'s "DB opens and migrates" check surfaces this. |
+| `storage.path` | path | *(unset)* | **Deprecated alias for `storage.dsn`.** Still fully supported: a config that sets only `storage.path` loads normally, with one deprecation warning on stderr, and uses that path exactly as before. `mtclaw config show` always renders the resolved value under `dsn`, never `path`, once loaded. | Setting both `storage.dsn` and `storage.path` fails to load, naming both keys. Otherwise behaves exactly like `storage.dsn` above. |
 
 ## `log`
 

@@ -191,8 +191,8 @@ The plan is complete when all of the following hold:
 - [x] `mtclaw onboard` writes a valid `~/.mtclaw/config.yaml` from an empty machine
 - [x] `mtclaw config validate` rejects unknown keys, bad cron expressions, and inline secrets with line-numbered errors
 - [x] `mtclaw doctor` verifies config, DB, OpenAI reachability, Telegram `getMe`, workspace, and shell
-- [ ] `mtclaw prompt "list files in my workspace"` completes a full tool-using agent turn in the terminal
-- [ ] `mtclaw gateway` serves a Telegram DM end to end: message → agent → tool → chunked reply
+- [x] `mtclaw prompt "list files in my workspace"` completes a full tool-using agent turn in the terminal — closed against a fake OpenAI upstream by `internal/cli/prompt_e2e_test.go::TestE2E_PromptCompletesToolUsingTurn` (`plans/260808-1921-portable-store-and-verification/`, phase 1). The mechanics (real gateway code, real tool dispatch, real store) are proven; a real model's own tool-call formatting is not - see `docs/verification.md` §B.1.
+- [x] `mtclaw gateway` serves a Telegram DM end to end: message → agent → tool → chunked reply — closed against a fake Telegram upstream (a real `telego` client talking to an `httptest` server) by `internal/gateway/e2e_test.go::TestE2E_DMRoundTrip_ToolCallFedBackAndChunkAwareReply` and `::TestE2E_ChunkedReply_SplitsAcrossMultipleSendMessageCalls`. Real-Telegram rendering (MarkdownV2) and `/whoami`/`/new`/`/status` are not exercised by any test - see `docs/verification.md` §B.2.
 - [x] A non-allowlisted Telegram user gets no agent turn and no reply
 - [x] A group message without a mention is ignored when `require_mention: true`
 - [x] A deny-listed command is refused without ever prompting the user, and is recorded in `exec_audit`
@@ -200,30 +200,27 @@ The plan is complete when all of the following hold:
 - [x] An unmatched command in `approval` mode produces inline Yes/No buttons; Deny returns a refusal to the model as a tool result, not an error
 - [x] In `auto` mode, a dangerous command still prompts, and classifier failure falls back to prompting (fail-closed)
 - [x] Sessions and history survive a gateway restart
-- [ ] A cron job fires on schedule and delivers to the configured chat, with the run recorded in `cron_runs`
+- [x] A cron job fires on schedule and delivers to the configured chat, with the run recorded in `cron_runs` — closed against a fake Telegram upstream and an anchored (not literally frozen) fake clock by `internal/gateway/e2e_test.go::TestE2E_CronDelivery_RoutesToDeliverToChatAndRecordsRun` plus `::TestE2E_GatewayNew_BuildsCronSchedulerOnlyWhenEnabled` (the scheduler-wiring gap the fake-clock test alone would bypass). The real up-to-60s minute-aligned wait in `cron/scheduler.go`'s `Start` is never exercised this way - see `docs/verification.md` §B.3.
 - [x] Two concurrent gateways with the same token is detected and refused, not left flapping on HTTP 409
 - [x] `go test ./...` passes with the policy engine, config loader, chunker, and gating logic covered by table tests
 - [x] `docs/configuration.md` documents every config key; `docs/security.md` states the exec threat model plainly
 
 ### Remaining manual verification (needs live credentials)
 
-All nine phases are implemented and test-verified (`go test -race ./...` green on
-Windows; 44/44 CLI smoke tests pass; security checklist 20/21 items executed with
-cited tests). The unchecked boxes above and in phases 4–9 are exclusively items
-that require a real OpenAI key and/or Telegram bot token, unavailable in the
-implementation environment:
-
-1. `mtclaw prompt` live tool-using turn + restart context retention (phases 4, 5).
-2. `mtclaw gateway` full Telegram DM round trip; `/whoami`, `/new`, `/status`
-   against a real chat; live token-leak log grep — security checklist #14
-   (phases 6, 7, 9).
-3. A live cron job delivering to a configured chat on schedule (phase 8).
-4. `onboard` on a clean machine; CI green on Linux/macOS (workflows written,
-   first push will exercise them); tagged release producing the five binaries
-   (phase 9 — the Makefile `release` target was already run locally as a rehearsal).
-
-Exact instructions for each are in
-`plans/reports/phase-09-implementation-260801-hardening-release-report.md`.
+See [`docs/verification.md`](../../docs/verification.md) for the current,
+authoritative split between what CI/tests prove automatically and what still
+needs a real OpenAI key and/or Telegram bot token - written by
+`plans/260808-1921-portable-store-and-verification/` (phase 4), the follow-on
+plan that closed the four criteria above with a credential-free e2e harness.
+Six items remain genuinely manual there: a real OpenAI turn, a real Telegram
+DM round trip (including `/whoami`/`/new`/`/status` and real MarkdownV2
+rendering), a real cron fire on a real minute boundary, `onboard` on a clean
+machine, a token-leak log grep with a real credential present, and a tagged
+release actually producing five binaries via GitHub Actions. That document
+also records, honestly, that the CI workflow's `go test -race` matrix is
+correctly *configured* but was not green on its last actual run - two
+causes, both pre-existing and unrelated to the follow-on plan, are cited
+there rather than glossed over.
 
 ## Risks
 

@@ -51,10 +51,21 @@ internal/
               A pure function of (file bytes, env map, OS) - no other
               package reads os.Getenv for config purposes.
   store/      interfaces (Store, SessionStore, MessageStore, ApprovalStore,
-              AuditStore, CronRunStore) + sqlite/ (open, embedded
-              migrations, one file per table). Every other package depends
-              on the interfaces, never on sqlite directly, except cli's
-              wiring and main.go.
+              AuditStore, CronRunStore), a generic SQL implementation (one
+              file per table, e.g. sessions.go/messages.go), the portable
+              embedded migrations/ (tokenized DDL, no driver-specific
+              syntax), dialect.go (the Dialect seam every query rebinds
+              placeholders and renders DDL tokens through), migrate.go (the
+              schema_migrations ledger, embed + apply), and factory.go
+              (Open(cfg)/Register(driver), a database/sql-style registry).
+              sqlite/ is the only registered driver: it holds every SQLite-
+              specific quirk (pragmas, connection pooling, the legacy
+              PRAGMA user_version adoption path) behind Dialect, and
+              registers itself via a blank import - internal/cli and
+              internal/gateway's three production wiring sites import it
+              only as `_ "…/internal/store/sqlite"`, never by name. Adding a
+              second backend is one new package implementing Dialect below
+              this same, unchanged Store interface.
   provider/   Provider interface + Request/Response/ToolSpec types,
               openai/ (the only package allowed to import the OpenAI SDK).
   agent/      the think/act/observe loop, prompt assembly, history
@@ -74,7 +85,13 @@ internal/
               expression parsing only, overlap/catch-up policy is ours.
   logging/    slog handler construction from log.*.
   version/    build-stamped Version/Commit/Date, set via -ldflags.
-docs/         this file, configuration.md, security.md, telegram-setup.md
+  testsupport/  test-only: a fake HOME directory and httptest fakes of the
+              Telegram Bot API and OpenAI's chat-completions endpoint.
+              Imported exclusively from _test.go files across cli/gateway/
+              this package's own fakeapi subpackage - nothing in a
+              non-test build depends on it.
+docs/         this file, configuration.md, security.md, telegram-setup.md,
+              verification.md
 ```
 
 Dependency direction is strictly inward: `channel` and `tools` depend on
@@ -83,6 +100,29 @@ Dependency direction is strictly inward: `channel` and `tools` depend on
 the only packages allowed to wire concrete implementations together. No
 package below `cli` imports `cli`, and no package other than `provider/openai`
 imports the OpenAI SDK.
+
+## Schema versioning
+
+`internal/store/migrate.go` maintains a `schema_migrations` ledger table
+(`version`, `name`, `applied_at`) as the authoritative record of which
+migrations a database has applied - it replaced a bare `PRAGMA user_version`
+check. The SQLite dialect (`internal/store/sqlite/dialect.go`) still sets
+`PRAGMA user_version` to the ledger's highest applied version after every
+successful migration, even though nothing in this codebase reads that pragma
+back anymore.
+
+This is deliberate, and load-bearing for safe downgrades: an older mtclaw
+binary, built before the ledger existed, only ever knows how to check
+`PRAGMA user_version` against its own highest embedded migration. Keeping
+that pragma in sync means an old binary opening a database a newer binary
+has since migrated still sees the correct version number and applies its own
+"database is newer than I understand" refusal correctly, instead of reading
+a stale `0` and either failing confusingly or - worse - trying to write to a
+schema it cannot fully interpret. **A future migration author must not stop
+updating `PRAGMA user_version` when adding a new migration**, even though
+the ledger table alone would be sufficient for every current-binary purpose;
+doing so would silently break the downgrade guard for anyone still running
+an old binary.
 
 ## Request lifecycle
 
