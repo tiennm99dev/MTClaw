@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"testing"
 	"time"
 
@@ -15,6 +14,7 @@ import (
 
 	"github.com/tiennm99/MTClaw/internal/channel/telegram"
 	"github.com/tiennm99/MTClaw/internal/config"
+	"github.com/tiennm99/MTClaw/internal/testsupport"
 )
 
 // useFakeHome points os.UserHomeDir() (HOME on POSIX, USERPROFILE on
@@ -23,16 +23,13 @@ import (
 // through the home directory, and onboard's own doctor step at the end of
 // its run (step 9) exercises those unconditionally - without this, every
 // onboard test would create a real ~/.mtclaw (database, prompts/AGENTS.md)
-// on whatever machine runs the test suite.
+// on whatever machine runs the test suite. The implementation itself lives
+// in internal/testsupport.FakeHome, generalized for internal/gateway's and
+// internal/cli's e2e suites to share; this is a one-line delegate so every
+// existing call site here keeps working unchanged.
 func useFakeHome(t *testing.T) string {
 	t.Helper()
-	home := t.TempDir()
-	if runtime.GOOS == "windows" {
-		t.Setenv("USERPROFILE", home)
-	} else {
-		t.Setenv("HOME", home)
-	}
-	return home
+	return testsupport.FakeHome(t)
 }
 
 // scriptedPrompter drives onboard's prompter interface from a fixed queue

@@ -129,9 +129,12 @@ type realTelegramCapturer struct{}
 var _ telegramCapturer = realTelegramCapturer{}
 
 func (realTelegramCapturer) GetMe(ctx context.Context, token string) (string, error) {
-	return telegram.GetMe(ctx, token)
+	// "" for apiBaseURL: onboard runs before any config file exists, so
+	// there is nothing to read channels.telegram.api_base_url from - it
+	// always talks to the real api.telegram.org.
+	return telegram.GetMe(ctx, token, "")
 }
 
 func (realTelegramCapturer) Capture(ctx context.Context, token string, window time.Duration) ([]telegram.Sender, error) {
-	return telegram.CaptureSenders(ctx, token, window)
+	return telegram.CaptureSenders(ctx, token, "", window)
 }

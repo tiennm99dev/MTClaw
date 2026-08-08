@@ -16,8 +16,14 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tiennm99/MTClaw/internal/channel"
+	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/store"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+
+	// Blank import: registers "sqlite" with store.Open's driver registry.
+	// Nothing else in this package's own dependency graph imports the
+	// sqlite backend package, so this test file is the one place that
+	// has to.
+	_ "github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
 // --- test helpers -----------------------------------------------------------
@@ -28,10 +34,11 @@ import (
 func newTestStore(t *testing.T) store.Store {
 	t.Helper()
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "cron-test.db"), false)
+	dbPath := filepath.Join(t.TempDir(), "cron-test.db")
+	st, err := store.Open(ctx, config.StorageConfig{Driver: "sqlite", DSN: dbPath}, false)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	return sqlite.New(db)
+	t.Cleanup(func() { _ = st.Close() })
+	return st
 }
 
 func discardLogger() *slog.Logger {

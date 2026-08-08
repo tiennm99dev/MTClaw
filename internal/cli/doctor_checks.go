@@ -16,7 +16,11 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/gateway"
 	"github.com/tiennm99/MTClaw/internal/provider/openai"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	"github.com/tiennm99/MTClaw/internal/store"
+
+	// Blank import: see root.go's identical import for why store.Open
+	// cannot resolve "sqlite" without it.
+	_ "github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
 // doctorNetworkTimeout bounds every check that makes an outbound call
@@ -109,23 +113,24 @@ func checkDirWritable(label, dir string) Result {
 	return Result{StatusOK, fmt.Sprintf("%s exists and is writable", dir)}
 }
 
-// checkDatabase opens storage.path the same way a real process would: a
-// database that already exists is opened read-only (never disturbing a
-// live gateway's connection), falling back to read-write only when that
-// fails (a fresh install with no database file yet); either way Open runs
-// pending migrations and refuses a schema newer than this binary supports,
-// so the same error text `doctor` reports here is what a real startup would
-// have hit.
+// checkDatabase opens storage.dsn (via store.Open) the same way a real
+// process would: a database that already exists is opened read-only
+// (never disturbing a live gateway's connection), falling back to
+// read-write only when that fails (a fresh install with no database file
+// yet); either way Open runs pending migrations and refuses a schema newer
+// than this binary supports, so the same error text `doctor` reports here
+// is what a real startup would have hit.
 func checkDatabase(ctx context.Context, cfg *config.Config) Result {
-	db, err := sqlite.Open(ctx, cfg.Storage.Path, true)
+	dsn := cfg.Storage.EffectiveDSN()
+	st, err := store.Open(ctx, cfg.Storage, true)
 	if err != nil {
-		db, err = sqlite.Open(ctx, cfg.Storage.Path, false)
+		st, err = store.Open(ctx, cfg.Storage, false)
 	}
 	if err != nil {
-		return Result{StatusFail, fmt.Sprintf("cannot open database %s: %v - check storage.path's parent directory permissions, or that this binary is at least as new as whatever last wrote this file", cfg.Storage.Path, err)}
+		return Result{StatusFail, fmt.Sprintf("cannot open database %s: %v - check storage.dsn's parent directory permissions, or that this binary is at least as new as whatever last wrote this file", dsn, err)}
 	}
-	defer db.Close()
-	return Result{StatusOK, fmt.Sprintf("%s opens and is at the current schema version", cfg.Storage.Path)}
+	defer st.Close()
+	return Result{StatusOK, fmt.Sprintf("%s opens and is at the current schema version", dsn)}
 }
 
 // checkInstanceLock reports a currently-held lock as INFO, not FAIL: a
@@ -235,7 +240,7 @@ func checkTelegramGetMe(ctx context.Context, cfg *config.Config) Result {
 	}
 	gctx, cancel := context.WithTimeout(ctx, doctorNetworkTimeout)
 	defer cancel()
-	username, err := telegram.GetMe(gctx, tg.Token())
+	username, err := telegram.GetMe(gctx, tg.Token(), tg.APIBaseURL)
 	if err != nil {
 		return Result{StatusFail, fmt.Sprintf("Telegram getMe failed: %v - check the bot token", err)}
 	}

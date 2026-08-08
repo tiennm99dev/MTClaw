@@ -104,6 +104,17 @@ func validateTelegram(cfg *Config, errs *ValidationErrors) {
 		errs.add("channels.telegram.token", "must not be set inline in the config file; use channels.telegram.token_env (or channels.telegram.token_file) instead")
 	}
 
+	if tg.APIBaseURL != "" {
+		// Mirrors validateOpenAI's base_url check: an absolute http(s) URL is
+		// the only shape the bot token can safely be sent to. This is also
+		// the seam an httptest fake plugs into, so the check must accept a
+		// bare "http://127.0.0.1:PORT" with no path.
+		u, err := url.Parse(tg.APIBaseURL)
+		if err != nil || !u.IsAbs() || (u.Scheme != "http" && u.Scheme != "https") {
+			errs.add("channels.telegram.api_base_url", "must be an absolute http(s) URL, got %q", tg.APIBaseURL)
+		}
+	}
+
 	if tg.Enabled && len(tg.AllowFrom) == 0 {
 		hasGroupAllow := false
 		for _, g := range tg.Groups {
@@ -284,9 +295,34 @@ func cronChatIDReachable(tg TelegramConfig, chatID string) bool {
 	return false
 }
 
+// validateStorage checks storage.driver first, since every other rule
+// here is meaningless against a driver this binary does not support; then
+// the storage.dsn/storage.path conflict, since a config that failed that
+// check has no single "the DSN" to run the parent-directory check
+// against; then - only for sqlite, whose DSN is a filesystem path, unlike
+// a future driver's connection-string DSN (see plan.md R7) - that the
+// resolved DSN's parent directory is creatable.
+//
+// By the time this runs via Load, expandStorage (load.go) has already
+// folded a legitimate path-only config's value into DSN and cleared Path,
+// so the both-set check below can afford to be the simple, unambiguous
+// "both fields are non-empty" test: a hand-built Config that reaches this
+// function directly (bypassing Load, as most tests do) must set both
+// fields explicitly to trigger it, which carries none of expandStorage's
+// own default-value ambiguity.
 func validateStorage(cfg *Config, errs *ValidationErrors) {
-	dir := filepath.Dir(cfg.Storage.Path)
+	if cfg.Storage.Driver != "sqlite" {
+		errs.add("storage.driver", "must be one of: sqlite, got %q", cfg.Storage.Driver)
+		return
+	}
+
+	if cfg.Storage.DSN != "" && cfg.Storage.Path != "" {
+		errs.add("storage.dsn", "set either storage.dsn or the deprecated storage.path, not both")
+		return
+	}
+
+	dir := filepath.Dir(cfg.Storage.EffectiveDSN())
 	if err := ensureDirCreatable(dir); err != nil {
-		errs.add("storage.path", "parent directory %q is not creatable: %v", dir, err)
+		errs.add("storage.dsn", "parent directory %q is not creatable: %v", dir, err)
 	}
 }

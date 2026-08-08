@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,7 +10,31 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/tiennm99/MTClaw/internal/testsupport"
 )
+
+// captureStderr redirects os.Stderr to a pipe for the duration of fn,
+// returning everything written to it. Load-time warnings (the storage.path
+// deprecation notice, warnIfWorldReadable) go straight to os.Stderr rather
+// than through a logger, precisely because the logger itself is built from
+// the config Load is still in the middle of producing - so this is the
+// only way to assert on them.
+func captureStderr(t *testing.T, fn func()) string {
+	t.Helper()
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	require.NoError(t, err)
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = orig })
+
+	fn()
+
+	require.NoError(t, w.Close())
+	data, err := io.ReadAll(r)
+	require.NoError(t, err)
+	return string(data)
+}
 
 // validMinimalYAML is the smallest document that satisfies every phase 1
 // validation rule against Default()'s built-in values: it sets the one
@@ -300,6 +325,164 @@ func TestLoad_FileNotFound(t *testing.T) {
 	require.Error(t, err)
 	var notFound *FileNotFoundError
 	assert.ErrorAs(t, err, &notFound)
+}
+
+// TestConfigPath_DefaultAliasPrecedence covers the four cells of the
+// config.yaml/config.yml alias table (see paths.go's defaultConfigPath):
+// yaml-only, yml-only, both-present (yaml wins, one warning), and
+// neither-present (yaml is still the name reported, so the eventual
+// not-found error and `onboard`'s write agree on the canonical extension).
+// Every case uses testsupport.FakeHome so no real home directory is ever
+// touched.
+func TestConfigPath_DefaultAliasPrecedence(t *testing.T) {
+	cases := []struct {
+		name      string
+		writeYAML bool
+		writeYML  bool
+		wantExt   string
+		wantWarn  bool
+	}{
+		{name: "yaml only", writeYAML: true, writeYML: false, wantExt: "yaml"},
+		{name: "yml only", writeYAML: false, writeYML: true, wantExt: "yml"},
+		{name: "both present: yaml wins, one warning naming the ignored yml", writeYAML: true, writeYML: true, wantExt: "yaml", wantWarn: true},
+		{name: "neither present: yaml is still the reported name", writeYAML: false, writeYML: false, wantExt: "yaml"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			home := testsupport.FakeHome(t)
+			dir := filepath.Join(home, ".mtclaw")
+			require.NoError(t, os.MkdirAll(dir, 0o755))
+			if tc.writeYAML {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("version: 1\n"), 0o600))
+			}
+			if tc.writeYML {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yml"), []byte("version: 1\n"), 0o600))
+			}
+
+			var path, source string
+			var err error
+			stderr := captureStderr(t, func() {
+				path, source, err = ConfigPath("")
+			})
+			require.NoError(t, err)
+			assert.Equal(t, "default", source, "the alias must never change the reported source")
+			assert.Equal(t, filepath.Join(dir, "config."+tc.wantExt), path)
+			if tc.wantWarn {
+				assert.Contains(t, stderr, "config.yml")
+				assert.Contains(t, stderr, "config.yaml")
+			} else {
+				assert.Empty(t, stderr, "no warning expected outside the both-present case")
+			}
+		})
+	}
+}
+
+// TestConfigPath_ExplicitFlagNeverAliasResolved is requirement 2 of phase
+// 4: an explicit --config value is used byte-for-byte, whether it ends in
+// .yml (the alias exists) or names a file that does not exist on disk at
+// all (ConfigPath never stats an explicit value - only the default branch
+// does). Neither case touches the real home directory.
+func TestConfigPath_ExplicitFlagNeverAliasResolved(t *testing.T) {
+	testsupport.FakeHome(t)
+
+	t.Run("explicit .yml path is returned verbatim", func(t *testing.T) {
+		dir := t.TempDir()
+		explicit := filepath.Join(dir, "foo.yml")
+		require.NoError(t, os.WriteFile(explicit, []byte("version: 1\n"), 0o600))
+
+		path, source, err := ConfigPath(explicit)
+		require.NoError(t, err)
+		assert.Equal(t, "flag", source)
+		assert.Equal(t, explicit, path)
+	})
+
+	t.Run("explicit path with no matching file on disk is still returned verbatim", func(t *testing.T) {
+		dir := t.TempDir()
+		explicit := filepath.Join(dir, "does-not-exist.yml")
+
+		path, source, err := ConfigPath(explicit)
+		require.NoError(t, err, "ConfigPath itself never checks existence; LoadFile is what reports not-found")
+		assert.Equal(t, "flag", source)
+		assert.Equal(t, explicit, path)
+	})
+}
+
+// TestLoad_StorageDSNOnly is the "new key" half of the storage.dsn/
+// storage.path compatibility contract: a config that only ever mentions
+// dsn loads normally, with EffectiveDSN() reflecting the expanded value
+// and no deprecation warning.
+func TestLoad_StorageDSNOnly(t *testing.T) {
+	baseDir := t.TempDir()
+	yamlDoc := validMinimalYAML + "storage:\n  dsn: \"mtclaw-custom.db\"\n"
+
+	var cfg *Config
+	stderr := captureStderr(t, func() {
+		var err error
+		cfg, err = Load([]byte(yamlDoc), baseDir, map[string]string{})
+		require.NoError(t, err)
+	})
+
+	assert.Equal(t, filepath.Join(baseDir, "mtclaw-custom.db"), cfg.Storage.DSN)
+	assert.Equal(t, "", cfg.Storage.Path)
+	assert.Equal(t, cfg.Storage.DSN, cfg.Storage.EffectiveDSN())
+	assert.NotContains(t, stderr, "storage.path")
+}
+
+// TestLoad_StoragePathAliasWarnsOnceAndNormalizes is the compatibility
+// contract's other half: every config written before storage.dsn existed
+// sets only storage.path, and must keep loading with no user action -
+// with exactly one deprecation warning, and EffectiveDSN() (and, after
+// Load's own normalization, DSN itself) equal to that same path.
+func TestLoad_StoragePathAliasWarnsOnceAndNormalizes(t *testing.T) {
+	baseDir := t.TempDir()
+	yamlDoc := validMinimalYAML + "storage:\n  path: \"mtclaw-legacy.db\"\n"
+
+	var cfg *Config
+	stderr := captureStderr(t, func() {
+		var err error
+		cfg, err = Load([]byte(yamlDoc), baseDir, map[string]string{})
+		require.NoError(t, err)
+	})
+
+	wantDSN := filepath.Join(baseDir, "mtclaw-legacy.db")
+	assert.Equal(t, wantDSN, cfg.Storage.EffectiveDSN())
+	// Load normalizes path into dsn and clears path, so `config show`
+	// renders the canonical key.
+	assert.Equal(t, wantDSN, cfg.Storage.DSN)
+	assert.Equal(t, "", cfg.Storage.Path)
+
+	assert.Equal(t, 1, strings.Count(stderr, "storage.path is deprecated"), "must warn exactly once: %q", stderr)
+}
+
+// TestLoad_StorageBothDSNAndPathSetFails proves the full Load pipeline
+// surfaces validateStorage's both-set error, naming both keys, rather than
+// silently preferring one - the scenario expandStorage's default-value
+// heuristic must NOT swallow, since both values here are explicit and
+// distinct from storage.dsn's own default.
+func TestLoad_StorageBothDSNAndPathSetFails(t *testing.T) {
+	baseDir := t.TempDir()
+	yamlDoc := validMinimalYAML + "storage:\n  dsn: \"mtclaw-custom.db\"\n  path: \"mtclaw-legacy.db\"\n"
+
+	_, err := Load([]byte(yamlDoc), baseDir, map[string]string{})
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "storage.dsn")
+	assert.Contains(t, msg, "storage.path")
+	assert.Contains(t, msg, "not both")
+}
+
+// TestLoad_StorageUnsupportedDriverFails proves the whole-pipeline
+// rejection of a driver this binary never registers - see
+// internal/store/factory_test.go for the matching runtime-side assertion
+// against store.Open itself.
+func TestLoad_StorageUnsupportedDriverFails(t *testing.T) {
+	baseDir := t.TempDir()
+	yamlDoc := validMinimalYAML + "storage:\n  driver: postgres\n"
+
+	_, err := Load([]byte(yamlDoc), baseDir, map[string]string{})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `storage.driver: must be one of: sqlite, got "postgres"`)
 }
 
 // TestMarshalRedacted_NeverLeaksSecretMaterial is the config-show snapshot

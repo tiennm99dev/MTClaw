@@ -39,6 +39,20 @@ type Channel struct {
 	botID    int64
 }
 
+// newBot builds a *telego.Bot for token, always discarding telego's own
+// logger (see New's doc comment for why), and additionally pointing it at
+// apiBaseURL via telego.WithAPIServer when apiBaseURL is non-empty. Every
+// production call site (New, SendOnce, GetMe) and CaptureSenders goes
+// through this one helper so "does this bot talk to the real Telegram API
+// or a configured/faked alternative" has exactly one answer, in one place.
+func newBot(token, apiBaseURL string) (*telego.Bot, error) {
+	opts := []telego.BotOption{telego.WithDiscardLogger()}
+	if apiBaseURL != "" {
+		opts = append(opts, telego.WithAPIServer(apiBaseURL))
+	}
+	return telego.NewBot(token, opts...)
+}
+
 // New constructs a Channel from a resolved token (cfg.Channels.Telegram.Token()
 // must already be non-empty; Load's secret resolution is what fills it in).
 // deps may be nil - the gateway (phase 7) supplies it once a session
@@ -58,7 +72,7 @@ func New(cfg *config.Config, approvals store.ApprovalStore, deps Deps, log *slog
 		return nil, fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
 	}
 
-	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
+	bot, err := newBot(token, cfg.Channels.Telegram.APIBaseURL)
 	if err != nil {
 		return nil, fmt.Errorf("telegram: construct bot: %w", err)
 	}
@@ -77,12 +91,14 @@ func New(cfg *config.Config, approvals store.ApprovalStore, deps Deps, log *slog
 // without building a full Channel (no approver, no store involved at all).
 // This is what `mtclaw send` (a one-shot outbound message, useful for
 // scripts and for verifying a token before running the gateway) uses
-// instead of standing up a Channel.
-func SendOnce(ctx context.Context, token, chatID, threadID, text string) error {
+// instead of standing up a Channel. apiBaseURL is normally
+// cfg.Channels.Telegram.APIBaseURL, forwarded so this one-shot path honors
+// the same Bot API server override the gateway does.
+func SendOnce(ctx context.Context, token, apiBaseURL, chatID, threadID, text string) error {
 	if token == "" {
 		return fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
 	}
-	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
+	bot, err := newBot(token, apiBaseURL)
 	if err != nil {
 		return fmt.Errorf("telegram: construct bot: %w", err)
 	}
@@ -92,12 +108,14 @@ func SendOnce(ctx context.Context, token, chatID, threadID, text string) error {
 // GetMe constructs a bot directly from token and returns its username,
 // without building a full Channel - the same one-shot shape as SendOnce,
 // used by `mtclaw doctor`'s Telegram getMe check and `onboard`'s bot-identity
-// confirmation (phase 9) instead of standing up a Channel.
-func GetMe(ctx context.Context, token string) (username string, err error) {
+// confirmation (phase 9) instead of standing up a Channel. apiBaseURL is
+// normally cfg.Channels.Telegram.APIBaseURL; onboard has no config to read
+// one from yet, so it always passes "".
+func GetMe(ctx context.Context, token, apiBaseURL string) (username string, err error) {
 	if token == "" {
 		return "", fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
 	}
-	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
+	bot, err := newBot(token, apiBaseURL)
 	if err != nil {
 		return "", fmt.Errorf("telegram: construct bot: %w", err)
 	}

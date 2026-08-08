@@ -1,4 +1,4 @@
-package sqlite
+package store
 
 import (
 	"context"
@@ -6,17 +6,16 @@ import (
 	"errors"
 	"fmt"
 	"time"
-
-	"github.com/tiennm99/MTClaw/internal/store"
 )
 
 const approvalColumns = "id, session_id, channel, chat_id, tool, command, reason, state, message_id, created_at, expires_at, decided_at, decided_by"
 
 type approvalStore struct {
-	db *DB
+	db *sql.DB
+	d  Dialect
 }
 
-func (a *approvalStore) Create(ctx context.Context, ap *store.Approval) error {
+func (a *approvalStore) Create(ctx context.Context, ap *Approval) error {
 	if ap.ID == "" {
 		id, err := newApprovalNonce()
 		if err != nil {
@@ -31,9 +30,9 @@ func (a *approvalStore) Create(ctx context.Context, ap *store.Approval) error {
 		ap.State = "pending"
 	}
 
-	_, err := a.db.ExecContext(ctx, `
+	_, err := a.db.ExecContext(ctx, a.d.Rebind(`
 		INSERT INTO approvals (id, session_id, channel, chat_id, tool, command, reason, state, message_id, created_at, expires_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`),
 		ap.ID, ap.SessionID, ap.Channel, ap.ChatID, ap.Tool, ap.Command, ap.Reason, ap.State, ap.MessageID,
 		toMillis(ap.CreatedAt), toMillis(ap.ExpiresAt),
 	)
@@ -48,15 +47,15 @@ func (a *approvalStore) Create(ctx context.Context, ap *store.Approval) error {
 // exist: the row may have already expired or been decided by the time the
 // send confirms, and that race must never turn into a failed Ask call.
 func (a *approvalStore) SetMessageID(ctx context.Context, id, messageID string) error {
-	_, err := a.db.ExecContext(ctx, `UPDATE approvals SET message_id = ? WHERE id = ?`, messageID, id)
+	_, err := a.db.ExecContext(ctx, a.d.Rebind(`UPDATE approvals SET message_id = ? WHERE id = ?`), messageID, id)
 	if err != nil {
 		return fmt.Errorf("set approval message id %s: %w", id, err)
 	}
 	return nil
 }
 
-func (a *approvalStore) Get(ctx context.Context, id string) (*store.Approval, error) {
-	row := a.db.QueryRowContext(ctx, `SELECT `+approvalColumns+` FROM approvals WHERE id = ?`, id)
+func (a *approvalStore) Get(ctx context.Context, id string) (*Approval, error) {
+	row := a.db.QueryRowContext(ctx, a.d.Rebind(`SELECT `+approvalColumns+` FROM approvals WHERE id = ?`), id)
 	ap, err := scanApproval(row)
 	if err != nil {
 		return nil, fmt.Errorf("get approval %s: %w", id, err)
@@ -70,9 +69,9 @@ func (a *approvalStore) Get(ctx context.Context, id string) (*store.Approval, er
 // the first UPDATE matches a row, the second affects zero rows and returns
 // ErrAlreadyDecided.
 func (a *approvalStore) Decide(ctx context.Context, id, state, by string) error {
-	res, err := a.db.ExecContext(ctx, `
+	res, err := a.db.ExecContext(ctx, a.d.Rebind(`
 		UPDATE approvals SET state = ?, decided_at = ?, decided_by = ?
-		WHERE id = ? AND state = 'pending'`,
+		WHERE id = ? AND state = 'pending'`),
 		state, toMillis(time.Now()), by, id,
 	)
 	if err != nil {
@@ -90,16 +89,16 @@ func (a *approvalStore) Decide(ctx context.Context, id, state, by string) error 
 	// pending. Distinguish the two so callers can tell "unknown approval"
 	// from "already decided".
 	if _, err := a.Get(ctx, id); err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			return store.ErrNotFound
+		if errors.Is(err, ErrNotFound) {
+			return ErrNotFound
 		}
 		return fmt.Errorf("decide approval %s: %w", id, err)
 	}
-	return store.ErrAlreadyDecided
+	return ErrAlreadyDecided
 }
 
 func (a *approvalStore) ExpirePending(ctx context.Context, now time.Time) (int, error) {
-	res, err := a.db.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE state = 'pending' AND expires_at < ?`, toMillis(now))
+	res, err := a.db.ExecContext(ctx, a.d.Rebind(`UPDATE approvals SET state = 'expired' WHERE state = 'pending' AND expires_at < ?`), toMillis(now))
 	if err != nil {
 		return 0, fmt.Errorf("expire pending approvals: %w", err)
 	}
@@ -110,8 +109,8 @@ func (a *approvalStore) ExpirePending(ctx context.Context, now time.Time) (int, 
 	return int(n), nil
 }
 
-func scanApproval(row rowScanner) (*store.Approval, error) {
-	var a store.Approval
+func scanApproval(row rowScanner) (*Approval, error) {
+	var a Approval
 	var createdAt, expiresAt int64
 	var decidedAt sql.NullInt64
 	err := row.Scan(
@@ -120,7 +119,7 @@ func scanApproval(row rowScanner) (*store.Approval, error) {
 	)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, store.ErrNotFound
+			return nil, ErrNotFound
 		}
 		return nil, err
 	}

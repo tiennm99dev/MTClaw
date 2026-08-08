@@ -12,7 +12,15 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/logging"
 	"github.com/tiennm99/MTClaw/internal/store"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+
+	// Blank import: registers "sqlite" with store.Open's driver registry
+	// via the sqlite backend package's own init(). store cannot import
+	// that package directly - it already imports store, so that would
+	// cycle - which is why this line, not a normal import, is what makes
+	// storage.driver: sqlite resolvable at all. Forgetting it fails at
+	// runtime (store.ErrUnknownDriver), not at compile time; see
+	// plan.md's R8.
+	_ "github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
 // state is process-wide command state populated by the root command's
@@ -44,12 +52,12 @@ func Execute() error {
 	return err
 }
 
-// openStore lazily opens the sqlite store backing cfg.Storage.Path,
-// reusing the same handle across multiple calls within one process.
-// readOnly selects a read-only connection for inspection commands
-// (`sessions list`, `sessions show`); write commands (`sessions rm` today;
-// `prompt` and `cron run` in later phases) must pass false. See
-// Execute for where the handle gets closed.
+// openStore lazily opens the store backing cfg.Storage (via store.Open's
+// driver registry - see the blank import above), reusing the same handle
+// across multiple calls within one process. readOnly selects a read-only
+// connection for inspection commands (`sessions list`, `sessions show`);
+// write commands (`sessions rm` today; `prompt` and `cron run` in later
+// phases) must pass false. See Execute for where the handle gets closed.
 func (s *state) openStore(ctx context.Context, readOnly bool) (store.Store, error) {
 	if s.store != nil {
 		return s.store, nil
@@ -57,11 +65,11 @@ func (s *state) openStore(ctx context.Context, readOnly bool) (store.Store, erro
 	if s.cfg == nil {
 		return nil, fmt.Errorf("open store: config not loaded")
 	}
-	db, err := sqlite.Open(ctx, s.cfg.Storage.Path, readOnly)
+	st, err := store.Open(ctx, s.cfg.Storage, readOnly)
 	if err != nil {
 		return nil, fmt.Errorf("open store: %w", err)
 	}
-	s.store = sqlite.New(db)
+	s.store = st
 	return s.store, nil
 }
 
@@ -86,7 +94,7 @@ func newRootCmd(s *state) *cobra.Command {
 		},
 	}
 
-	root.PersistentFlags().StringVar(&s.configFlag, "config", "", "path to the config file (default: $MTCLAW_CONFIG or ~/.mtclaw/config.yaml)")
+	root.PersistentFlags().StringVar(&s.configFlag, "config", "", "path to the config file (default: $MTCLAW_CONFIG or ~/.mtclaw/config.yaml, falling back to config.yml)")
 	root.PersistentFlags().StringVar(&s.logLevelFlag, "log-level", "", "override log.level from the config file (debug|info|warn|error)")
 
 	root.AddCommand(newVersionCmd())

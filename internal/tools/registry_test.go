@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"log/slog"
+	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -11,7 +12,9 @@ import (
 	"github.com/tiennm99/MTClaw/internal/agent"
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/provider"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	"github.com/tiennm99/MTClaw/internal/store"
+	// This package's own exec_test.go already carries the blank import
+	// that registers "sqlite" with store.Open's driver registry.
 )
 
 func TestRegistry_Run_UnknownToolReturnsResultStringNotError(t *testing.T) {
@@ -45,12 +48,13 @@ func newTestFullConfig(t *testing.T) config.Config {
 	return cfg
 }
 
-func newTestStoreForRegistry(t *testing.T) *sqlite.Store {
+func newTestStoreForRegistry(t *testing.T) store.Store {
 	t.Helper()
-	db, err := sqlite.Open(context.Background(), t.TempDir()+"/test.db", false)
+	dbPath := filepath.Join(t.TempDir(), "test.db")
+	st, err := store.Open(context.Background(), config.StorageConfig{Driver: "sqlite", DSN: dbPath}, false)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	return sqlite.New(db)
+	t.Cleanup(func() { _ = st.Close() })
+	return st
 }
 
 func TestNew_ModeOff_ExecToolNotRegistered(t *testing.T) {

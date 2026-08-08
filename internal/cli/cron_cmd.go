@@ -233,7 +233,7 @@ func deliverCronResult(cmd *cobra.Command, s *state, d config.CronDeliverTo, tex
 	if token == "" {
 		return fmt.Errorf("no telegram bot token resolved; set channels.telegram.token_env or channels.telegram.token_file")
 	}
-	if err := telegram.SendOnce(cmd.Context(), token, d.ChatID, "", text); err != nil {
+	if err := telegram.SendOnce(cmd.Context(), token, s.cfg.Channels.Telegram.APIBaseURL, d.ChatID, "", text); err != nil {
 		return fmt.Errorf("deliver result: %w", err)
 	}
 	_, err := fmt.Fprintf(cmd.OutOrStdout(), "delivered to chat %s\n", d.ChatID)

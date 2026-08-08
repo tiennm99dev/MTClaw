@@ -118,6 +118,15 @@ type TelegramConfig struct {
 	TokenInline string                         `yaml:"token,omitempty"`
 	AllowFrom   []int64                        `yaml:"allow_from"`
 	Groups      map[string]TelegramGroupConfig `yaml:"groups"`
+	// APIBaseURL points the channel at a Bot API server other than
+	// https://api.telegram.org (empty means the real thing): a self-hosted
+	// Bot API server, or - the reason this key exists at all - an
+	// httptest fake so internal/gateway's and internal/cli's e2e suites can
+	// drive the real telego client with no network and no real bot token.
+	// This is a token-trust boundary: whoever runs the named host receives
+	// the resolved bot token on every request, so validate.go requires an
+	// absolute http(s) URL and docs/configuration.md says so plainly.
+	APIBaseURL string `yaml:"api_base_url"`
 
 	token       string
 	tokenSource string
@@ -212,9 +221,50 @@ type CronDeliverTo struct {
 	ChatID  string `yaml:"chat_id"`
 }
 
-// StorageConfig points at the SQLite database file.
+// StorageConfig selects the persistence backend and where its data lives.
+// internal/store/factory.go dispatches on Driver via a driver registry
+// (the database/sql pattern); "sqlite" is the only backend this binary
+// registers today - a second backend is a new package plus a new entry in
+// validateStorage's driver whitelist, nothing here has to change shape.
 type StorageConfig struct {
-	Path string `yaml:"path"`
+	// Driver selects the backend by the name it registered itself under
+	// (store.Register, called from a backend's own init()). Only "sqlite"
+	// is registered today; see validateStorage.
+	Driver string `yaml:"driver"`
+
+	// DSN is the canonical connection string: for sqlite, a filesystem
+	// path to the database file. Never read this field directly - use
+	// EffectiveDSN - because a config loaded from a pre-existing file may
+	// still carry only the deprecated Path field below.
+	DSN string `yaml:"dsn"`
+
+	// Path is storage.dsn's predecessor, kept as a working, permanently
+	// deprecated alias (no removal planned - see plan.md's "Decision:
+	// path vs dsn") so every config written before storage.dsn existed
+	// keeps loading with no user action. Setting both Path and DSN in the
+	// same config is a validation error naming both keys, not a silent
+	// preference for one - see validateStorage. Load folds a path-only
+	// config's value into DSN and clears Path once validation passes, so
+	// a Config that came from Load never actually carries both; a
+	// hand-built Config (most tests, and onboard's freshly-Default()'d
+	// value before it is ever written to disk) is the normal place either
+	// field is set alone. omitempty keeps a config onboard writes - which
+	// never touches this field - free of a stray, meaningless
+	// `path: ""` line.
+	Path string `yaml:"path,omitempty"`
+}
+
+// EffectiveDSN returns the DSN every consumer should actually open: DSN
+// when set, otherwise the deprecated Path alias. This is the one read path
+// store.Open, doctor's DB check, and every log line naming "the database"
+// use, so a legacy path-only config and a freshly-normalized dsn config
+// behave identically to code that never touched Load's own normalization
+// (most tests build a Config by hand, not through Load).
+func (s StorageConfig) EffectiveDSN() string {
+	if s.DSN != "" {
+		return s.DSN
+	}
+	return s.Path
 }
 
 // LogConfig configures the slog logger built in internal/logging.

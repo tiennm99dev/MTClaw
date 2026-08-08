@@ -1,4 +1,4 @@
-package sqlite
+package store
 
 import (
 	"database/sql"
@@ -30,7 +30,7 @@ func fromMillis(ms int64) time.Time {
 }
 
 // toNullMillis converts an optional Go time (nil or zero means absent) to
-// a nullable SQLite integer column.
+// a nullable integer column.
 func toNullMillis(t *time.Time) sql.NullInt64 {
 	if t == nil || t.IsZero() {
 		return sql.NullInt64{}
@@ -47,7 +47,7 @@ func fromNullMillis(v sql.NullInt64) *time.Time {
 	return &t
 }
 
-// toNullInt converts an optional *int to a nullable SQLite integer column.
+// toNullInt converts an optional *int to a nullable integer column.
 func toNullInt(v *int) sql.NullInt64 {
 	if v == nil {
 		return sql.NullInt64{}
@@ -64,8 +64,7 @@ func fromNullInt(v sql.NullInt64) *int {
 	return &i
 }
 
-// toNullInt64 converts an optional *int64 to a nullable SQLite integer
-// column.
+// toNullInt64 converts an optional *int64 to a nullable integer column.
 func toNullInt64(v *int64) sql.NullInt64 {
 	if v == nil {
 		return sql.NullInt64{}
@@ -82,7 +81,7 @@ func fromNullInt64(v sql.NullInt64) *int64 {
 	return &i
 }
 
-// boolToInt converts a Go bool to the 0/1 SQLite stores it as.
+// boolToInt converts a Go bool to the 0/1 integer it stores as.
 func boolToInt(b bool) int {
 	if b {
 		return 1

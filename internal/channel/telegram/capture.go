@@ -22,9 +22,11 @@ type Sender struct {
 // returning on the first message - a second, later sender is exactly the
 // case onboard needs to surface, not race past. The caller is responsible
 // for getting explicit on-screen confirmation before writing anything to
-// config; CaptureSenders itself never touches disk.
-func CaptureSenders(ctx context.Context, token string, window time.Duration) ([]Sender, error) {
-	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
+// config; CaptureSenders itself never touches disk. apiBaseURL is normally
+// cfg.Channels.Telegram.APIBaseURL; onboard has no config to read one from
+// yet, so it always passes "".
+func CaptureSenders(ctx context.Context, token, apiBaseURL string, window time.Duration) ([]Sender, error) {
+	bot, err := newBot(token, apiBaseURL)
 	if err != nil {
 		return nil, err
 	}

@@ -2,6 +2,18 @@ package config
 
 import "time"
 
+// defaultStorageDSN is storage.dsn's built-in value, applied both by
+// Default() (so a hand-built Config, and the file `mtclaw onboard`
+// writes, both show a concrete, usable path rather than an empty string)
+// and - compared against literally, before either field is path-expanded
+// - by expandStorage in load.go, which is where it earns its keep: Load
+// always decodes the user's YAML onto this already-populated struct, so a
+// config that sets only the deprecated storage.path cannot be told apart
+// from one that also happens to repeat storage.dsn's own default by
+// looking at field emptiness alone. See expandStorage's doc comment for
+// the full reasoning, including the one edge case this cannot resolve.
+const defaultStorageDSN = "~/.mtclaw/mtclaw.db"
+
 // Default returns a Config populated with MTClaw's built-in defaults. Load
 // decodes the user's YAML onto this struct, so any key the user omits keeps
 // its value here.
@@ -33,6 +45,9 @@ func Default() *Config {
 				Groups: map[string]TelegramGroupConfig{
 					"*": {RequireMention: true},
 				},
+				// APIBaseURL is deliberately left unset: empty means telego's
+				// own default (https://api.telegram.org). Only a config file
+				// or a test that builds a Config directly ever sets it.
 			},
 		},
 		Tools: ToolsConfig{
@@ -64,7 +79,8 @@ func Default() *Config {
 			Timezone: "Local",
 		},
 		Storage: StorageConfig{
-			Path: "~/.mtclaw/mtclaw.db",
+			Driver: "sqlite",
+			DSN:    defaultStorageDSN,
 		},
 		Log: LogConfig{
 			Level:  "info",

@@ -24,7 +24,7 @@ func validConfig(t *testing.T) *Config {
 	cfg.Channels.Telegram.Enabled = false
 	cfg.Tools.Filesystem.Roots = []string{root}
 	cfg.Tools.Exec.CWD = root
-	cfg.Storage.Path = filepath.Join(root, "mtclaw.db")
+	cfg.Storage.DSN = filepath.Join(root, "mtclaw.db")
 	cfg.Cron.Timezone = "UTC"
 	return cfg
 }
@@ -142,6 +142,27 @@ func TestValidate_TelegramGroupKeys(t *testing.T) {
 	assert.Contains(t, msg, "channels.telegram.groups.not-a-num: invalid chat id")
 	assert.Contains(t, msg, "channels.telegram.groups.123456789")
 	assert.Contains(t, msg, "looks like a user id")
+}
+
+func TestValidate_TelegramAPIBaseURL(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Channels.Telegram.APIBaseURL = "not-a-url"
+
+	err := Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `channels.telegram.api_base_url: must be an absolute http(s) URL, got "not-a-url"`)
+}
+
+func TestValidate_TelegramAPIBaseURLEmptyIsValid(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Channels.Telegram.APIBaseURL = ""
+	assert.NoError(t, Validate(cfg))
+}
+
+func TestValidate_TelegramAPIBaseURLAbsoluteHTTPIsValid(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Channels.Telegram.APIBaseURL = "http://127.0.0.1:8080"
+	assert.NoError(t, Validate(cfg))
 }
 
 func TestValidate_ExecMode(t *testing.T) {
@@ -288,19 +309,39 @@ func TestValidate_CronDeliverTo(t *testing.T) {
 func TestValidate_StorageParentDirCreatable(t *testing.T) {
 	cfg := validConfig(t)
 	// Parent does not exist yet but is creatable under a writable temp dir.
-	cfg.Storage.Path = filepath.Join(t.TempDir(), "nested", "dirs", "mtclaw.db")
+	cfg.Storage.DSN = filepath.Join(t.TempDir(), "nested", "dirs", "mtclaw.db")
 	assert.NoError(t, Validate(cfg))
 }
 
 func TestValidate_StorageParentDirNotCreatable(t *testing.T) {
 	cfg := validConfig(t)
 	// A regular file cannot be treated as a directory: MkdirAll must fail
-	// when the storage path's parent collides with an existing file.
+	// when the DSN's parent collides with an existing file.
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o644))
-	cfg.Storage.Path = filepath.Join(blocker, "mtclaw.db")
+	cfg.Storage.DSN = filepath.Join(blocker, "mtclaw.db")
 
 	err := Validate(cfg)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "storage.path: parent directory")
+	assert.Contains(t, err.Error(), "storage.dsn: parent directory")
+}
+
+func TestValidate_StorageBothDSNAndPathSet(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Storage.DSN = filepath.Join(t.TempDir(), "via-dsn.db")
+	cfg.Storage.Path = filepath.Join(t.TempDir(), "via-path.db")
+
+	err := Validate(cfg)
+	require.Error(t, err)
+	msg := err.Error()
+	assert.Contains(t, msg, "storage.dsn: set either storage.dsn or the deprecated storage.path, not both")
+}
+
+func TestValidate_StorageUnsupportedDriver(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Storage.Driver = "postgres"
+
+	err := Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `storage.driver: must be one of: sqlite, got "postgres"`)
 }

@@ -1,29 +1,29 @@
-package sqlite
+package store
 
 import (
 	"context"
 	"database/sql"
 	"fmt"
 	"time"
-
-	"github.com/tiennm99/MTClaw/internal/store"
 )
 
 type messageStore struct {
-	db *DB
+	db *sql.DB
+	d  Dialect
 }
 
 // Append assigns seq atomically and commits the whole slice in one
-// transaction, on the writer's BEGIN IMMEDIATE handle (see dsn's
-// _txlock=immediate): reading COALESCE(MAX(seq),0) and inserting the batch
-// must not interleave with another writer's Append on the same session, or
-// two callers could compute the same next seq and collide on the
-// UNIQUE(session_id, seq) constraint - or worse, silently skip a seq if
-// the constraint were ever relaxed. Any failure mid-batch rolls back every
-// row this call attempted, including ones inserted earlier in the same
-// call, so a turn's assistant tool_calls row can never persist without its
-// matching tool rows.
-func (m *messageStore) Append(ctx context.Context, sessionID string, msgs []store.Message) error {
+// transaction, on the writer's BEGIN IMMEDIATE handle (see the sqlite
+// dialect's dsn helper for _txlock=immediate): reading
+// COALESCE(MAX(seq),0) and inserting the batch must not interleave with
+// another writer's Append on the same session, or two callers could
+// compute the same next seq and collide on the UNIQUE(session_id, seq)
+// constraint - or worse, silently skip a seq if the constraint were ever
+// relaxed. Any failure mid-batch rolls back every row this call
+// attempted, including ones inserted earlier in the same call, so a
+// turn's assistant tool_calls row can never persist without its matching
+// tool rows.
+func (m *messageStore) Append(ctx context.Context, sessionID string, msgs []Message) error {
 	if len(msgs) == 0 {
 		return nil
 	}
@@ -35,14 +35,14 @@ func (m *messageStore) Append(ctx context.Context, sessionID string, msgs []stor
 	defer func() { _ = tx.Rollback() }()
 
 	var maxSeq sql.NullInt64
-	if err := tx.QueryRowContext(ctx, `SELECT MAX(seq) FROM messages WHERE session_id = ?`, sessionID).Scan(&maxSeq); err != nil {
+	if err := tx.QueryRowContext(ctx, m.d.Rebind(`SELECT MAX(seq) FROM messages WHERE session_id = ?`), sessionID).Scan(&maxSeq); err != nil {
 		return fmt.Errorf("append messages: read max seq: %w", err)
 	}
 	next := maxSeq.Int64 // 0 when the session has no messages yet (NULL scans as 0, invalid)
 
-	stmt, err := tx.PrepareContext(ctx, `
+	stmt, err := tx.PrepareContext(ctx, m.d.Rebind(`
 		INSERT INTO messages (session_id, seq, role, content, tool_calls, tool_call_id, tool_name, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)`))
 	if err != nil {
 		return fmt.Errorf("append messages: prepare insert: %w", err)
 	}
@@ -62,23 +62,27 @@ func (m *messageStore) Append(ctx context.Context, sessionID string, msgs []stor
 	return nil
 }
 
-func (m *messageStore) Recent(ctx context.Context, sessionID string, n int) ([]store.Message, error) {
-	if n <= 0 {
-		n = -1
+// Recent returns the last n messages in ascending seq order. n <= 0 omits
+// the LIMIT clause entirely (see sessions.go's List for why that, not a
+// driver-specific sentinel, is how this package spells "no limit").
+func (m *messageStore) Recent(ctx context.Context, sessionID string, n int) ([]Message, error) {
+	query := `SELECT id, session_id, seq, role, content, tool_calls, tool_call_id, tool_name, created_at
+		FROM messages WHERE session_id = ? ORDER BY seq DESC`
+	args := []any{sessionID}
+	if n > 0 {
+		query += ` LIMIT ?`
+		args = append(args, n)
 	}
-	rows, err := m.db.QueryContext(ctx, `
-		SELECT id, session_id, seq, role, content, tool_calls, tool_call_id, tool_name, created_at
-		FROM messages WHERE session_id = ? ORDER BY seq DESC LIMIT ?`,
-		sessionID, n,
-	)
+
+	rows, err := m.db.QueryContext(ctx, m.d.Rebind(query), args...)
 	if err != nil {
 		return nil, fmt.Errorf("recent messages for session %s: %w", sessionID, err)
 	}
 	defer rows.Close()
 
-	var desc []store.Message
+	var desc []Message
 	for rows.Next() {
-		var msg store.Message
+		var msg Message
 		var createdAt int64
 		if err := rows.Scan(&msg.ID, &msg.SessionID, &msg.Seq, &msg.Role, &msg.Content, &msg.ToolCalls, &msg.ToolCallID, &msg.ToolName, &createdAt); err != nil {
 			return nil, fmt.Errorf("recent messages for session %s: %w", sessionID, err)
@@ -100,14 +104,14 @@ func (m *messageStore) Recent(ctx context.Context, sessionID string, n int) ([]s
 
 func (m *messageStore) CountBySession(ctx context.Context, sessionID string) (int, error) {
 	var n int
-	if err := m.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM messages WHERE session_id = ?`, sessionID).Scan(&n); err != nil {
+	if err := m.db.QueryRowContext(ctx, m.d.Rebind(`SELECT COUNT(*) FROM messages WHERE session_id = ?`), sessionID).Scan(&n); err != nil {
 		return 0, fmt.Errorf("count messages for session %s: %w", sessionID, err)
 	}
 	return n, nil
 }
 
 func (m *messageStore) DeleteBySession(ctx context.Context, sessionID string) error {
-	if _, err := m.db.ExecContext(ctx, `DELETE FROM messages WHERE session_id = ?`, sessionID); err != nil {
+	if _, err := m.db.ExecContext(ctx, m.d.Rebind(`DELETE FROM messages WHERE session_id = ?`), sessionID); err != nil {
 		return fmt.Errorf("delete messages for session %s: %w", sessionID, err)
 	}
 	return nil

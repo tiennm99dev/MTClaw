@@ -1,7 +1,9 @@
 // Package store defines the persistence interfaces every other MTClaw
-// package (agent loop, policy engine, cron scheduler, CLI) depends on. The
-// SQLite implementation lives in internal/store/sqlite; keeping the
-// interfaces here lets tests fake the store without a real database.
+// package (agent loop, policy engine, cron scheduler, CLI) depends on, plus
+// the one generic SQL implementation of them shared by every backend. A
+// concrete backend (internal/store/sqlite is the only one today) supplies
+// nothing but a Dialect (dialect.go) and a migrated *sql.DB; see
+// migrate.go for the portable migration ledger every backend shares.
 package store
 
 import (

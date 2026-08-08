@@ -29,7 +29,7 @@ func newSendCmd(s *state) *cobra.Command {
 				return fmt.Errorf("no telegram bot token resolved; set channels.telegram.token_env or channels.telegram.token_file")
 			}
 
-			if err := telegram.SendOnce(cmd.Context(), token, chatFlag, threadFlag, args[0]); err != nil {
+			if err := telegram.SendOnce(cmd.Context(), token, s.cfg.Channels.Telegram.APIBaseURL, chatFlag, threadFlag, args[0]); err != nil {
 				return fmt.Errorf("send message: %w", err)
 			}
 

@@ -51,7 +51,7 @@ func logStartupBanner(log *slog.Logger, s *state) {
 		"model", s.cfg.Agent.Model,
 		"exec_mode", s.cfg.Tools.Exec.Mode,
 		"workspace", s.cfg.Agent.Workspace,
-		"db_path", s.cfg.Storage.Path,
+		"storage_dsn", s.cfg.Storage.EffectiveDSN(),
 	)
 	if s.cfg.Tools.Exec.Mode == "auto" {
 		log.Warn("mtclaw: tools.exec.mode is \"auto\" (beta) - the LLM classifier is not a security control; the deny-list is the only real enforcement boundary")
