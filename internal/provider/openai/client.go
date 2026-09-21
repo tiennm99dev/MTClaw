@@ -67,7 +67,14 @@ func NewWithAPIKey(apiKey, baseURL string, timeout time.Duration) (*Client, erro
 	if apiKey == "" {
 		return nil, fmt.Errorf("openai: empty API key")
 	}
-	opts := []option.RequestOption{option.WithAPIKey(apiKey)}
+	// Mirrors New's retry budget (config.Default().OpenAI.MaxRetries) even
+	// though there is no config.OpenAIConfig in scope here, so a key check
+	// at onboarding does not silently fall back to the SDK's own default
+	// retry count.
+	opts := []option.RequestOption{
+		option.WithAPIKey(apiKey),
+		option.WithMaxRetries(config.Default().OpenAI.MaxRetries),
+	}
 	if baseURL != "" {
 		opts = append(opts, option.WithBaseURL(baseURL))
 	}

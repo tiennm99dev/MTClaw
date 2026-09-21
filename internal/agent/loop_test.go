@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -401,4 +402,145 @@ func TestRun_UnknownSession_ReturnsError(t *testing.T) {
 	loop := New(testAgentConfig(), mock.New(), st, &fakeToolRunner{}, nil)
 	result := loop.Run(context.Background(), "does-not-exist", "hi", "", nil)
 	require.Error(t, result.Err)
+}
+
+// TestRun_ToolCallsDispatchOnPayloadRegardlessOfFinishReason covers a
+// backend that returns a populated ToolCalls slice under FinishReason
+// "stop" - the shape several OpenAI-compatible endpoints send. The loop
+// must still run the tools and must never let ToolCalls reach the store on
+// the turn's terminal row.
+func TestRun_ToolCallsDispatchOnPayloadRegardlessOfFinishReason(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	calls := []provider.ToolCall{{ID: "call_1", Name: "get_weather"}}
+	prov := mock.New(
+		mock.Step{ToolCalls: calls, FinishReason: "stop"},
+		mock.Step{Content: "sunny out"},
+	)
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			return "sunny", nil
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "weather?", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Equal(t, "sunny out", result.Text)
+	require.Len(t, tools.calls, 1, "the tool must run even though FinishReason said \"stop\"")
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 4) // user, assistant(tool_calls), tool, assistant(final)
+	assert.NotEmpty(t, msgs[1].ToolCalls)
+	assert.Equal(t, "assistant", msgs[3].Role)
+	assert.Empty(t, msgs[3].ToolCalls, "the terminal assistant row must never carry tool_calls")
+}
+
+// TestRun_EmptyToolCallsWithToolCallsFinishReason_EndsTurnImmediately covers
+// the mirror case: FinishReason=="tool_calls" but an empty ToolCalls slice
+// must end the turn on the spot rather than looping with zero tools run
+// until max_iterations is spent.
+func TestRun_EmptyToolCallsWithToolCallsFinishReason_EndsTurnImmediately(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(mock.Step{Content: "done anyway", FinishReason: "tool_calls"})
+	loop := New(testAgentConfig(), prov, st, &fakeToolRunner{}, nil)
+	result := loop.Run(context.Background(), sessionID, "hi", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Equal(t, "done anyway", result.Text)
+	assert.Equal(t, 1, result.Iterations, "must not burn iterations retrying an empty tool_calls turn")
+	assert.Len(t, prov.Requests(), 1)
+}
+
+// TestRun_LengthTruncation_NoticeNotPersistedAsModelContent is the M4
+// regression test: the "[response truncated ...]" notice must only appear
+// in the caller-facing Result.Text, never in what gets persisted as the
+// model's own content, since a future turn's loadHistory would otherwise
+// replay our own editorial note back to the model as something it said.
+func TestRun_LengthTruncation_NoticeNotPersistedAsModelContent(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(mock.Step{Content: "partial output", FinishReason: "length"})
+	loop := New(testAgentConfig(), prov, st, &fakeToolRunner{}, nil)
+	result := loop.Run(context.Background(), sessionID, "write something long", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Contains(t, result.Text, "partial output")
+	assert.Contains(t, result.Text, "truncated", "the caller-facing result still explains the truncation")
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "partial output", msgs[1].Content, "the transcript must record exactly what the model produced, not our editorial notice")
+}
+
+// TestRun_ErrContextLength_RetryAlsoElidesBufferedToolResults covers a
+// tool-heavy turn that overflows because of its own in-progress buffer
+// (not history): it must still recover on the one retry, by sending the
+// provider an elided copy of the buffered tool content rather than only
+// trimming history - and the elision must never reach the persisted
+// transcript, which keeps the real tool output the turn actually produced.
+func TestRun_ErrContextLength_RetryAlsoElidesBufferedToolResults(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	bigResult := strings.Repeat("x", 5000)
+	prov := mock.New(
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "big_tool"}}},
+		mock.Step{Err: &provider.Error{Kind: provider.ErrContextLength}},
+		mock.Step{Content: "done"},
+	)
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			return bigResult, nil
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "do something with lots of output", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Equal(t, "done", result.Text)
+
+	requests := prov.Requests()
+	require.Len(t, requests, 3)
+
+	// The request that overflowed still carries the full tool output.
+	overflowedHasFull := false
+	for _, m := range requests[1].Messages {
+		if m.Role == provider.RoleTool {
+			assert.Equal(t, bigResult, m.Content)
+			overflowedHasFull = true
+		}
+	}
+	require.True(t, overflowedHasFull)
+
+	// The retried request must have replaced it with a short placeholder,
+	// and the turn must still complete and persist that elided content.
+	retriedHasPlaceholder := false
+	for _, m := range requests[2].Messages {
+		if m.Role == provider.RoleTool {
+			assert.NotEqual(t, bigResult, m.Content)
+			assert.Less(t, len(m.Content), 100)
+			retriedHasPlaceholder = true
+		}
+	}
+	require.True(t, retriedHasPlaceholder)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	var toolMsg *store.Message
+	for i := range msgs {
+		if msgs[i].Role == "tool" {
+			toolMsg = &msgs[i]
+		}
+	}
+	require.NotNil(t, toolMsg)
+	assert.Equal(t, bigResult, toolMsg.Content, "the persisted tool row must keep the real tool output; only the retried request may see the elided placeholder")
 }

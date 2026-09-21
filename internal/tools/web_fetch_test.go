@@ -54,6 +54,32 @@ func TestIsBlockedAddr_Matrix(t *testing.T) {
 	}
 }
 
+// TestIsBlockedAddr_ResidualRanges covers the ranges added on top of the
+// phase 5 matrix above: the limited broadcast address, the two remaining
+// IETF-reserved IPv4 blocks, and IPv6 encodings (NAT64, 6to4) that embed a
+// blocked or an ordinary public IPv4 address.
+func TestIsBlockedAddr_ResidualRanges(t *testing.T) {
+	cases := []struct {
+		addr    string
+		blocked bool
+	}{
+		{"255.255.255.255", true},   // limited broadcast
+		{"192.0.0.1", true},         // 192.0.0.0/24 IETF protocol assignments
+		{"192.0.0.170", true},       // NAT64/DNS64 discovery address within that block
+		{"198.18.0.1", true},        // 198.18.0.0/15 benchmarking
+		{"198.19.255.255", true},    // top of the same /15
+		{"64:ff9b::7f00:1", true},   // NAT64-embedded 127.0.0.1
+		{"64:ff9b::808:808", false}, // NAT64-embedded 8.8.8.8 (public) must not be blocked
+		{"2002:7f00:1::", true},     // 6to4-embedded 127.0.0.1
+		{"2002:0808:0808::", false}, // 6to4-embedded 8.8.8.8 (public) must not be blocked
+	}
+	for _, c := range cases {
+		addr, err := netip.ParseAddr(c.addr)
+		require.NoError(t, err, c.addr)
+		assert.Equal(t, c.blocked, isBlockedAddr(addr), "address %s", c.addr)
+	}
+}
+
 func TestWebFetch_RefusesLoopbackTarget(t *testing.T) {
 	w := newWebFetchTool(t)
 	out, err := w.run(context.Background(), mustArgs(t, webFetchArgs{URL: "http://127.0.0.1:1/"}), agent.Meta{})
@@ -123,6 +149,60 @@ func TestWebFetch_FetchesAndStripsHTML(t *testing.T) {
 	assert.NotContains(t, out, "color:red")
 	assert.NotContains(t, out, "<h1>")
 	assert.Contains(t, out, "untrusted third-party text")
+}
+
+func TestWebFetch_SkipsNonTextContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "image/png")
+		_, _ = w.Write([]byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a})
+	}))
+	defer srv.Close()
+
+	wf := &webFetchTool{client: srv.Client(), maxBytes: 1 << 20}
+	out, err := wf.run(context.Background(), mustArgs(t, webFetchArgs{URL: srv.URL}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Contains(t, out, "binary content skipped")
+	assert.Contains(t, out, "image/png")
+}
+
+func TestWebFetch_AllowsJSONContentType(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		_, _ = w.Write([]byte(`{"hello":"world"}`))
+	}))
+	defer srv.Close()
+
+	wf := &webFetchTool{client: srv.Client(), maxBytes: 1 << 20}
+	out, err := wf.run(context.Background(), mustArgs(t, webFetchArgs{URL: srv.URL}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Contains(t, out, `"hello":"world"`)
+	assert.NotContains(t, out, "binary content skipped")
+}
+
+func TestWebFetch_AllowsXMLAndSuffixedAndJavaScriptContentTypes(t *testing.T) {
+	cases := []struct {
+		contentType string
+		body        string
+	}{
+		{"application/xml", "<root>hello</root>"},
+		{"application/vnd.api+json; charset=utf-8", `{"hello":"world"}`},
+		{"application/atom+xml", "<feed>hello</feed>"},
+		{"application/javascript", "console.log('hello')"},
+	}
+	for _, c := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", c.contentType)
+			_, _ = w.Write([]byte(c.body))
+		}))
+
+		wf := &webFetchTool{client: srv.Client(), maxBytes: 1 << 20}
+		out, err := wf.run(context.Background(), mustArgs(t, webFetchArgs{URL: srv.URL}), agent.Meta{})
+		require.NoError(t, err)
+		assert.NotContains(t, out, "binary content skipped", "content-type: %q", c.contentType)
+		assert.Contains(t, out, "hello", "content-type: %q", c.contentType)
+
+		srv.Close()
+	}
 }
 
 func TestWebFetch_MaxBytesCapTruncates(t *testing.T) {

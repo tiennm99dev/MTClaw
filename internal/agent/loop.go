@@ -31,6 +31,15 @@ const noReplySentinel = "NO_REPLY"
 // whole conversation on a hard trim to max_history_turns alone.
 const contextLengthRetryTurns = 4
 
+// toolResultElidedPlaceholder replaces a buffered tool-role message's
+// content on the ErrContextLength retry. history is not always what pushed
+// a request over the limit: a tool-heavy turn's own in-progress buffer -
+// several large tool results accumulated across earlier iterations of the
+// same turn - can dominate it, and trimming history alone does nothing for
+// that. Every tool message keeps its ToolCallID so the assistant/tool
+// pairing invariant survives; only Content shrinks.
+const toolResultElidedPlaceholder = "[tool output elided to fit the context window]"
+
 // ToolRunner executes tool calls the model requests. Run never returns a
 // Go error for tool-level failures: a failed tool produces a result string
 // describing the failure so the model can react (apologize, try another
@@ -126,9 +135,17 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 		iterations++
 		onProgress(Event{Kind: EventIteration, Iteration: iterations})
 
+		// The request sends an elided copy of buffer once the retry
+		// below has fired, but buffer itself is never mutated: flush
+		// must still persist the real tool output, not the
+		// placeholder sent to the provider.
+		requestBuffer := buffer
+		if contextRetried {
+			requestBuffer = elideBufferedToolResults(buffer)
+		}
 		req := provider.Request{
 			Model:       l.cfg.Agent.Model,
-			Messages:    l.assembleMessages(systemPrompt, summary, history, buffer),
+			Messages:    l.assembleMessages(systemPrompt, summary, history, requestBuffer),
 			Tools:       l.tools.Specs(),
 			Temperature: &l.cfg.Agent.Temperature,
 		}
@@ -145,6 +162,10 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 				contextRetried = true
 				iterations-- // the retry is not a new agent step, just recovery
 				history = HardTrim(history, contextLengthRetryTurns)
+				// buffer itself is left untouched: the loop's next pass
+				// through this iteration builds requestBuffer as an
+				// elided copy for the request only, so a flush after
+				// this point still persists the real tool output.
 				summary = ""
 				continue
 			}
@@ -153,17 +174,27 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 			// ErrContextLength - flushes only the user's message and
 			// returns the classified error; buffered tool activity from
 			// earlier iterations in this turn is deliberately not
-			// persisted, per the phase 4 spec.
+			// persisted, per the phase 4 spec. totalUsage still reflects
+			// whatever was actually spent and billed across those earlier
+			// iterations, so the caller-facing Result reports it even
+			// though it is not written to the store here.
 			if flushErr := l.flush(ctx, sessionID, []provider.Message{userMsg}, nil, provider.Usage{}); flushErr != nil {
 				l.log.Error("agent: flush user message after provider error failed", "session_id", sessionID, "error", flushErr)
 			}
-			return Result{Iterations: iterations, Err: perr}
+			return Result{Iterations: iterations, Usage: totalUsage, Err: perr}
 		}
 
 		totalUsage.Prompt += resp.Usage.Prompt
 		totalUsage.Completion += resp.Usage.Completion
 
-		if resp.FinishReason == "tool_calls" {
+		// Dispatch on the payload, not the label: FinishReason is a
+		// provider-supplied string, and an OpenAI-compatible endpoint
+		// other than api.openai.com itself (base_url is a documented,
+		// user-configurable knob) can return tool_calls under "stop" or
+		// "" and vice versa. Trusting the label here either buffers an
+		// assistant tool_calls row with no chance to answer it, or spins
+		// through max_iterations answering zero calls.
+		if len(resp.Message.ToolCalls) > 0 {
 			buffer = append(buffer, resp.Message)
 
 			for _, call := range resp.Message.ToolCalls {
@@ -220,22 +251,25 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 			continue
 		}
 
-		// Any finish reason other than "tool_calls" ("stop", "length", or
-		// an unrecognized provider-defined reason) ends the turn.
+		// No ToolCalls payload ends the turn, regardless of FinishReason.
+		// FinishReason only still drives the "length" notice below, since
+		// that is what it is actually reliable for.
 		text := resp.Message.Content
 		noReply := strings.TrimSpace(text) == noReplySentinel
+		resultText := text
 		if resp.FinishReason == "length" {
-			text += "\n\n[response truncated: the model's output hit the token limit]"
+			resultText += "\n\n[response truncated: the model's output hit the token limit]"
 		}
 
-		final := resp.Message
-		final.Content = text
-		buffer = append(buffer, final)
+		// This branch is only reached when resp.Message.ToolCalls is
+		// empty (the dispatch condition above), so the terminal row
+		// appended here never carries ToolCalls.
+		buffer = append(buffer, resp.Message)
 
 		if flushErr := l.flush(ctx, sessionID, buffer, toolNames, totalUsage); flushErr != nil {
-			return Result{Text: text, NoReply: noReply, Iterations: iterations, Usage: totalUsage, Err: flushErr}
+			return Result{Text: resultText, NoReply: noReply, Iterations: iterations, Usage: totalUsage, Err: flushErr}
 		}
-		return Result{Text: text, NoReply: noReply, Iterations: iterations, Usage: totalUsage}
+		return Result{Text: resultText, NoReply: noReply, Iterations: iterations, Usage: totalUsage}
 	}
 }
 
@@ -308,11 +342,38 @@ func backfillAbortedToolCalls(buffer []provider.Message, toolNames map[string]st
 // still recorded even though ctx itself is done, then returns a Result
 // classified as provider.ErrCanceled.
 func (l *Loop) abortForCancellation(ctx context.Context, sessionID string, buffer []provider.Message, toolNames map[string]string, usage provider.Usage, iterations int, cause error) Result {
-	bg := context.WithoutCancel(ctx)
+	// context.WithoutCancel strips ctx's deadline along with its
+	// cancellation, and the writer handle is capped at one physical
+	// connection (sqlite.Open's db.SetMaxOpenConns(1)), so an unbounded
+	// bg would let Append block forever behind a wedged writer. 5s
+	// matches the DSN's busy_timeout(5000) (see sqlite's dsn helper), so
+	// this flush gives up on the same budget the driver itself already
+	// uses for that one connection, rather than on no budget at all.
+	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
 	if err := l.flush(bg, sessionID, buffer, toolNames, usage); err != nil {
 		l.log.Error("agent: flush on cancellation failed", "session_id", sessionID, "error", err)
 	}
 	return Result{Iterations: iterations, Usage: usage, Err: provider.Classify(cause)}
+}
+
+// elideBufferedToolResults replaces every buffered tool-role message's
+// Content with a short placeholder, keeping every message (and therefore
+// the assistant/tool pairing invariant) intact. It is what the
+// ErrContextLength retry uses to shrink the in-turn buffer itself, not just
+// history: by the time a tool-heavy turn overflows, the buffer accumulated
+// across this turn's own earlier iterations can dominate the request, and
+// trimming history alone does nothing for that case.
+func elideBufferedToolResults(buffer []provider.Message) []provider.Message {
+	out := make([]provider.Message, len(buffer))
+	copy(out, buffer)
+	for i, m := range out {
+		if m.Role == provider.RoleTool {
+			m.Content = toolResultElidedPlaceholder
+			out[i] = m
+		}
+	}
+	return out
 }
 
 // flush converts the buffered turn to store rows and appends them in one

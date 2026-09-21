@@ -17,6 +17,13 @@ type approvalStore struct {
 }
 
 func (a *approvalStore) Create(ctx context.Context, ap *store.Approval) error {
+	if ap.ExpiresAt.IsZero() {
+		// toMillis maps a zero time to 0, and ExpirePending selects
+		// expires_at < now, so a zero ExpiresAt would be expired by the
+		// very next sweep - silently denying the caller's pending
+		// approval. This is a caller bug, not a state to tolerate.
+		return fmt.Errorf("create approval: ExpiresAt must be set")
+	}
 	if ap.ID == "" {
 		id, err := newApprovalNonce()
 		if err != nil {

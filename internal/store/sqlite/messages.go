@@ -56,6 +56,15 @@ func (m *messageStore) Append(ctx context.Context, sessionID string, msgs []stor
 		}
 	}
 
+	// A session that only ever exchanges zero-usage turns (mock provider,
+	// cached responses) would otherwise never bump updated_at, sinking it
+	// in `sessions list`'s ORDER BY updated_at DESC despite active
+	// traffic. Same tx as the inserts above, so this can never observably
+	// land without them.
+	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id = ?`, now, sessionID); err != nil {
+		return fmt.Errorf("append messages: bump session updated_at: %w", err)
+	}
+
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("append messages: commit: %w", err)
 	}

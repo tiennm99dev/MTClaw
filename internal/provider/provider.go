@@ -23,11 +23,16 @@ const (
 // ToolCall is one function call the model asked the agent loop to run.
 // Args stays as raw JSON end to end: the provider layer never unmarshals
 // it, and the tool registry is what validates and decodes it against the
-// tool's schema.
+// tool's schema. It is also store.FromProviderMessage/ToProviderMessage's
+// persisted wire format (see internal/store/types.go): the tags below fix
+// the on-disk column keys independent of the Go field names, so a future
+// field rename does not silently zero out every historical row (encoding/
+// json still matches these tags case-insensitively against data written
+// before the tags existed).
 type ToolCall struct {
-	ID   string
-	Name string
-	Args json.RawMessage
+	ID   string          `json:"id"`
+	Name string          `json:"name"`
+	Args json.RawMessage `json:"args"`
 }
 
 // Message is MTClaw's single representation of one turn of a conversation.

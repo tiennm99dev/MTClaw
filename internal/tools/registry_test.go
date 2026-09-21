@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"log/slog"
+	"runtime"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -114,6 +115,41 @@ func TestNew_NilApproverFallsBackToDenyAll(t *testing.T) {
 	out, err := r.Run(context.Background(), provider.ToolCall{Name: "exec", Args: []byte(`{"command":"echo hi"}`)}, agent.Meta{SessionID: sess.ID})
 	require.NoError(t, err)
 	assert.Contains(t, out, "no approval decision was reached")
+}
+
+// TestNew_ExecToolStripsConfiguredSecretEnvNamesFromChild proves the wiring
+// from config to execTool.secretEnvNames, not just the field: building the
+// exec tool through registerExecTool (via New, exactly as production code
+// does) with openai.api_key_env and channels.telegram.token_env naming real
+// environment variables must result in a child command that cannot read
+// either one back out.
+func TestNew_ExecToolStripsConfiguredSecretEnvNamesFromChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix shell $VAR expansion assumed")
+	}
+	t.Setenv("MTCLAW_TEST_OPENAI_KEY", "openai-secret-value")
+	t.Setenv("MTCLAW_TEST_TG_TOKEN", "telegram-secret-value")
+
+	cfg := newTestFullConfig(t)
+	cfg.Tools.Exec.Mode = "approval"
+	cfg.Tools.Exec.Allow = []string{".*"}
+	cfg.OpenAI.APIKeyEnv = "MTCLAW_TEST_OPENAI_KEY"
+	cfg.Channels.Telegram.TokenEnv = "MTCLAW_TEST_TG_TOKEN"
+	st := newTestStoreForRegistry(t)
+	sess, err := st.Sessions().Ensure(context.Background(), "cli", "local", "")
+	require.NoError(t, err)
+
+	r, err := New(cfg, st, nil, slog.Default())
+	require.NoError(t, err)
+
+	out, err := r.Run(context.Background(), provider.ToolCall{
+		Name: "exec",
+		Args: []byte(`{"command":"echo [$MTCLAW_TEST_OPENAI_KEY] [$MTCLAW_TEST_TG_TOKEN]"}`),
+	}, agent.Meta{SessionID: sess.ID})
+	require.NoError(t, err)
+	assert.NotContains(t, out, "openai-secret-value")
+	assert.NotContains(t, out, "telegram-secret-value")
+	assert.Contains(t, out, "[] []")
 }
 
 func TestNew_FilesystemDisabled_NoFSTools(t *testing.T) {

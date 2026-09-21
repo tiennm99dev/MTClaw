@@ -69,6 +69,35 @@ func TestReadFile_OutsideRootRefused(t *testing.T) {
 	assert.NotContains(t, out, "nope")
 }
 
+func TestReadFile_NonPositiveMaxReadBytesRefusesInsteadOfPanicking(t *testing.T) {
+	f, root := newFSTools(t, 0, 1024)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+
+	out, err := f.readFile(context.Background(), mustArgs(t, readFileArgs{Path: "a.txt"}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Contains(t, out, "max_read_bytes must be positive")
+}
+
+func TestReadFile_CanceledContextReturnsErrorImmediately(t *testing.T) {
+	f, root := newFSTools(t, 1024, 1024)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := f.readFile(ctx, mustArgs(t, readFileArgs{Path: "a.txt"}), agent.Meta{})
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestListDir_CanceledContextReturnsErrorImmediately(t *testing.T) {
+	f, root := newFSTools(t, 1024, 1024)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := f.listDir(ctx, mustArgs(t, listDirArgs{Path: "."}), agent.Meta{})
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
 func TestReadFile_InvalidArgsReturnsResultString(t *testing.T) {
 	f, _ := newFSTools(t, 1024, 1024)
 	out, err := f.readFile(context.Background(), json.RawMessage(`{not valid json`), agent.Meta{})

@@ -59,7 +59,7 @@ type DB struct {
 // since continuing could corrupt data the binary does not understand.
 func Open(ctx context.Context, path string, readOnly bool) (*DB, error) {
 	if !readOnly {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, fmt.Errorf("create db directory: %w", err)
 		}
 	}
@@ -67,7 +67,7 @@ func Open(ctx context.Context, path string, readOnly bool) (*DB, error) {
 	db, err := openHandle(ctx, path, readOnly)
 	if err != nil && readOnly && isReadOnlyRecovery(err) {
 		readOnly = false
-		if mkErr := os.MkdirAll(filepath.Dir(path), 0o755); mkErr != nil {
+		if mkErr := os.MkdirAll(filepath.Dir(path), 0o700); mkErr != nil {
 			return nil, fmt.Errorf("create db directory: %w", mkErr)
 		}
 		db, err = openHandle(ctx, path, readOnly)
@@ -81,6 +81,14 @@ func Open(ctx context.Context, path string, readOnly bool) (*DB, error) {
 		// serializes writers, and capping the pool at 1 sidesteps
 		// SQLITE_BUSY under the gateway's own goroutine concurrency
 		// entirely rather than relying on busy_timeout to paper over it.
+		//
+		// Invariant this pool size depends on: no store method may call
+		// another store method - directly, via a callback, or by holding
+		// a transaction or an open *sql.Rows open across the call - on
+		// this same *DB. database/sql's pool wait blocks on the caller's
+		// context, not on a deadlock detector, so a nested call would
+		// hang until ctx expires instead of failing fast; several CLI
+		// paths pass context.Background(), which never expires.
 		db.SetMaxOpenConns(1)
 	}
 
@@ -89,7 +97,25 @@ func Open(ctx context.Context, path string, readOnly bool) (*DB, error) {
 		return nil, err
 	}
 
+	if !readOnly {
+		chmodOwnerOnly(path)
+	}
+
 	return &DB{DB: db, ReadOnly: readOnly}, nil
+}
+
+// chmodOwnerOnly narrows the database file and its WAL sidecars to 0600.
+// The database holds conversation history and exec output, so it must not
+// be readable by other local users. Under WAL mode the freshest rows live
+// in the -wal file until a checkpoint, so covering only the main file
+// would leave today's conversation world-readable. Best-effort: the
+// sidecars may not exist yet (ENOENT is expected), and an unsupported
+// platform must not stop the gateway from starting. The pragma pass at
+// open touches both sidecars, so by the time this runs they exist.
+func chmodOwnerOnly(path string) {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		_ = os.Chmod(p, 0o600)
+	}
 }
 
 // dsn builds the sqlite driver DSN for path.

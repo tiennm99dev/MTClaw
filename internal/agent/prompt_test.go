@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -70,4 +71,22 @@ func TestBuild_MissingPromptFileLogsAndContinues(t *testing.T) {
 	assert.NotContains(t, out, "does-not-exist.md", "a missing prompt file must not appear in the assembled prompt")
 	assert.Contains(t, logBuf.String(), "unreadable", "a missing prompt file must log a warning")
 	assert.Contains(t, logBuf.String(), missing)
+}
+
+func TestBuild_OversizePromptFileWarnsAndSkips(t *testing.T) {
+	dir := t.TempDir()
+	big := filepath.Join(dir, "big.md")
+	require.NoError(t, os.WriteFile(big, bytes.Repeat([]byte("a"), maxSystemPromptFileSize+1), 0o644))
+
+	cfg := testAgentConfig()
+	cfg.Agent.SystemPromptFiles = []string{big}
+
+	var logBuf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+
+	out := Build(cfg, nil, time.Now(), logger)
+
+	assert.NotContains(t, out, strings.Repeat("a", 100), "an oversize prompt file must not appear in the assembled prompt")
+	assert.Contains(t, logBuf.String(), "too large", "an oversize prompt file must log a warning")
+	assert.Contains(t, logBuf.String(), big)
 }

@@ -125,7 +125,7 @@ type CronRun struct {
 	ID         int64
 	JobName    string
 	SessionID  string
-	Status     string // ok | error | skipped
+	Status     string // started | ok | error | skipped | interrupted
 	Error      string
 	StartedAt  time.Time
 	FinishedAt *time.Time

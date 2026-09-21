@@ -62,11 +62,11 @@ type compiledRule struct {
 // for auto mode) and Evaluate fails closed with VerdictAsk rather than
 // panicking.
 func NewPolicy(cfg config.ExecConfig, classifier Classifier) (*Policy, error) {
-	deny, err := compileRules(cfg.Deny)
+	deny, err := compileRules(cfg.Deny, true)
 	if err != nil {
 		return nil, fmt.Errorf("tools: compile tools.exec.deny: %w", err)
 	}
-	allow, err := compileRules(cfg.Allow)
+	allow, err := compileRules(cfg.Allow, false)
 	if err != nil {
 		return nil, fmt.Errorf("tools: compile tools.exec.allow: %w", err)
 	}
@@ -87,10 +87,24 @@ func NewPolicy(cfg config.ExecConfig, classifier Classifier) (*Policy, error) {
 	}, nil
 }
 
-func compileRules(patterns []string) ([]compiledRule, error) {
+// compileRules compiles patterns as-is for the allow-list, but prefixes
+// deny patterns with (?s) so "." also matches a newline: a deny pattern
+// like ".*" written against a single-line example command must still match
+// when the same command arrives with a line continuation (a
+// backslash-newline pasted from a multi-line shell snippet). Applying (?s)
+// to allow as well would do the opposite of what an allow rule is for: an
+// anchored pattern like "^npm run .+$" is meant to permit exactly one tight
+// command, and (?s) would let ".+" swallow a newline plus an unrelated
+// second command appended after it, auto-running that second command with
+// no prompt.
+func compileRules(patterns []string, deny bool) ([]compiledRule, error) {
 	rules := make([]compiledRule, 0, len(patterns))
 	for _, p := range patterns {
-		re, err := regexp.Compile(p)
+		src := p
+		if deny {
+			src = "(?s)" + p
+		}
+		re, err := regexp.Compile(src)
 		if err != nil {
 			return nil, fmt.Errorf("invalid regex %q: %w", p, err)
 		}
@@ -99,14 +113,40 @@ func compileRules(patterns []string) ([]compiledRule, error) {
 	return rules, nil
 }
 
+// denyCommandWordQuote matches a command word at the very start of cmd, or
+// immediately after a `;`, `&`, or `|` segment separator, that is wrapped in
+// a single quote, a double quote, or escaped with a single leading
+// backslash - the shapes `'rm' -rf /`, `"rm" -rf /`, and `\rm -rf /` use to
+// dodge a plain "rm" pattern without changing what the shell actually runs.
+// It is deliberately anchored to the command-word position only: a quoted
+// *argument* elsewhere in the command (`grep "rm -rf" file`, `cat "my 'rm
+// -rf' notes.txt"`) must keep its quotes, because those quotes are what
+// keep "rm -rf" inert text instead of a command - stripping them there
+// would turn an ordinary read-only command into a permanent, non-overridable
+// refusal.
+var denyCommandWordQuote = regexp.MustCompile(`(^|[;&|]\s*)(?:'([^'\s]+)'|"([^"\s]+)"|\\(\w))`)
+
+// normalizeForDeny rewrites only each segment's leading command word,
+// unquoting or unescaping it, so a deny rule also catches a command whose
+// command word is trivially quoted or escaped without weakening the
+// pattern itself or touching quoting anywhere else in cmd. It is evaluated
+// in addition to, not instead of, the raw command - see Evaluate - so this
+// covers only "one character of rephrasing" at the command-word position,
+// not interpreter wrappers like `sh -c '...'` or `eval`, which remain a
+// documented gap (see docs/security.md).
+func normalizeForDeny(cmd string) string {
+	return denyCommandWordQuote.ReplaceAllString(cmd, "${1}${2}${3}${4}")
+}
+
 // Evaluate decides cmd in the fixed order deny -> allow -> mode. Deny is
 // checked first and, on a match, wins unconditionally: neither the
 // allow-list nor a human approver nor the classifier ever sees the command
 // again. cmd is matched as the raw command string (not tokenized), exactly
 // as config.Validate already required each pattern to compile against.
 func (p *Policy) Evaluate(ctx context.Context, cmd string) Decision {
+	normalized := normalizeForDeny(cmd)
 	for _, rule := range p.deny {
-		if rule.re.MatchString(cmd) {
+		if rule.re.MatchString(cmd) || rule.re.MatchString(normalized) {
 			return Decision{
 				Verdict: VerdictRefuse,
 				Audit:   "denied_rule",

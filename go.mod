@@ -5,7 +5,6 @@ go 1.25.7
 require (
 	github.com/adhocore/gronx v1.20.0
 	github.com/goccy/go-yaml v1.19.2
-	github.com/mattn/go-shellwords v1.0.14
 	github.com/mymmrac/telego v1.11.1
 	github.com/openai/openai-go/v3 v3.49.0
 	github.com/spf13/cobra v1.10.2

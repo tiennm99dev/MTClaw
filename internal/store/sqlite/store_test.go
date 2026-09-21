@@ -71,6 +71,34 @@ func TestSessions_List_OrderedByUpdatedAtDesc(t *testing.T) {
 	assert.Equal(t, a.ID, list[1].ID)
 }
 
+// TestMessages_Append_BumpsSessionUpdatedAt proves a turn with no usage to
+// record (mock provider, a cached or zero-usage response) still surfaces as
+// recently active in `sessions list`'s ORDER BY updated_at DESC, instead of
+// sinking behind sessions whose only activity was AddUsage. The session's
+// updated_at is forced into the past first (rather than relying on sleeps
+// around millisecond-resolution timestamps) so the assertion is
+// deterministic instead of racing the clock on a loaded box.
+func TestMessages_Append_BumpsSessionUpdatedAt(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sess, err := st.Sessions().Ensure(ctx, "telegram", "chat-1", "")
+	require.NoError(t, err)
+
+	dbHandle := storeDB(t, st)
+	sentinel := toMillis(time.Now().Add(-time.Hour))
+	_, err = dbHandle.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id = ?`, sentinel, sess.ID)
+	require.NoError(t, err)
+
+	// Append with no usage to report - the exact shape AddUsage's own
+	// updated_at bump never covers.
+	require.NoError(t, st.Messages().Append(ctx, sess.ID, []store.Message{{Role: "user", Content: "hi"}}))
+
+	got, err := st.Sessions().Get(ctx, sess.ID)
+	require.NoError(t, err)
+	assert.True(t, got.UpdatedAt.After(fromMillis(sentinel)), "Append must bump updated_at even when it records no usage")
+}
+
 func TestMessages_AppendIsAtomicAndGaplessUnderConcurrency(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -299,6 +327,22 @@ func TestApprovals_SetMessageID_UnknownIDIsANoOp(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestApprovals_Create_RejectsZeroExpiresAt proves a caller cannot create
+// an approval that ExpirePending would silently expire on its very next
+// sweep (toMillis maps a zero ExpiresAt to 0, which sorts before "now").
+func TestApprovals_Create_RejectsZeroExpiresAt(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sess, err := st.Sessions().Ensure(ctx, "telegram", "chat-1", "")
+	require.NoError(t, err)
+
+	err = st.Approvals().Create(ctx, &store.Approval{
+		SessionID: sess.ID, Channel: "telegram", ChatID: "chat-1", Tool: "exec", Command: "ls",
+	})
+	require.Error(t, err)
+}
+
 func TestApprovals_ExpirePending(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -374,6 +418,70 @@ func TestCronRuns_Finish_UnknownIDReturnsErrNotFound(t *testing.T) {
 
 	err := st.CronRuns().Finish(ctx, 999999, "ok", "", time.Now())
 	assert.ErrorIs(t, err, store.ErrNotFound)
+}
+
+// TestCronRuns_ExpireStarted_MovesStartedRowsBeforeCutoff is the M6
+// regression test: a row still "started" as of a prior process's crash (no
+// Finish ever ran) must be swept to "interrupted" at the next startup, the
+// same restart-safety pattern ApprovalStore.ExpirePending already provides.
+func TestCronRuns_ExpireStarted_MovesStartedRowsBeforeCutoff(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	stuck := &store.CronRun{JobName: "briefing", Status: "started"}
+	require.NoError(t, st.CronRuns().Append(ctx, stuck))
+
+	cutoff := stuck.StartedAt.Add(time.Second)
+	n, err := st.CronRuns().ExpireStarted(ctx, cutoff)
+	require.NoError(t, err)
+	assert.Equal(t, 1, n)
+
+	got, err := st.CronRuns().List(ctx, "briefing", 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "interrupted", got[0].Status)
+	require.NotNil(t, got[0].FinishedAt)
+}
+
+// TestCronRuns_ExpireStarted_LeavesFinishedRowsAlone proves a row already
+// in a terminal status (ok/error/skipped) is never touched by the sweep.
+func TestCronRuns_ExpireStarted_LeavesFinishedRowsAlone(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	done := &store.CronRun{JobName: "daily", Status: "ok"}
+	require.NoError(t, st.CronRuns().Append(ctx, done))
+	require.NoError(t, st.CronRuns().Finish(ctx, done.ID, "ok", "", time.Now()))
+
+	n, err := st.CronRuns().ExpireStarted(ctx, time.Now().Add(time.Second))
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	got, err := st.CronRuns().List(ctx, "daily", 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "ok", got[0].Status)
+}
+
+// TestCronRuns_ExpireStarted_LeavesRowsStartedAfterCutoff proves the sweep
+// never touches a row that started at or after the cutoff - only a run
+// genuinely stuck from before this startup is swept.
+func TestCronRuns_ExpireStarted_LeavesRowsStartedAfterCutoff(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	before := time.Now()
+	fresh := &store.CronRun{JobName: "briefing", Status: "started"}
+	require.NoError(t, st.CronRuns().Append(ctx, fresh))
+
+	n, err := st.CronRuns().ExpireStarted(ctx, before)
+	require.NoError(t, err)
+	assert.Equal(t, 0, n)
+
+	got, err := st.CronRuns().List(ctx, "briefing", 1)
+	require.NoError(t, err)
+	require.Len(t, got, 1)
+	assert.Equal(t, "started", got[0].Status)
 }
 
 func TestConcurrentReaderWhileWritingSucceedsUnderWAL(t *testing.T) {

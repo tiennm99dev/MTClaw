@@ -66,6 +66,9 @@ type MessageStore interface {
 // ApprovalStore manages Approval rows.
 type ApprovalStore interface {
 	// Create inserts a, assigning ID and CreatedAt when they are zero.
+	// ExpiresAt must be set: a zero value would be stored as the epoch and
+	// swept as already expired on the next ExpirePending, silently denying
+	// the command, so Create rejects it.
 	Create(ctx context.Context, a *Approval) error
 	Get(ctx context.Context, id string) (*Approval, error)
 	// SetMessageID records the channel message id holding a pending
@@ -93,18 +96,29 @@ type AuditStore interface {
 	List(ctx context.Context, limit int) ([]*ExecAudit, error)
 }
 
-// CronRunStore records cron run history.
+// CronRunStore records cron run history. A row's status is one of ok,
+// error, skipped, or interrupted (see ExpireStarted for the last).
+// migrations/001_init.sql's own column comment predates "interrupted" and
+// still lists only ok|error|skipped; it needs the same update.
 type CronRunStore interface {
 	// Append inserts r, assigning ID and StartedAt when they are zero.
 	Append(ctx context.Context, r *CronRun) error
-	// Finish moves a "started" row to a terminal status (ok or error),
-	// stamping finishedAt. Used by the scheduler's OnDone callback, once
-	// the enqueued turn actually completes, to close out the row Append
-	// created when the job fired. Returns ErrNotFound if id does not
-	// exist; callers treat that as a log-only failure, since losing this
-	// update must never crash a running job.
+	// Finish sets the row's terminal status (ok or error), stamping
+	// finishedAt. It matches on id alone and does not check the current
+	// status. Used by the scheduler's OnDone callback, once the enqueued
+	// turn actually completes, to close out the row Append created when
+	// the job fired. Returns ErrNotFound if id does not exist; callers
+	// treat that as a log-only failure, since losing this update must
+	// never crash a running job.
 	Finish(ctx context.Context, id int64, status, errMsg string, finishedAt time.Time) error
 	// List returns the most recent runs first, optionally filtered to one
 	// job name (empty means all jobs). limit <= 0 means no limit.
 	List(ctx context.Context, jobName string, limit int) ([]*CronRun, error)
+	// ExpireStarted moves every row still "started" as of before (a fire
+	// whose OnDone never ran: a SIGKILL, an OOM, a dropped dispatch) to
+	// "interrupted", stamping finishedAt, and returns the count moved.
+	// Called once at gateway startup, mirroring
+	// ApprovalStore.ExpirePending, so a `mtclaw cron runs` report never
+	// shows a job as perpetually in flight after a hard process exit.
+	ExpireStarted(ctx context.Context, before time.Time) (int, error)
 }

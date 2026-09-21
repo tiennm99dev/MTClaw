@@ -68,7 +68,11 @@ type readFileArgs struct {
 // content (a NUL byte in the first binarySniffBytes), and returns content
 // bounded by limit (default and cap: maxReadBytes) starting at offset, with
 // an explicit truncation marker when the file has more to give.
-func (f *fsTools) readFile(_ context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
+func (f *fsTools) readFile(ctx context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	var a readFileArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("read_file: invalid arguments: %v", err), nil
@@ -105,6 +109,12 @@ func (f *fsTools) readFile(_ context.Context, args json.RawMessage, _ agent.Meta
 	limit := a.Limit
 	if limit <= 0 || limit > int64(f.maxReadBytes) {
 		limit = int64(f.maxReadBytes)
+	}
+	if limit <= 0 {
+		// Defense in depth: a misconfigured (non-positive) max_read_bytes
+		// must never reach make([]byte, limit) below, which panics on a
+		// negative length.
+		return "read_file: server misconfiguration: tools.filesystem.max_read_bytes must be positive", nil
 	}
 	if a.Offset < 0 {
 		return "read_file: offset must not be negative", nil
@@ -148,7 +158,11 @@ type writeFileArgs struct {
 // writeFile resolves path within the configured roots, creates any missing
 // parent directories (which Resolve has already proven stay inside a root),
 // and writes content according to mode, bounded by maxWriteBytes.
-func (f *fsTools) writeFile(_ context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
+func (f *fsTools) writeFile(ctx context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	var a writeFileArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("write_file: invalid arguments: %v", err), nil
@@ -222,7 +236,11 @@ type listDirArgs struct {
 // symlinked directory - regardless of whether the symlink's target is
 // itself inside a root - which is the simplest rule that both prevents
 // escaping the root and avoids symlink-cycle loops.
-func (f *fsTools) listDir(_ context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
+func (f *fsTools) listDir(ctx context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+
 	var a listDirArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("list_dir: invalid arguments: %v", err), nil
@@ -250,7 +268,10 @@ func (f *fsTools) listDir(_ context.Context, args json.RawMessage, _ agent.Meta)
 
 	var lines []string
 	count := 0
-	capped := walkDir(resolved, depth, "", &lines, &count)
+	capped := walkDir(ctx, resolved, depth, "", &lines, &count)
+	if err := ctx.Err(); err != nil {
+		return "list_dir: canceled", err
+	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "list_dir: %s\n", a.Path)
@@ -266,8 +287,13 @@ func (f *fsTools) listDir(_ context.Context, args json.RawMessage, _ agent.Meta)
 
 // walkDir appends one line per entry under dir to out, recursing while
 // depth remains and count is under listDirEntryCap. It returns true if the
-// cap was hit before the tree was fully listed.
-func walkDir(dir string, depth int, prefix string, out *[]string, count *int) bool {
+// cap was hit, or ctx ended, before the tree was fully listed; the caller
+// distinguishes the two afterward via ctx.Err().
+func walkDir(ctx context.Context, dir string, depth int, prefix string, out *[]string, count *int) bool {
+	if ctx.Err() != nil {
+		return true
+	}
+
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		*out = append(*out, prefix+fmt.Sprintf("[error reading directory: %v]", err))
@@ -277,7 +303,7 @@ func walkDir(dir string, depth int, prefix string, out *[]string, count *int) bo
 	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
 	for _, entry := range entries {
-		if *count >= listDirEntryCap {
+		if *count >= listDirEntryCap || ctx.Err() != nil {
 			return true
 		}
 
@@ -304,7 +330,7 @@ func walkDir(dir string, depth int, prefix string, out *[]string, count *int) bo
 		*count++
 
 		if typ == "dir" && depth > 1 {
-			if walkDir(filepath.Join(dir, entry.Name()), depth-1, prefix+"  ", out, count) {
+			if walkDir(ctx, filepath.Join(dir, entry.Name()), depth-1, prefix+"  ", out, count) {
 				return true
 			}
 		}

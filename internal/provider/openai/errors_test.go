@@ -3,7 +3,6 @@ package openai
 import (
 	"context"
 	"errors"
-	"net"
 	"testing"
 	"time"
 
@@ -13,16 +12,6 @@ import (
 
 	"github.com/tiennm99/MTClaw/internal/provider"
 )
-
-// fakeTimeoutErr is a minimal net.Error implementation for exercising the
-// net.Error timeout branch without opening a real socket.
-type fakeTimeoutErr struct{}
-
-func (fakeTimeoutErr) Error() string   { return "i/o timeout" }
-func (fakeTimeoutErr) Timeout() bool   { return true }
-func (fakeTimeoutErr) Temporary() bool { return true }
-
-var _ net.Error = fakeTimeoutErr{}
 
 func TestClassify_Table(t *testing.T) {
 	cases := []struct {
@@ -36,9 +25,14 @@ func TestClassify_Table(t *testing.T) {
 		{"500 server error", &openaisdk.Error{StatusCode: 500, Code: "server_error", Message: "internal error"}, provider.ErrTransient},
 		{"400 context length exceeded", &openaisdk.Error{StatusCode: 400, Code: "context_length_exceeded", Message: "This model's maximum context length is 8192 tokens"}, provider.ErrContextLength},
 		{"400 other bad request", &openaisdk.Error{StatusCode: 400, Code: "invalid_value", Message: "invalid value for temperature"}, provider.ErrBadRequest},
+		{"404 model not found", &openaisdk.Error{StatusCode: 404, Code: "model_not_found", Message: "The model does not exist"}, provider.ErrBadRequest},
+		{"422 unprocessable payload", &openaisdk.Error{StatusCode: 422, Code: "invalid_request", Message: "unprocessable entity"}, provider.ErrBadRequest},
+		{"400 context length with no code", &openaisdk.Error{StatusCode: 400, Code: "", Message: "This model's maximum context length is 4096 tokens"}, provider.ErrContextLength},
+		{"413 payload too large", &openaisdk.Error{StatusCode: 413, Code: "", Message: "payload too large"}, provider.ErrContextLength},
+		{"409 conflict", &openaisdk.Error{StatusCode: 409, Code: "conflict", Message: "resource conflict"}, provider.ErrTransient},
 		{"context canceled", context.Canceled, provider.ErrCanceled},
 		{"context deadline exceeded", context.DeadlineExceeded, provider.ErrCanceled},
-		{"net timeout", fakeTimeoutErr{}, provider.ErrTransient},
+		{"unrecognized transport error falls back to transient", errors.New("connection reset by peer"), provider.ErrTransient},
 	}
 
 	for _, tc := range cases {

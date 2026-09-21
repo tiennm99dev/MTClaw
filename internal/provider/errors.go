@@ -3,7 +3,6 @@ package provider
 import (
 	"context"
 	"errors"
-	"net"
 )
 
 // ErrKind classifies why a Provider.Complete call failed, so the agent loop
@@ -11,9 +10,8 @@ import (
 type ErrKind int
 
 const (
-	// ErrTransient covers 5xx responses, a 429 whose retries were already
-	// exhausted by the SDK's own retry layer, connection resets, and
-	// network timeouts. The caller may retry.
+	// ErrTransient covers 5xx responses, 408/409/425, connection resets,
+	// and network timeouts. The caller may retry.
 	ErrTransient ErrKind = iota
 	// ErrAuth covers 401/403: the configured credential is missing or
 	// rejected. Retrying will not help.
@@ -22,11 +20,16 @@ const (
 	// were exhausted.
 	ErrRateLimit
 	// ErrContextLength covers a 400 whose error code is
-	// context_length_exceeded. The agent loop reacts to this
-	// specifically: trim history and retry once.
+	// context_length_exceeded (or, when the backend left the code empty,
+	// whose message matches common overflow phrasing - see
+	// openai.isContextLengthError), and a 413 Payload Too Large, which
+	// several OpenAI-compatible front ends use to report the same
+	// condition. The agent loop reacts to this specifically: trim history
+	// and retry once.
 	ErrContextLength
-	// ErrBadRequest covers any other 400 - a bug in our own request that
-	// retrying will not fix.
+	// ErrBadRequest covers a 400 that is not a context-window overflow,
+	// plus other permanent 4xx faults in the request itself (404 model not
+	// found, 422 malformed payload). Retrying will not fix these.
 	ErrBadRequest
 	// ErrCanceled covers ctx cancellation or deadline expiry.
 	ErrCanceled
@@ -94,10 +97,8 @@ func Classify(err error) *Error {
 		return &Error{Kind: ErrCanceled, Msg: err.Error(), Err: err}
 	}
 
-	var netErr net.Error
-	if errors.As(err, &netErr) && netErr.Timeout() {
-		return &Error{Kind: ErrTransient, Msg: err.Error(), Err: err}
-	}
-
+	// Anything else - a network timeout, a connection reset, a raw
+	// transport error a provider-specific classifier did not recognize -
+	// is treated as transient: the caller may retry.
 	return &Error{Kind: ErrTransient, Msg: err.Error(), Err: err}
 }

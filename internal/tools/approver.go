@@ -8,7 +8,9 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // Request is one approval ask. ThreadID routes the prompt to the right
@@ -68,25 +70,93 @@ func (DenyAllApprover) Ask(_ context.Context, _ Request) (bool, error) {
 // running `mtclaw prompt` knows why the process appears to hang.
 const approvalPromptFooter = "approve? [y/N]: "
 
-// TerminalApprover asks y/N on a terminal, used by `mtclaw prompt`. Reading
-// stdin happens on its own goroutine so Ask can still return promptly on ctx
-// cancellation or its own Timeout even though there is no portable way to
-// cancel a blocking bufio.Reader.ReadString call.
+// TerminalApprover asks y/N on a terminal, used by `mtclaw prompt`. It owns a
+// single bufio.Reader over In and a single long-lived goroutine that reads
+// it line by line for the approver's entire lifetime - not one goroutine per
+// Ask - so a prompt that times out cannot leave a second reader racing a
+// later Ask for the same buffered stdin bytes. Consent is per-prompt: a line
+// typed before a prompt was shown (e.g. an answer to a prompt that already
+// timed out) is stale and is discarded at the top of the next Ask rather
+// than being applied to it - see the drain loop in Ask.
 type TerminalApprover struct {
 	In      io.Reader
 	Out     io.Writer
 	Timeout time.Duration
+
+	// lines is buffered so readLines is never parked mid-send holding a
+	// line no Ask has consumed yet; a parked send could not be drained
+	// non-blockingly by Ask's stale-input guard below.
+	lines chan string
+
+	mu      sync.Mutex
+	readErr error // set once readLines hits EOF/error, then lines is closed
 }
 
 var _ Approver = (*TerminalApprover)(nil)
 
 // NewTerminalApprover builds a TerminalApprover reading from in and writing
-// prompts to out, waiting at most timeout for a response.
+// prompts to out, waiting at most timeout for a response. It starts the
+// single reader goroutine immediately so the first Ask does not race it.
 func NewTerminalApprover(in io.Reader, out io.Writer, timeout time.Duration) *TerminalApprover {
-	return &TerminalApprover{In: in, Out: out, Timeout: timeout}
+	t := &TerminalApprover{
+		In:      in,
+		Out:     out,
+		Timeout: timeout,
+		lines:   make(chan string, 8),
+	}
+	go t.readLines()
+	return t
+}
+
+// readLines is the sole reader of t.In for this TerminalApprover's whole
+// lifetime. It runs until In returns an error (EOF, closed pipe), at which
+// point it records that error under t.mu and closes t.lines so every Ask
+// from then on - not just the next one - observes the closed channel and
+// returns the same terminal error immediately instead of blocking for the
+// full approval timeout.
+func (t *TerminalApprover) readLines() {
+	r := bufio.NewReader(t.In)
+	for {
+		line, err := r.ReadString('\n')
+		if err != nil {
+			t.mu.Lock()
+			t.readErr = err
+			t.mu.Unlock()
+			close(t.lines)
+			return
+		}
+		t.lines <- line
+	}
+}
+
+func (t *TerminalApprover) terminalError() error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.readErr
 }
 
 func (t *TerminalApprover) Ask(ctx context.Context, req Request) (bool, error) {
+	if err := t.terminalError(); err != nil {
+		return false, fmt.Errorf("tools: read approval response: %w", err)
+	}
+
+	// Drain any line already queued before this prompt is shown, so a
+	// human's answer to a previous prompt (in particular one that already
+	// timed out) can never be mistaken for the answer to this one. This is
+	// the real enforcement boundary alongside deny: consent must be
+	// per-prompt.
+drain:
+	for {
+		select {
+		case _, ok := <-t.lines:
+			if !ok {
+				break drain
+			}
+		default:
+			break drain
+		}
+	}
+
 	fmt.Fprintf(t.Out, "\n[mtclaw] approval requested for tool %q\n  command: %s\n", req.Tool, req.Command)
 	if req.Reason != "" {
 		fmt.Fprintf(t.Out, "  reason: %s\n", req.Reason)
@@ -101,24 +171,14 @@ func (t *TerminalApprover) Ask(ctx context.Context, req Request) (bool, error) {
 	waitCtx, cancel := context.WithTimeout(ctx, t.Timeout)
 	defer cancel()
 
-	lineCh := make(chan string, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		line, err := bufio.NewReader(t.In).ReadString('\n')
-		if err != nil {
-			errCh <- err
-			return
-		}
-		lineCh <- line
-	}()
-
 	select {
 	case <-waitCtx.Done():
 		fmt.Fprintln(t.Out, "\n[mtclaw] no response in time; refusing")
 		return false, waitCtx.Err()
-	case err := <-errCh:
-		return false, fmt.Errorf("tools: read approval response: %w", err)
-	case line := <-lineCh:
+	case line, ok := <-t.lines:
+		if !ok {
+			return false, fmt.Errorf("tools: read approval response: %w", t.terminalError())
+		}
 		answer := strings.ToLower(strings.TrimSpace(line))
 		return answer == "y" || answer == "yes", nil
 	}
@@ -143,10 +203,34 @@ func RedactSecrets(cmd string) string {
 	for _, re := range redactPatterns {
 		s = re.re.ReplaceAllString(s, re.replacement)
 	}
+	s = redactBase64Like(s)
 	if len(s) > maxDisplayCommandLen {
-		s = s[:maxDisplayCommandLen] + "... [truncated; command is longer]"
+		cut := runeSafeLen([]byte(s[:maxDisplayCommandLen]))
+		s = s[:cut] + "... [truncated; command is longer]"
 	}
 	return s
+}
+
+// runeSafeLen returns the largest n <= len(b) such that b[:n] does not end
+// mid-rune, so a hard byte-length cap (here, and on exec's captured output)
+// can never split a multi-byte UTF-8 character in two. It backtracks at
+// most utf8.UTFMax-1 bytes - the most a single valid rune could still be
+// waiting on - so input that is not valid UTF-8 at all (e.g. binary output
+// wrongly treated as text) cannot walk all the way back to an empty prefix;
+// the cut is kept at the raw byte boundary instead.
+func runeSafeLen(b []byte) int {
+	n := len(b)
+	limit := n - utf8.UTFMax + 1
+	if limit < 0 {
+		limit = 0
+	}
+	for n > limit {
+		if r, size := utf8.DecodeLastRune(b[:n]); r != utf8.RuneError || size > 1 {
+			break
+		}
+		n--
+	}
+	return n
 }
 
 type redactRule struct {
@@ -168,13 +252,82 @@ var redactPatterns = []redactRule{
 	// flag on some other tool. Over-redaction is the safe failure
 	// direction for a display-only value; see the package-level note above.
 	{regexp.MustCompile(`(\s-p)(\S+)`), `${1}[REDACTED]`},
-	// KEY=, TOKEN=, SECRET=, PASSWORD= environment-style assignments.
-	{regexp.MustCompile(`(?i)\b(KEY|TOKEN|SECRET|PASSWORD)=(\S+)`), `${1}=[REDACTED]`},
-	// Common credential shapes: OpenAI sk-..., GitHub ghp_..., AWS AKIA...,
-	// and long base64/hex runs that are likely to be a key rather than
-	// prose.
+	// *_KEY=, *_TOKEN=, *_SECRET=, *_PASSWORD=, *_PASSWD= environment-style
+	// assignments (API_KEY=, GITHUB_TOKEN=, DB_PASSWORD=,
+	// AWS_SECRET_ACCESS_KEY=, PASSWD=, the bare PASSWORD= form, and the same
+	// keyword glued onto a flag or URL query string: --api-key=,
+	// ?token=..., &token=...): the keyword is matched by suffix, not \b,
+	// because \b never fires between "_" and a following letter (both are
+	// word characters), so a plain \bKEY\b would silently skip the API_KEY=
+	// shape almost every real assignment uses. The character before the
+	// keyword run only has to be a non-identifier character (or the start
+	// of the string) - not one of a fixed punctuation set - so this also
+	// catches the keyword right after a "-", "?", or "&" that a closed
+	// boundary class would miss.
+	{regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_])([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWD|PASSWORD))=(\S+)`), `${1}${2}=[REDACTED]`},
+	// Common credential shapes: OpenAI sk-..., GitHub ghp_..., AWS AKIA...
 	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}\b`), "[REDACTED]"},
 	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{20,}\b`), "[REDACTED]"},
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{12,}\b`), "[REDACTED]"},
-	{regexp.MustCompile(`\b[A-Za-z0-9+/]{32,}={0,2}\b`), "[REDACTED]"},
+}
+
+// base64Like matches a candidate base64-style secret: a run of at least 32
+// characters from the base64 alphabet including "/" (real secrets - AWS
+// secret access keys in particular - commonly contain "/"), with optional
+// "=" padding, plus whatever single character immediately precedes it (or
+// nothing, at the start of the string). "/" has to stay in the class for
+// the secret case, which makes a long filesystem path (e.g. a repo
+// checkout under a deep directory tree) exactly as long as a real secret
+// and built from the same character set; redactBase64Like tells them apart
+// instead of excluding "/" outright.
+var base64Like = regexp.MustCompile(`(^|.)([A-Za-z0-9+/]{32,}={0,2})`)
+
+// redactBase64Like replaces each base64Like candidate with [REDACTED],
+// unless it looks path-shaped (it starts with "/", or is immediately
+// preceded by "/" - either means it is a segment of a "/"-joined path, not
+// a standalone secret) or it lacks the mix a real key almost always has: at
+// least one uppercase letter, one lowercase letter, and one digit. A bare
+// path segment is rarely all three at once.
+func redactBase64Like(s string) string {
+	locs := base64Like.FindAllStringSubmatchIndex(s, -1)
+	if locs == nil {
+		return s
+	}
+	var b strings.Builder
+	last := 0
+	for _, loc := range locs {
+		wholeStart, wholeEnd := loc[0], loc[1]
+		prefix := s[loc[2]:loc[3]]
+		secret := s[loc[4]:loc[5]]
+		b.WriteString(s[last:wholeStart])
+		if prefix == "/" || strings.HasPrefix(secret, "/") || !hasUpperLowerDigit(secret) {
+			b.WriteString(s[wholeStart:wholeEnd])
+		} else {
+			b.WriteString(prefix)
+			b.WriteString("[REDACTED]")
+		}
+		last = wholeEnd
+	}
+	b.WriteString(s[last:])
+	return b.String()
+}
+
+// hasUpperLowerDigit reports whether s contains at least one ASCII
+// uppercase letter, one lowercase letter, and one digit.
+func hasUpperLowerDigit(s string) bool {
+	var upper, lower, digit bool
+	for _, r := range s {
+		switch {
+		case r >= 'A' && r <= 'Z':
+			upper = true
+		case r >= 'a' && r <= 'z':
+			lower = true
+		case r >= '0' && r <= '9':
+			digit = true
+		}
+		if upper && lower && digit {
+			return true
+		}
+	}
+	return false
 }

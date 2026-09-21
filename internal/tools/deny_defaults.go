@@ -10,9 +10,12 @@ package tools
 // patterns were bypassed by `rm --recursive --force /` and `/bin/rm -rf /`
 // respectively.
 var DefaultDenyPOSIX = []string{
-	// recursive/forced rm - short flags, long flags, and path-prefixed invocations
-	`(^|[;&|]\s|\s)(/\S*/)?rm\s+([^|;&]*\s)?-[a-zA-Z]*[rf]`,
-	`(^|[;&|]\s|\s)(/\S*/)?rm\s+([^|;&]*\s)?--(recursive|force)\b`,
+	// recursive/forced rm - short flags, long flags, path-prefixed
+	// invocations, and a subshell/group open paren directly before rm
+	// (`(rm -rf ~) &`), which is not whitespace and would otherwise slip
+	// past the boundary group below.
+	`(^|[;&|]\s|\s|\()(/\S*/)?rm\s+([^|;&]*\s)?-[a-zA-Z]*[rf]`,
+	`(^|[;&|]\s|\s|\()(/\S*/)?rm\s+([^|;&]*\s)?--(recursive|force)\b`,
 	`\bfind\b[^|;&]*\s-delete\b`,
 	`\bmkfs(\.|\s)`,
 	`\bdd\s+.*\bof=/dev/`,

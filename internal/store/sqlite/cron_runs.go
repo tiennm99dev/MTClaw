@@ -52,6 +52,21 @@ func (c *cronRunStore) Finish(ctx context.Context, id int64, status, errMsg stri
 	return nil
 }
 
+func (c *cronRunStore) ExpireStarted(ctx context.Context, before time.Time) (int, error) {
+	res, err := c.db.ExecContext(ctx, `
+		UPDATE cron_runs SET status = 'interrupted', finished_at = ? WHERE status = 'started' AND started_at < ?`,
+		toMillis(before), toMillis(before),
+	)
+	if err != nil {
+		return 0, fmt.Errorf("expire started cron runs: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("expire started cron runs: %w", err)
+	}
+	return int(n), nil
+}
+
 func (c *cronRunStore) List(ctx context.Context, jobName string, limit int) ([]*store.CronRun, error) {
 	if limit <= 0 {
 		limit = -1

@@ -1,11 +1,13 @@
 package tools
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"html"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"net/netip"
@@ -116,15 +118,49 @@ func isBlockedAddr(ip netip.Addr) bool {
 	}
 
 	if ip.Is4() {
-		b := ip.As4()
-		if b[0] == 0 { // 0.0.0.0/8
-			return true
+		return isBlocked4(ip.As4())
+	}
+
+	if ip.Is6() {
+		b := ip.As16()
+		// NAT64's well-known prefix 64:ff9b::/96 and 6to4's 2002::/16 both
+		// embed an IPv4 address in the low bits; recurse on that embedded
+		// address through the full check (not just isBlocked4) so wrapping
+		// any blocked address - loopback included - in either encoding
+		// cannot bypass this function.
+		if bytes.Equal(b[:12], nat64Prefix[:]) {
+			return isBlockedAddr(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
 		}
-		if b[0] == 100 && b[1] >= 64 && b[1] <= 127 { // 100.64.0.0/10 CGNAT
-			return true
+		if b[0] == 0x20 && b[1] == 0x02 { // 6to4: 2002:aabb:ccdd::/16 embeds a.b.c.d
+			return isBlockedAddr(netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}))
 		}
 	}
 
+	return false
+}
+
+// nat64Prefix is 64:ff9b::/96 (12 bytes; the trailing 4 hold the embedded
+// IPv4 address, checked separately in isBlockedAddr).
+var nat64Prefix = [12]byte{0x00, 0x64, 0xff, 0x9b}
+
+// isBlocked4 covers the IPv4-specific ranges netip's own predicates (already
+// applied in isBlockedAddr) do not: 0.0.0.0/8, 100.64.0.0/10 CGNAT, the
+// limited broadcast address 255.255.255.255, 192.0.0.0/24 (IETF protocol
+// assignments, including the NAT64/DNS64 discovery addresses .170/.171), and
+// 198.18.0.0/15 (benchmarking).
+func isBlocked4(b [4]byte) bool {
+	switch {
+	case b[0] == 0:
+		return true
+	case b[0] == 100 && b[1] >= 64 && b[1] <= 127:
+		return true
+	case b == [4]byte{255, 255, 255, 255}:
+		return true
+	case b[0] == 192 && b[1] == 0 && b[2] == 0:
+		return true
+	case b[0] == 198 && (b[1] == 18 || b[1] == 19):
+		return true
+	}
 	return false
 }
 
@@ -170,6 +206,11 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 		body = body[:w.maxBytes]
 	}
 
+	contentType := resp.Header.Get("Content-Type")
+	if !isTextualContentType(contentType) {
+		return fmt.Sprintf("web_fetch: binary content skipped (content-type: %q, %d bytes)", contentType, len(body)), nil
+	}
+
 	text := htmlToText(string(body))
 
 	var b strings.Builder
@@ -181,6 +222,39 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 	b.WriteString("\n")
 	b.WriteString(text)
 	return b.String(), nil
+}
+
+// isTextualContentType reports whether contentType is text the model can
+// usefully read: text/*, application/json, application/xml,
+// application/javascript, application/xhtml+xml, or any application/*
+// subtype ending in the structured-syntax suffix +json or +xml (RFC 6839 -
+// e.g. application/vnd.api+json, application/atom+xml). An absent header is
+// treated as text (the prior behavior, unchanged) rather than refused,
+// since plenty of plain servers omit it. Anything else - images, archives,
+// other application/* binary formats - is skipped instead of being run
+// through htmlToText, which would burn context tokens on garbage. Note this
+// check runs after the response body has already been fully read (see
+// run above): it saves the model's context budget, not fetch-time
+// bandwidth or memory.
+func isTextualContentType(contentType string) bool {
+	if contentType == "" {
+		return true
+	}
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	}
+	if strings.HasPrefix(mediaType, "text/") {
+		return true
+	}
+	if strings.HasSuffix(mediaType, "+json") || strings.HasSuffix(mediaType, "+xml") {
+		return true
+	}
+	switch mediaType {
+	case "application/json", "application/xml", "application/javascript", "application/xhtml+xml":
+		return true
+	}
+	return false
 }
 
 // scriptStyleRe strips <script>...</script> and <style>...</style> blocks

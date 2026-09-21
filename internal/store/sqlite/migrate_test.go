@@ -2,12 +2,16 @@ package sqlite
 
 import (
 	"context"
+	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/tiennm99/MTClaw/internal/store"
 )
 
 func TestOpen_FreshDatabaseMigratesToLatest(t *testing.T) {
@@ -74,6 +78,72 @@ func TestOpen_NewerSchemaVersionIsRefused(t *testing.T) {
 	_, err = Open(ctx, path, true)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "newer than this binary supports")
+}
+
+// TestOpen_WriterCreatesFileWithOwnerOnlyPermissions proves the database
+// file and its WAL sidecars - which hold conversation history and exec
+// output - are not left group/world readable after a writer open and a
+// first write. Unix-only: file mode bits are not meaningful on Windows.
+func TestOpen_WriterCreatesFileWithOwnerOnlyPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("file mode bits are not meaningful on Windows")
+	}
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "perms.db")
+
+	db, err := Open(ctx, path, false)
+	require.NoError(t, err)
+	defer db.Close()
+
+	st := New(db)
+	sess, err := st.Sessions().Ensure(ctx, "cli", "perms", "")
+	require.NoError(t, err)
+	require.NoError(t, st.Messages().Append(ctx, sess.ID, []store.Message{{Role: "user", Content: "hello"}}))
+
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		info, err := os.Stat(p)
+		require.NoError(t, err, p)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), p)
+	}
+}
+
+// TestOpen_ReadOnlyOpenOfUpToDateDatabaseSucceeds pins the read-only path
+// every CLI read command (sessions list/show, cron list, approvals list)
+// depends on: a database already at the latest schema version must open
+// read-only without ever needing a writer to run first. Adding a migration
+// breaks this for every existing database until a writer upgrades it.
+func TestOpen_ReadOnlyOpenOfUpToDateDatabaseSucceeds(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "uptodate.db")
+
+	writer, err := Open(ctx, path, false)
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	reader, err := Open(ctx, path, true)
+	require.NoError(t, err)
+	defer reader.Close()
+	assert.True(t, reader.ReadOnly)
+}
+
+// TestOpen_ReadOnlyOpenOfBehindSchemaDatabaseFails pins the refusal message
+// for a database whose user_version has not caught up to the binary's
+// latest migration, so the behavior stays intentional rather than
+// accidental if another migration is ever added.
+func TestOpen_ReadOnlyOpenOfBehindSchemaDatabaseFails(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "behind.db")
+
+	writer, err := Open(ctx, path, false)
+	require.NoError(t, err)
+	_, err = writer.ExecContext(ctx, "PRAGMA user_version = 0")
+	require.NoError(t, err)
+	require.NoError(t, writer.Close())
+
+	_, err = Open(ctx, path, true)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "is behind the latest migration")
+	assert.Contains(t, err.Error(), "open it for writing")
 }
 
 func TestForeignKeysAreOnForWriterAndReader(t *testing.T) {

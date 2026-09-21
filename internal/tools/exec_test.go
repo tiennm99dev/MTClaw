@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -178,15 +180,34 @@ func TestExec_MessageIDPassedThroughToApprovalRequest(t *testing.T) {
 	assert.Equal(t, "555", approver.lastReq.MessageID, "the triggering message id must reach the approval Request so a prompt can quote it")
 }
 
-func TestExec_TokenizeFailureFailsClosedToAsk(t *testing.T) {
+// TestExec_UnusualSyntaxStillGoesThroughDenyThenApprover proves a command a
+// naive tokenizer would choke on (an unterminated quote) is evaluated by the
+// policy exactly like any other raw string - it is not treated specially or
+// routed around the deny-list - and, matching neither deny nor allow under
+// approval mode, still reaches the approver rather than running silently.
+func TestExec_UnusualSyntaxStillGoesThroughDenyThenApprover(t *testing.T) {
 	approver := &recordingApprover{approve: false}
 	et, _ := newTestExecTool(t, approver, nil)
 
-	// An unterminated quote is a go-shellwords parse error.
 	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: `echo "unterminated`}), testMeta())
 	require.NoError(t, err)
-	assert.True(t, approver.called, "a tokenize failure must still go through the approver, not silently run")
+	assert.True(t, approver.called, "a command with unusual syntax must still go through the approver, not silently run")
 	assert.Contains(t, out, "denied")
+}
+
+// TestExec_SubshellWrappedDenyCommandIsRefusedNotAsked is the H1 regression:
+// before the tokenize gate was removed, a command a naive tokenizer could
+// not parse (a subshell) skipped the deny-list entirely and fell through to
+// an approval prompt instead of being refused outright. The raw command
+// string now always reaches Policy.Evaluate first, so this must refuse.
+func TestExec_SubshellWrappedDenyCommandIsRefusedNotAsked(t *testing.T) {
+	approver := &recordingApprover{approve: true}
+	et, _ := newTestExecTool(t, approver, func(c *config.ExecConfig) { c.Deny = DefaultDenyPOSIX })
+
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: "(rm -rf ~) &"}), testMeta())
+	require.NoError(t, err)
+	assert.Contains(t, out, "refused permanently")
+	assert.False(t, approver.called, "a deny match must never reach the approver, regardless of shell syntax around it")
 }
 
 func TestExec_InvalidArgsReturnsResultString(t *testing.T) {
@@ -213,6 +234,71 @@ func TestExec_OutputTruncatedAndMarked(t *testing.T) {
 	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: cmd}), testMeta())
 	require.NoError(t, err)
 	assert.Contains(t, out, "[output truncated to 10 bytes]")
+}
+
+// TestExec_OutputCappedAtWriteTimeNotAfter proves a command producing far
+// more output than MaxOutputBytes still yields a capped, truncated result -
+// capWriter must be discarding excess bytes as they are written, not
+// accumulating the whole stream before truncating it.
+func TestExec_OutputCappedAtWriteTimeNotAfter(t *testing.T) {
+	et, _ := newTestExecTool(t, nil, func(c *config.ExecConfig) {
+		c.Allow = []string{".*"}
+		c.MaxOutputBytes = 100
+	})
+
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: "yes | head -c 2000000"}), testMeta())
+	require.NoError(t, err)
+	assert.Contains(t, out, "[output truncated to 100 bytes]")
+
+	outputStart := strings.Index(out, "output:\n") + len("output:\n")
+	require.GreaterOrEqual(t, outputStart, len("output:\n"))
+	assert.LessOrEqual(t, len(out)-outputStart, 100, "captured output body must never exceed MaxOutputBytes")
+}
+
+// TestExec_OutputCapIsRuneSafe proves a hard byte cap that lands mid
+// multi-byte character is trimmed back to the last complete rune, not
+// returned as broken UTF-8.
+func TestExec_OutputCapIsRuneSafe(t *testing.T) {
+	et, _ := newTestExecTool(t, nil, func(c *config.ExecConfig) {
+		c.Allow = []string{".*"}
+		c.MaxOutputBytes = 10 // not a multiple of 3, the byte width of "あ"
+	})
+
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: "printf 'あああああ'"}), testMeta())
+	require.NoError(t, err)
+	assert.True(t, utf8.ValidString(out), "exec output must never be truncated mid multi-byte rune")
+}
+
+// TestExec_StripsSecretEnvVarsFromChild proves a child command cannot read
+// this process's own secret environment variables back out, even though it
+// otherwise inherits the full environment.
+// TestFilterEnv_ExactNameMatchStrippedOnAllPlatforms proves the baseline
+// filterEnv contract still holds after adding Windows case-folding: an
+// exact-case name in strip is always removed, and an unrelated variable
+// that merely contains the same substring survives.
+func TestFilterEnv_ExactNameMatchStrippedOnAllPlatforms(t *testing.T) {
+	got := filterEnv([]string{"A=1", "B=2", "SECRET=shh", "SECRETS=y", "NOEQ", "=weird"}, []string{"SECRET"})
+	assert.NotContains(t, got, "SECRET=shh")
+	assert.Contains(t, got, "A=1")
+	assert.Contains(t, got, "B=2")
+	assert.Contains(t, got, "SECRETS=y", "a variable that merely contains the stripped name must survive")
+	assert.Contains(t, got, "NOEQ")
+	assert.Contains(t, got, "=weird")
+}
+
+func TestExec_StripsSecretEnvVarsFromChild(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix shell $VAR expansion assumed")
+	}
+	t.Setenv("MTCLAW_TEST_SECRET", "shh-do-not-leak")
+
+	et, _ := newTestExecTool(t, nil, func(c *config.ExecConfig) { c.Allow = []string{".*"} })
+	et.secretEnvNames = []string{"MTCLAW_TEST_SECRET"}
+
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: "echo [$MTCLAW_TEST_SECRET]"}), testMeta())
+	require.NoError(t, err)
+	assert.NotContains(t, out, "shh-do-not-leak")
+	assert.Contains(t, out, "[]")
 }
 
 func TestExec_RedactSecretsAppliedToAuditAndExecutedCommandUnaltered(t *testing.T) {

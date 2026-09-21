@@ -7,12 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
 	"time"
-
-	shellwords "github.com/mattn/go-shellwords"
 
 	"github.com/tiennm99/MTClaw/internal/agent"
 	"github.com/tiennm99/MTClaw/internal/config"
@@ -42,6 +41,13 @@ type execTool struct {
 	approver Approver
 	audit    store.AuditStore
 	log      *slog.Logger
+
+	// secretEnvNames lists the environment variable names this process
+	// resolved its own secrets from (the OpenAI API key, the Telegram bot
+	// token); execute strips them from the spawned child's environment so a
+	// command cannot read them back out via `env` or `echo $VAR` and hand
+	// them to the model - see filterEnv.
+	secretEnvNames []string
 }
 
 func registerExecTool(r *Registry, cfg config.Config, st store.Store, approver Approver, log *slog.Logger) error {
@@ -65,13 +71,22 @@ func registerExecTool(r *Registry, cfg config.Config, st store.Store, approver A
 		return fmt.Errorf("tools: registering exec tool: %w", err)
 	}
 
+	var secretEnvNames []string
+	if cfg.OpenAI.APIKeyEnv != "" {
+		secretEnvNames = append(secretEnvNames, cfg.OpenAI.APIKeyEnv)
+	}
+	if cfg.Channels.Telegram.TokenEnv != "" {
+		secretEnvNames = append(secretEnvNames, cfg.Channels.Telegram.TokenEnv)
+	}
+
 	et := &execTool{
-		cfg:      execCfg,
-		shell:    resolveShell(execCfg.Shell),
-		policy:   policy,
-		approver: approver,
-		audit:    st.Audit(),
-		log:      log,
+		cfg:            execCfg,
+		shell:          resolveShell(execCfg.Shell),
+		policy:         policy,
+		approver:       approver,
+		audit:          st.Audit(),
+		log:            log,
+		secretEnvNames: secretEnvNames,
 	}
 	r.Register("exec", Tool{Spec: execToolSpec(), Run: et.run})
 	return nil
@@ -97,10 +112,13 @@ type execArgs struct {
 	Command string `json:"command"`
 }
 
-// run is the exec tool's entry point: tokenize (fail closed on error) ->
-// Policy.Evaluate -> act on the verdict. It never returns a Go error except
-// when the outer ctx itself ends mid-command or mid-approval-wait, in which
-// case the agent loop's own cancellation handling must run.
+// run is the exec tool's entry point: Policy.Evaluate -> act on the verdict.
+// The raw command string is what a real shell would receive and what the
+// deny/allow regexes are written against, so it goes to Evaluate unmodified
+// and first - nothing runs ahead of the deny-list. It never returns a Go
+// error except when the outer ctx itself ends mid-command or
+// mid-approval-wait, in which case the agent loop's own cancellation
+// handling must run.
 func (e *execTool) run(ctx context.Context, args json.RawMessage, meta agent.Meta) (string, error) {
 	var a execArgs
 	if err := json.Unmarshal(args, &a); err != nil {
@@ -112,20 +130,7 @@ func (e *execTool) run(ctx context.Context, args json.RawMessage, meta agent.Met
 	}
 	displayCmd := RedactSecrets(rawCmd)
 
-	// Tokenizing is step zero of the decision pipeline, ahead of the
-	// deny-list: a command go-shellwords cannot even parse is treated as
-	// ambiguous and fails closed to VerdictAsk, exactly like a classifier
-	// error would.
-	var decision Decision
-	if _, tokErr := shellwords.Parse(rawCmd); tokErr != nil {
-		decision = Decision{
-			Verdict: VerdictAsk,
-			Audit:   "approval",
-			Reason:  fmt.Sprintf("command could not be tokenized (%v); failing closed", tokErr),
-		}
-	} else {
-		decision = e.policy.Evaluate(ctx, rawCmd)
-	}
+	decision := e.policy.Evaluate(ctx, rawCmd)
 
 	switch decision.Verdict {
 	case VerdictRefuse:
@@ -203,6 +208,7 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 	fullArgs := append(append([]string{}, e.shell[1:]...), rawCmd)
 	cmd := exec.CommandContext(runCtx, e.shell[0], fullArgs...)
 	cmd.Dir = e.cfg.CWD
+	cmd.Env = filterEnv(os.Environ(), e.secretEnvNames)
 	cmd.WaitDelay = execWaitDelay
 	setProcessGroup(cmd)
 	cmd.Cancel = func() error {
@@ -210,18 +216,30 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 		return nil
 	}
 
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	// Stdout and Stderr must be assigned the identical *capWriter value, not
+	// two separate instances: os/exec special-cases c.Stderr == c.Stdout
+	// (interfaceEqual) and runs a single copier goroutine reading one pipe
+	// into it instead of two goroutines writing to it concurrently, and
+	// Wait always joins that copier before returning - so capWriter.Write
+	// itself never needs to be goroutine-safe, and out.buf/out.over are
+	// safe to read once cmd.Run returns. Two distinct writers here would
+	// silently reintroduce a concurrent-write race this type does nothing
+	// to guard against.
+	out := &capWriter{max: e.cfg.MaxOutputBytes}
+	cmd.Stdout = out
+	cmd.Stderr = out
 
 	start := time.Now()
 	runErr := cmd.Run()
 	durationMS := time.Since(start).Milliseconds()
 
-	output := out.Bytes()
-	truncated := len(output) > e.cfg.MaxOutputBytes
+	output := out.buf.Bytes()
+	truncated := out.over
 	if truncated {
-		output = output[:e.cfg.MaxOutputBytes]
+		// The cap above cut at a raw byte count with no regard for UTF-8
+		// boundaries; trim back to the last complete rune so a truncated
+		// multi-byte character is never split in the stored/displayed output.
+		output = output[:runeSafeLen(output)]
 	}
 
 	var exitErr *exec.ExitError
@@ -292,4 +310,64 @@ func (e *execTool) writeAudit(ctx context.Context, sessionID, command, decision,
 	if err := e.audit.Append(bg, row); err != nil {
 		e.log.Error("tools: append exec_audit row failed", "session_id", sessionID, "decision", decision, "error", err)
 	}
+}
+
+// capWriter bounds how much of a running command's output is kept in
+// memory: unlike truncating a fully-buffered bytes.Buffer after the command
+// exits, it discards past max at write time, so a command that emits
+// gigabytes before its timeout fires (yes, cat /dev/urandom, a runaway log
+// tail) cannot grow this process's memory past max. It always reports a
+// full-length write (never a short write or an error) so the child is never
+// blocked or killed by what would otherwise look like a broken pipe.
+type capWriter struct {
+	buf  bytes.Buffer
+	max  int
+	over bool
+}
+
+func (w *capWriter) Write(p []byte) (int, error) {
+	if room := w.max - w.buf.Len(); room > 0 {
+		if len(p) > room {
+			w.buf.Write(p[:room])
+			w.over = true
+		} else {
+			w.buf.Write(p)
+		}
+	} else if len(p) > 0 {
+		w.over = true
+	}
+	return len(p), nil
+}
+
+// filterEnv returns environ with every variable named in strip removed, so
+// a spawned command inherits this process's environment minus the secrets
+// (API keys, bot tokens) it was configured to read - a command cannot hand
+// them to the model via `env` or `echo $VAR` if they were never in its
+// environment to begin with. Names are compared case-insensitively on
+// Windows, where environment variable names are themselves
+// case-insensitive (api_key_env: openai_api_key must still strip a real
+// OPENAI_API_KEY= entry there); POSIX environments are case-sensitive, so
+// the comparison stays exact everywhere else.
+func filterEnv(environ, strip []string) []string {
+	if len(strip) == 0 {
+		return environ
+	}
+	skip := make(map[string]bool, len(strip))
+	for _, name := range strip {
+		if runtime.GOOS == "windows" {
+			name = strings.ToUpper(name)
+		}
+		skip[name] = true
+	}
+	out := make([]string, 0, len(environ))
+	for _, kv := range environ {
+		name, _, _ := strings.Cut(kv, "=")
+		if runtime.GOOS == "windows" {
+			name = strings.ToUpper(name)
+		}
+		if !skip[name] {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
