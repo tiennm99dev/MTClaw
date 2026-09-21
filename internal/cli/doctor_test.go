@@ -8,13 +8,13 @@ import (
 	osexec "os/exec"
 	"path/filepath"
 	"runtime"
-	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/tiennm99/MTClaw/internal/config"
+	"github.com/tiennm99/MTClaw/internal/gateway"
 	"github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
@@ -98,12 +98,17 @@ func TestCheckInstanceLock(t *testing.T) {
 	res := checkInstanceLock(dir, nil)(context.Background(), nil)
 	assert.Equal(t, StatusOK, res.Status)
 
-	// A lock file naming this test process's own (therefore live) pid
-	// simulates "another instance holds it" without spawning a real
-	// second process.
-	require.NoError(t, os.WriteFile(filepath.Join(dir, "gateway.lock"), []byte(strconv.Itoa(os.Getpid())), 0o644))
+	// Holding the kernel lock from this process on a separate descriptor
+	// is exactly what "another instance holds it" looks like to Held,
+	// without spawning a real second gateway.
+	release, err := gateway.Acquire(filepath.Join(dir, "gateway.lock"))
+	require.NoError(t, err)
 	res = checkInstanceLock(dir, nil)(context.Background(), nil)
 	assert.Equal(t, StatusInfo, res.Status)
+	require.NoError(t, release())
+
+	res = checkInstanceLock(dir, nil)(context.Background(), nil)
+	assert.Equal(t, StatusOK, res.Status)
 
 	res = checkInstanceLock("", assert.AnError)(context.Background(), nil)
 	assert.Equal(t, StatusFail, res.Status)

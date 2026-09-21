@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
@@ -144,6 +146,30 @@ func TestRunOnboard_TelegramDisabled_WritesLoadableConfigWithNoSecret(t *testing
 	assert.FileExists(t, cfg.Agent.SystemPromptFiles[0])
 }
 
+func TestRunOnboard_WritesAgentsMDNextToConfigPath(t *testing.T) {
+	// A --config pointed elsewhere must get its own starter AGENTS.md next
+	// to that config file, not silently share (and overwrite) whatever a
+	// prior install under ~/.mtclaw wrote.
+	useFakeHome(t)
+	configPath := onboardConfigPath(t)
+
+	p := &scriptedPrompter{
+		t:        t,
+		texts:    []string{"", "gpt-4o-mini", filepath.Join(t.TempDir(), "workspace")},
+		secrets:  []string{""},
+		confirms: []bool{false},
+	}
+	err := runOnboard(context.Background(), &p.out, configPath, p, &fakeTelegramCapturer{})
+	require.NoError(t, err)
+
+	cfg, err := config.LoadFile(configPath)
+	require.NoError(t, err)
+	require.Len(t, cfg.Agent.SystemPromptFiles, 1)
+	wantPath := filepath.Join(filepath.Dir(configPath), "prompts", "AGENTS.md")
+	assert.Equal(t, wantPath, cfg.Agent.SystemPromptFiles[0])
+	assert.FileExists(t, wantPath)
+}
+
 func TestRunOnboard_TelegramEnabled_SingleSenderConfirmedIsWritten(t *testing.T) {
 	useFakeHome(t)
 	configPath := onboardConfigPath(t)
@@ -220,6 +246,44 @@ func TestRunOnboard_TelegramEnabled_NoSenderFallsBackToManualEntry(t *testing.T)
 	cfg, err := config.LoadFile(configPath)
 	require.NoError(t, err)
 	assert.Equal(t, []int64{555}, cfg.Channels.Telegram.AllowFrom)
+}
+
+func TestRunOnboard_TelegramEnabled_NonPositiveManualIDWarns(t *testing.T) {
+	useFakeHome(t)
+	configPath := onboardConfigPath(t)
+
+	p := &scriptedPrompter{
+		t:        t,
+		texts:    []string{"", "gpt-4o-mini", "", "-100", filepath.Join(t.TempDir(), "workspace")},
+		secrets:  []string{"", "123456:fake-token"},
+		confirms: []bool{true},
+	}
+	capturer := &fakeTelegramCapturer{getMeUsername: "my_test_bot"} // no senders -> manual entry
+
+	err := runOnboard(context.Background(), &p.out, configPath, p, capturer)
+	require.NoError(t, err)
+
+	cfg, err := config.LoadFile(configPath)
+	require.NoError(t, err)
+	assert.Equal(t, []int64{-100}, cfg.Channels.Telegram.AllowFrom)
+	assert.Contains(t, p.out.String(), "not a positive user id")
+}
+
+// TestRunOnboard_ClosedStdinAbortsWithoutWritingConfig pins the C1 fix end
+// to end: onboard driven by a real stdioPrompter over an already-closed
+// reader (the `mtclaw onboard < /dev/null` / systemd-unit / CI-step case
+// that used to spin forever and fill the disk) must abort with an error
+// and must never write a config file.
+func TestRunOnboard_ClosedStdinAbortsWithoutWritingConfig(t *testing.T) {
+	useFakeHome(t)
+	configPath := onboardConfigPath(t)
+
+	p := newStdioPrompter(context.Background(), strings.NewReader(""), io.Discard, -1)
+	err := runOnboard(context.Background(), io.Discard, configPath, p, &fakeTelegramCapturer{})
+	require.Error(t, err)
+
+	_, statErr := os.Stat(configPath)
+	assert.True(t, os.IsNotExist(statErr), "onboard must not write a config file when stdin closes before it can answer")
 }
 
 func TestRunOnboard_RefusesToOverwriteExistingConfig(t *testing.T) {

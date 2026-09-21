@@ -43,7 +43,7 @@ func doctorChecks(configPath string) []Check {
 		{Name: "Allowlist non-empty", Run: checkAllowlistNonEmpty},
 		{Name: "Workspace exists and writable", Run: checkWorkspace},
 		{Name: "filesystem.roots exist", Run: checkFilesystemRoots},
-		{Name: "exec.cwd inside a root", Run: checkExecCWD},
+		{Name: "exec.cwd exists", Run: checkExecCWD},
 		{Name: "Shell exists", Run: checkShellExists},
 		{Name: "Deny-list sanity", Run: checkDenyListSanity},
 		{Name: "exec.mode: auto", Run: checkExecModeAuto},
@@ -74,17 +74,21 @@ func checkConfigFilePermissions(configPath string) func(context.Context, *config
 }
 
 // checkStateDirWritable verifies ~/.mtclaw (internal/config.StateDir) can be
-// created and written to - the database, the instance lock, and (after
-// onboard) the starter AGENTS.md all live there. stateDir/resolveErr are
-// resolved once by doctorChecks and passed in (rather than calling
-// config.StateDir() again here) purely so tests can point this check at a
-// t.TempDir() instead of the real, machine-wide ~/.mtclaw.
+// created and written to - the database and the instance lock live there by
+// default, since storage.path and the lock path both default under it. The
+// starter AGENTS.md onboard writes does not: it lives next to whatever
+// --config path was used (see writeStarterAgentsFile in onboard_cmd.go), so
+// it is only under ~/.mtclaw when --config itself defaulted there.
+// stateDir/resolveErr are resolved once by doctorChecks and passed in
+// (rather than calling config.StateDir() again here) purely so tests can
+// point this check at a t.TempDir() instead of the real, machine-wide
+// ~/.mtclaw.
 func checkStateDirWritable(stateDir string, resolveErr error) func(context.Context, *config.Config) Result {
 	return func(_ context.Context, _ *config.Config) Result {
 		if resolveErr != nil {
 			return Result{StatusFail, fmt.Sprintf("cannot resolve the state directory: %v", resolveErr)}
 		}
-		if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		if err := os.MkdirAll(stateDir, 0o700); err != nil {
 			return Result{StatusFail, fmt.Sprintf("cannot create state directory %s: %v - check permissions on its parent", stateDir, err)}
 		}
 		return checkDirWritable("state directory", stateDir)
@@ -242,14 +246,15 @@ func checkTelegramGetMe(ctx context.Context, cfg *config.Config) Result {
 	return Result{StatusOK, fmt.Sprintf("bot is @%s", username)}
 }
 
-// checkAllowlistNonEmpty is defensive rather than load-bearing:
+// checkAllowlistNonEmpty is a defensive duplicate, not load-bearing:
 // config.Validate already refuses to load a config where telegram is
 // enabled and every allowlist (channel-level and every group's) is empty,
-// so reaching this check with cfg loaded means it cannot actually be empty.
-// It stays in the table as the documented, always-checkable signal rather
-// than assuming validation ran (`onboard` calls these checks directly,
-// against a config it just wrote, before config.Load ever gets a chance to
-// reject anything).
+// and doctorChecks' only caller (runDoctor) always loads and validates the
+// config before running any Check - onboard included, since it runs
+// runDoctor against the file it just wrote. Reaching this check with cfg
+// loaded therefore means the allowlist cannot actually be empty; it stays
+// in the table anyway as an explicit, always-checkable row rather than a
+// silent assumption about what already ran.
 func checkAllowlistNonEmpty(_ context.Context, cfg *config.Config) Result {
 	tg := cfg.Channels.Telegram
 	if !tg.Enabled {
@@ -290,9 +295,13 @@ func checkFilesystemRoots(_ context.Context, cfg *config.Config) Result {
 	return Result{StatusOK, fmt.Sprintf("%d root(s) exist", len(fs.Roots))}
 }
 
-// checkExecCWD verifies tools.exec.cwd exists on disk. config.Validate only
-// checks the string relationship (cwd is inside one of the filesystem
-// roots), not that the directory physically exists.
+// checkExecCWD verifies tools.exec.cwd exists on disk - that is all it
+// checks. exec.cwd is documented as "not a jail": nothing in the product
+// ever compares it against tools.filesystem.roots, neither at load time
+// (config.Validate cannot see the filesystem) nor at exec call time
+// (internal/tools/exec.go sets cmd.Dir directly, with no resolution or root
+// check). The deny-list is the only real enforcement boundary - see
+// docs/security.md.
 func checkExecCWD(_ context.Context, cfg *config.Config) Result {
 	execCfg := cfg.Tools.Exec
 	if !execCfg.Enabled {
@@ -305,7 +314,7 @@ func checkExecCWD(_ context.Context, cfg *config.Config) Result {
 	if !info.IsDir() {
 		return Result{StatusFail, fmt.Sprintf("tools.exec.cwd %q is not a directory", execCfg.CWD)}
 	}
-	return Result{StatusOK, fmt.Sprintf("%q exists (confinement to tools.filesystem.roots was already checked at config load)", execCfg.CWD)}
+	return Result{StatusOK, fmt.Sprintf("%q exists", execCfg.CWD)}
 }
 
 // checkShellExists resolves tools.exec.shell (or its OS default) and looks

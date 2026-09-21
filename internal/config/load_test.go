@@ -144,7 +144,12 @@ cron:
 			wantSubstr: `job "whatever": invalid cron expression`,
 		},
 		{
-			name: "exec.cwd outside filesystem.roots",
+			// exec.cwd is documented as "not a jail": Load does not compare
+			// it against tools.filesystem.roots at all, and nothing else in
+			// the product does either, at any point - usability (does the
+			// directory even exist) is covered separately by `mtclaw
+			// doctor`'s checkExecCWD.
+			name: "exec.cwd outside filesystem.roots loads fine",
 			yaml: `
 version: 1
 agent:
@@ -158,8 +163,7 @@ tools:
   exec:
     cwd: "~/somewhere-else-entirely"
 `,
-			wantErr:    true,
-			wantSubstr: "must be inside one of tools.filesystem.roots",
+			wantErr: false,
 		},
 	}
 

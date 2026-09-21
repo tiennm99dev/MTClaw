@@ -42,8 +42,9 @@ func (e *ValidationErrors) add(path, format string, args ...any) {
 // Validate checks cfg against every structural and semantic rule in the
 // phase 1 schema, accumulating all failures instead of stopping at the
 // first one. It assumes paths have already been expanded (ExpandPath) and
-// secrets already resolved (resolveSecrets); it does not read the
-// filesystem except for storage.path's parent-directory check.
+// secrets already resolved (resolveSecrets); it never writes to the
+// filesystem, and the only filesystem read is a stat walk up storage.path's
+// parent-directory chain to check it is creatable.
 func Validate(cfg *Config) error {
 	errs := &ValidationErrors{}
 
@@ -95,6 +96,9 @@ func validateOpenAI(cfg *Config, errs *ValidationErrors) {
 	}
 	if o.Timeout.Std() <= 0 {
 		errs.add("openai.timeout", "must be greater than 0, got %s", o.Timeout.Std())
+	}
+	if o.MaxRetries < 0 {
+		errs.add("openai.max_retries", "must be 0 or greater, got %d", o.MaxRetries)
 	}
 }
 
@@ -148,6 +152,20 @@ func validateTools(cfg *Config, errs *ValidationErrors) {
 			errs.add(fmt.Sprintf("tools.filesystem.roots[%d]", i), "must be absolute after expansion, got %q", root)
 		}
 	}
+	if fs.Enabled && fs.MaxReadBytes < 1 {
+		errs.add("tools.filesystem.max_read_bytes", "must be greater than 0, got %d", fs.MaxReadBytes)
+	}
+	if fs.Enabled && fs.MaxWriteBytes < 1 {
+		errs.add("tools.filesystem.max_write_bytes", "must be greater than 0, got %d", fs.MaxWriteBytes)
+	}
+
+	wf := cfg.Tools.WebFetch
+	if wf.Enabled && wf.Timeout.Std() <= 0 {
+		errs.add("tools.web_fetch.timeout", "must be greater than 0, got %s", wf.Timeout.Std())
+	}
+	if wf.Enabled && wf.MaxBytes < 1 {
+		errs.add("tools.web_fetch.max_bytes", "must be greater than 0, got %d", wf.MaxBytes)
+	}
 
 	exec := cfg.Tools.Exec
 	switch exec.Mode {
@@ -165,32 +183,15 @@ func validateTools(cfg *Config, errs *ValidationErrors) {
 			errs.add(fmt.Sprintf("tools.exec.allow[%d]", i), "invalid regex %q: %v", pattern, err)
 		}
 	}
-
-	if exec.Enabled {
-		if len(fs.Roots) == 0 {
-			errs.add("tools.exec.cwd", "cannot be validated against tools.filesystem.roots because no roots are configured")
-		} else {
-			withinAnyRoot := false
-			for _, root := range fs.Roots {
-				if isWithinRoot(exec.CWD, root) {
-					withinAnyRoot = true
-					break
-				}
-			}
-			if !withinAnyRoot {
-				errs.add("tools.exec.cwd", "must be inside one of tools.filesystem.roots, got %q", exec.CWD)
-			}
-		}
+	if exec.Enabled && exec.Timeout.Std() <= 0 {
+		errs.add("tools.exec.timeout", "must be greater than 0, got %s", exec.Timeout.Std())
 	}
-}
-
-// isWithinRoot reports whether path is root itself or a descendant of root.
-func isWithinRoot(path, root string) bool {
-	rel, err := filepath.Rel(root, path)
-	if err != nil {
-		return false
+	if exec.Enabled && exec.ApprovalTimeout.Std() <= 0 {
+		errs.add("tools.exec.approval_timeout", "must be greater than 0, got %s", exec.ApprovalTimeout.Std())
 	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && !filepath.IsAbs(rel))
+	if exec.Enabled && exec.MaxOutputBytes < 1 {
+		errs.add("tools.exec.max_output_bytes", "must be greater than 0, got %d", exec.MaxOutputBytes)
+	}
 }
 
 func validateCron(cfg *Config, errs *ValidationErrors) {
@@ -285,6 +286,10 @@ func cronChatIDReachable(tg TelegramConfig, chatID string) bool {
 }
 
 func validateStorage(cfg *Config, errs *ValidationErrors) {
+	if strings.TrimSpace(cfg.Storage.Path) == "" {
+		errs.add("storage.path", "must not be empty")
+		return
+	}
 	dir := filepath.Dir(cfg.Storage.Path)
 	if err := ensureDirCreatable(dir); err != nil {
 		errs.add("storage.path", "parent directory %q is not creatable: %v", dir, err)

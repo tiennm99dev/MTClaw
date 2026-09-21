@@ -40,7 +40,7 @@ func newOnboardCmd(s *state) *cobra.Command {
 		Short: "Interactive first-run setup: writes a working config and runs doctor",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			p := newStdioPrompter(cmd.InOrStdin(), cmd.OutOrStdout(), int(os.Stdin.Fd()))
+			p := newStdioPrompter(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(), int(os.Stdin.Fd()))
 			return runOnboard(cmd.Context(), cmd.OutOrStdout(), s.configPath, p, realTelegramCapturer{})
 		},
 	}
@@ -113,7 +113,7 @@ func runOnboard(ctx context.Context, out io.Writer, configPath string, p prompte
 
 	// Step 8: starter AGENTS.md, written before the config so the config
 	// this run writes already references a file that exists.
-	agentsPath, err := writeStarterAgentsFile()
+	agentsPath, err := writeStarterAgentsFile(configPath)
 	if err != nil {
 		return err
 	}
@@ -144,36 +144,16 @@ func runOnboard(ctx context.Context, out io.Writer, configPath string, p prompte
 }
 
 // showWouldNotOverwrite is onboard's refuse-to-clobber path: it never
-// overwrites an existing config, and instead prints the existing config
-// (redacted) next to what a fresh onboard run would write by default, so
-// the user can see what would change without either file being touched.
+// overwrites an existing config, and points at `config show` instead of
+// dumping the whole file here, so the refusal stays short no matter how
+// large the config has grown.
 func showWouldNotOverwrite(configPath string, out io.Writer) error {
-	fmt.Fprintf(out, "A config file already exists at %s; onboard refuses to overwrite it.\n\n", configPath)
-
-	fmt.Fprintln(out, "=== existing config (secrets redacted) ===")
-	if existing, err := config.LoadFile(configPath); err == nil {
-		redacted, err := config.MarshalRedacted(existing)
-		if err != nil {
-			return fmt.Errorf("render existing config: %w", err)
-		}
-		if _, err := out.Write(redacted); err != nil {
-			return err
-		}
-	} else {
-		fmt.Fprintf(out, "(could not load it to render redacted: %v)\n", err)
-	}
-
-	fmt.Fprintln(out, "\n=== what a fresh `onboard` run would write (built-in defaults; your answers would fill in the rest) ===")
-	fresh, err := yaml.Marshal(config.Default())
-	if err != nil {
-		return fmt.Errorf("render default config: %w", err)
-	}
-	if _, err := out.Write(fresh); err != nil {
-		return err
-	}
-
-	fmt.Fprintln(out, "\nDelete or rename the existing file (or pass --config pointing elsewhere) to onboard a fresh one.")
-	return nil
+	_, err := fmt.Fprintf(out,
+		"A config file already exists at %s; onboard refuses to overwrite it.\n"+
+			"Run `mtclaw config show` to see it (secrets redacted).\n"+
+			"Delete or rename it, or pass --config pointing elsewhere, to onboard a fresh one.\n",
+		configPath)
+	return err
 }
 
 // onboardOpenAI prompts for the OpenAI key's env var name and (optionally)
@@ -378,20 +358,23 @@ func manualAllowFromEntry(p prompter, cfg *config.Config) error {
 		p.Printf("could not parse %q as a numeric id; leaving channels.telegram.allow_from empty - edit the config manually.\n", answer)
 		return nil
 	}
+	if id <= 0 {
+		p.Printf("warning: %d is not a positive user id (negative/zero ids are group chat ids, not user ids) - allow_from expects your own user id from /whoami; double check before relying on this.\n", id)
+	}
 	cfg.Channels.Telegram.AllowFrom = []int64{id}
 	return nil
 }
 
 // writeStarterAgentsFile writes the embedded starter AGENTS.md to
-// ~/.mtclaw/prompts/AGENTS.md, returning the path written so the caller can
-// reference it from agent.system_prompt_files.
-func writeStarterAgentsFile() (string, error) {
-	stateDir, err := config.StateDir()
-	if err != nil {
-		return "", fmt.Errorf("resolve state directory: %w", err)
-	}
-	promptsDir := filepath.Join(stateDir, "prompts")
-	if err := os.MkdirAll(promptsDir, 0o755); err != nil {
+// prompts/AGENTS.md next to configPath, returning the path written so the
+// caller can reference it from agent.system_prompt_files. Writing it next
+// to the config file being onboarded - rather than always under the
+// machine-wide ~/.mtclaw - keeps a `--config` pointed at a second install
+// self-contained instead of silently sharing (and overwriting) the first
+// install's starter prompt.
+func writeStarterAgentsFile(configPath string) (string, error) {
+	promptsDir := filepath.Join(filepath.Dir(configPath), "prompts")
+	if err := os.MkdirAll(promptsDir, 0o700); err != nil {
 		return "", fmt.Errorf("create %s: %w", promptsDir, err)
 	}
 	agentsPath := filepath.Join(promptsDir, "AGENTS.md")
@@ -413,7 +396,7 @@ func writeStarterAgentsFile() (string, error) {
 // `omitempty` tag, and the file contains only the env/file indirection
 // keys - never a secret.
 func writeOnboardConfig(path string, cfg *config.Config) error {
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
 	data, err := yaml.Marshal(cfg)

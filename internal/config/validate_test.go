@@ -176,13 +176,94 @@ func TestValidate_FilesystemRootsRequiredWhenEnabled(t *testing.T) {
 	assert.Contains(t, err.Error(), "tools.filesystem.roots: must list at least one root")
 }
 
-func TestValidate_ExecCWDOutsideRoots(t *testing.T) {
+func TestValidate_ExecCWDOutsideRootsIsNotAValidationError(t *testing.T) {
+	// exec.cwd is documented as "not a jail": config.Validate never compares
+	// it against tools.filesystem.roots, and neither does anything else in
+	// the product, at any point - a cwd outside the roots is not a
+	// validation failure. `mtclaw doctor`'s checkExecCWD only checks that
+	// the directory exists, nothing about its relationship to the roots.
 	cfg := validConfig(t)
 	cfg.Tools.Exec.CWD = t.TempDir() // a different temp dir than the configured root
 
+	assert.NoError(t, Validate(cfg))
+}
+
+func TestValidate_ToolBounds(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Tools.Filesystem.Enabled = true
+	cfg.Tools.Filesystem.MaxReadBytes = -5
+	cfg.Tools.Filesystem.MaxWriteBytes = 0
+	cfg.Tools.WebFetch.Enabled = true
+	cfg.Tools.WebFetch.Timeout = Duration(0)
+	cfg.Tools.WebFetch.MaxBytes = 0
+	cfg.Tools.Exec.Enabled = true
+	cfg.Tools.Exec.Timeout = Duration(0)
+	cfg.Tools.Exec.ApprovalTimeout = Duration(0)
+	cfg.Tools.Exec.MaxOutputBytes = 0
+
 	err := Validate(cfg)
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "tools.exec.cwd: must be inside one of tools.filesystem.roots")
+	msg := err.Error()
+	assert.Contains(t, msg, "tools.filesystem.max_read_bytes: must be greater than 0, got -5")
+	assert.Contains(t, msg, "tools.filesystem.max_write_bytes: must be greater than 0, got 0")
+	assert.Contains(t, msg, "tools.web_fetch.timeout: must be greater than 0")
+	assert.Contains(t, msg, "tools.web_fetch.max_bytes: must be greater than 0, got 0")
+	assert.Contains(t, msg, "tools.exec.timeout: must be greater than 0")
+	assert.Contains(t, msg, "tools.exec.approval_timeout: must be greater than 0")
+	assert.Contains(t, msg, "tools.exec.max_output_bytes: must be greater than 0, got 0")
+}
+
+func TestValidate_ToolBoundsSkippedWhenDisabled(t *testing.T) {
+	// A negative/zero bound must be skipped while its tool is disabled -
+	// nothing registers the tool, so nothing will ever read the value - but
+	// the exact same value must fail the moment the tool is turned on.
+	// Asserting both halves is what makes this discriminating: a guard that
+	// always passes regardless of Enabled (or that never actually reads
+	// Enabled) would still pass the "disabled" half alone.
+	t.Run("filesystem.max_read_bytes", func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.Tools.Filesystem.Enabled = false
+		cfg.Tools.Filesystem.MaxReadBytes = -5
+		assert.NoError(t, Validate(cfg))
+
+		cfg.Tools.Filesystem.Enabled = true
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tools.filesystem.max_read_bytes: must be greater than 0, got -5")
+	})
+
+	t.Run("web_fetch.timeout", func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.Tools.WebFetch.Enabled = false
+		cfg.Tools.WebFetch.Timeout = Duration(0)
+		assert.NoError(t, Validate(cfg))
+
+		cfg.Tools.WebFetch.Enabled = true
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tools.web_fetch.timeout: must be greater than 0")
+	})
+
+	t.Run("exec.timeout", func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.Tools.Exec.Enabled = false
+		cfg.Tools.Exec.Timeout = Duration(0)
+		assert.NoError(t, Validate(cfg))
+
+		cfg.Tools.Exec.Enabled = true
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "tools.exec.timeout: must be greater than 0")
+	})
+}
+
+func TestValidate_OpenAIMaxRetriesNegative(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.OpenAI.MaxRetries = -1
+
+	err := Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "openai.max_retries: must be 0 or greater, got -1")
 }
 
 func TestValidate_CronTimezone(t *testing.T) {
@@ -288,14 +369,19 @@ func TestValidate_CronDeliverTo(t *testing.T) {
 func TestValidate_StorageParentDirCreatable(t *testing.T) {
 	cfg := validConfig(t)
 	// Parent does not exist yet but is creatable under a writable temp dir.
-	cfg.Storage.Path = filepath.Join(t.TempDir(), "nested", "dirs", "mtclaw.db")
+	nested := filepath.Join(t.TempDir(), "nested", "dirs")
+	cfg.Storage.Path = filepath.Join(nested, "mtclaw.db")
 	assert.NoError(t, Validate(cfg))
+
+	// Validate must not write to disk: it only stats up to the nearest
+	// existing ancestor, never creates the directory itself.
+	_, err := os.Stat(nested)
+	assert.True(t, os.IsNotExist(err), "Validate must not create %s", nested)
 }
 
 func TestValidate_StorageParentDirNotCreatable(t *testing.T) {
 	cfg := validConfig(t)
-	// A regular file cannot be treated as a directory: MkdirAll must fail
-	// when the storage path's parent collides with an existing file.
+	// A regular file cannot be treated as a directory.
 	blocker := filepath.Join(t.TempDir(), "blocker")
 	require.NoError(t, os.WriteFile(blocker, []byte("x"), 0o644))
 	cfg.Storage.Path = filepath.Join(blocker, "mtclaw.db")
@@ -303,4 +389,13 @@ func TestValidate_StorageParentDirNotCreatable(t *testing.T) {
 	err := Validate(cfg)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "storage.path: parent directory")
+}
+
+func TestValidate_StoragePathEmpty(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Storage.Path = ""
+
+	err := Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "storage.path: must not be empty")
 }

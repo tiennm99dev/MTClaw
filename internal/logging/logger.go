@@ -20,10 +20,15 @@ import (
 func New(cfg config.LogConfig) (*slog.Logger, error) {
 	var w io.Writer = os.Stderr
 	if cfg.File != "" {
-		if err := os.MkdirAll(filepath.Dir(cfg.File), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(cfg.File), 0o700); err != nil {
 			return nil, fmt.Errorf("create log directory for %s: %w", cfg.File, err)
 		}
-		f, err := os.OpenFile(cfg.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o644)
+		// Best-effort: O_CREATE's mode only applies at creation, so a log
+		// file left at a looser mode by a pre-fix run would otherwise keep
+		// that mode forever. Narrow it before (re)opening, mirroring
+		// sqlite.Open's own best-effort chmod of the database file.
+		_ = os.Chmod(cfg.File, 0o600)
+		f, err := os.OpenFile(cfg.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
 			return nil, fmt.Errorf("open log file %s: %w", cfg.File, err)
 		}

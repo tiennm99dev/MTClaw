@@ -35,6 +35,7 @@ type prompter interface {
 
 // stdioPrompter is prompter's real, TTY-driven implementation.
 type stdioPrompter struct {
+	ctx     context.Context // ends every blocking read when the command is interrupted
 	in      *bufio.Reader
 	out     io.Writer
 	stdinFd int // used only to detect a real terminal for hidden Secret input
@@ -46,8 +47,11 @@ var _ prompter = (*stdioPrompter)(nil)
 // out. stdinFd is the OS file descriptor backing in, used solely to detect
 // whether Secret can hide its input; pass a negative value (or any fd that
 // is not a terminal) to always fall back to a plain, visible line read.
-func newStdioPrompter(in io.Reader, out io.Writer, stdinFd int) *stdioPrompter {
-	return &stdioPrompter{in: bufio.NewReader(in), out: out, stdinFd: stdinFd}
+func newStdioPrompter(ctx context.Context, in io.Reader, out io.Writer, stdinFd int) *stdioPrompter {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return &stdioPrompter{ctx: ctx, in: bufio.NewReader(in), out: out, stdinFd: stdinFd}
 }
 
 func (p *stdioPrompter) Printf(format string, args ...any) {
@@ -100,12 +104,47 @@ func (p *stdioPrompter) Confirm(question string, defaultYes bool) (bool, error) 
 	return line == "y" || line == "yes", nil
 }
 
+// readLine reads one line, trimmed. A final answer with no trailing newline
+// (EOF right after some content) is still real input and is returned
+// normally; EOF with nothing pending means stdin closed before answering,
+// which must abort the caller instead of looping forever on an empty
+// answer - see runOnboard's model prompt, which used to spin forever (and
+// fill the disk) against a closed or `/dev/null` stdin.
+//
+// The read runs on its own goroutine so an interrupt (ctx done) aborts the
+// prompt immediately: a blocking os.Stdin read cannot otherwise be woken,
+// and the root command's signal handling has replaced the default
+// die-on-signal disposition. The abandoned goroutine exits on the next
+// stdin byte or at process exit.
 func (p *stdioPrompter) readLine() (string, error) {
-	line, err := p.in.ReadString('\n')
-	if err != nil && err != io.EOF {
+	type result struct {
+		line string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		line, err := p.in.ReadString('\n')
+		ch <- result{line, err}
+	}()
+	var line string
+	var err error
+	select {
+	case r := <-ch:
+		line, err = r.line, r.err
+	case <-p.ctx.Done():
+		return "", fmt.Errorf("interrupted while waiting for an answer: %w", p.ctx.Err())
+	}
+	trimmed := strings.TrimSpace(line)
+	if err != nil {
+		if err == io.EOF && trimmed != "" {
+			return trimmed, nil
+		}
+		if err == io.EOF {
+			return "", fmt.Errorf("input closed (stdin reached EOF) while waiting for an answer: %w", err)
+		}
 		return "", fmt.Errorf("read input: %w", err)
 	}
-	return strings.TrimSpace(line), nil
+	return trimmed, nil
 }
 
 // telegramCapturer is onboard's seam for every Telegram network call it

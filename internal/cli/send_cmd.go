@@ -4,8 +4,6 @@ import (
 	"fmt"
 
 	"github.com/spf13/cobra"
-
-	"github.com/tiennm99/MTClaw/internal/channel/telegram"
 )
 
 // newSendCmd builds `mtclaw send --chat <id> "<text>"`: a one-shot outbound
@@ -24,12 +22,8 @@ func newSendCmd(s *state) *cobra.Command {
 			if chatFlag == "" {
 				return fmt.Errorf("--chat is required")
 			}
-			token := s.cfg.Channels.Telegram.Token()
-			if token == "" {
-				return fmt.Errorf("no telegram bot token resolved; set channels.telegram.token_env or channels.telegram.token_file")
-			}
 
-			if err := telegram.SendOnce(cmd.Context(), token, chatFlag, threadFlag, args[0]); err != nil {
+			if err := s.sendTelegram(cmd.Context(), chatFlag, threadFlag, args[0]); err != nil {
 				return fmt.Errorf("send message: %w", err)
 			}
 

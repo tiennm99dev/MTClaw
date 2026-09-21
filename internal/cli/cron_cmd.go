@@ -3,7 +3,6 @@ package cli
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"path/filepath"
 	"text/tabwriter"
 	"time"
@@ -11,11 +10,8 @@ import (
 	"github.com/adhocore/gronx"
 	"github.com/spf13/cobra"
 
-	"github.com/tiennm99/MTClaw/internal/agent"
-	"github.com/tiennm99/MTClaw/internal/channel/telegram"
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/gateway"
-	"github.com/tiennm99/MTClaw/internal/provider/openai"
 	"github.com/tiennm99/MTClaw/internal/store"
 	"github.com/tiennm99/MTClaw/internal/tools"
 )
@@ -119,19 +115,10 @@ func newCronRunCmd(s *state) *cobra.Command {
 				return err
 			}
 
-			client, err := openai.New(s.cfg.OpenAI)
+			loop, err := s.newLoop(st, newCronRunApprover())
 			if err != nil {
-				return fmt.Errorf("build openai client: %w", err)
+				return err
 			}
-			// Cron turns never have an interactive approver: DenyAllApprover
-			// matches exactly what a real gateway's approver mux picks for
-			// channel "cron" (see internal/gateway/approver.go), so `cron
-			// run` cannot approve anything a scheduled fire could not.
-			registry, err := tools.New(*s.cfg, st, tools.DenyAllApprover{}, slog.Default())
-			if err != nil {
-				return fmt.Errorf("build tool registry: %w", err)
-			}
-			loop := agent.New(*s.cfg, client, st, registry, slog.Default())
 
 			threadID := ""
 			if ephemeral {
@@ -175,6 +162,16 @@ func newCronRunCmd(s *state) *cobra.Command {
 	return cmd
 }
 
+// newCronRunApprover builds the approver `cron run` wires into its loop:
+// DenyAllApprover, matching exactly what a real gateway's approver mux
+// picks for channel "cron" (see internal/gateway/approver.go), so `cron
+// run` cannot approve anything a scheduled fire could not. Extracted to its
+// own function so cron_cmd_test.go can assert this wiring directly, without
+// running a whole turn.
+func newCronRunApprover() tools.DenyAllApprover {
+	return tools.DenyAllApprover{}
+}
+
 // findCronJob returns a pointer into jobs matching name, or nil.
 func findCronJob(jobs []config.CronJob, name string) *config.CronJob {
 	for i := range jobs {
@@ -209,7 +206,11 @@ func refuseIfGatewayLocked(jobName string) error {
 // mirroring the scheduler's own started->finished bookkeeping but
 // collapsed into a single Append (there is no concurrent tick to race
 // against here). A store failure is a warning, not a command failure: the
-// turn itself already ran to completion by the time this is called.
+// turn itself already ran to completion (or was cancelled) by the time this
+// is called. It records under context.WithoutCancel(ctx) - same rationale
+// as the ephemeral-session cleanup above - so a Ctrl-C that cancelled ctx
+// mid-turn does not also cancel the write that records how the turn ended;
+// otherwise an interrupted run would vanish from cron_runs with no trace.
 func recordManualRun(ctx context.Context, cmd *cobra.Command, runs store.CronRunStore, jobName, sessionID string, turnErr error) {
 	status, errMsg := "ok", ""
 	if turnErr != nil {
@@ -217,23 +218,19 @@ func recordManualRun(ctx context.Context, cmd *cobra.Command, runs store.CronRun
 	}
 	now := time.Now()
 	run := &store.CronRun{JobName: jobName, SessionID: sessionID, Status: status, Error: errMsg, StartedAt: now, FinishedAt: &now}
-	if err := runs.Append(ctx, run); err != nil {
+	if err := runs.Append(context.WithoutCancel(ctx), run); err != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "warning: record cron run: %v\n", err)
 	}
 }
 
-// deliverCronResult sends text to d over a directly-constructed Telegram
-// bot, the same one-shot path `mtclaw send` uses - `cron run --deliver`
-// does not go through a gateway, so there is no channel to hand it to.
+// deliverCronResult sends text to d over the same one-shot Telegram path
+// `mtclaw send` uses - `cron run --deliver` does not go through a gateway,
+// so there is no channel to hand it to.
 func deliverCronResult(cmd *cobra.Command, s *state, d config.CronDeliverTo, text string) error {
 	if d.Channel != "telegram" {
 		return fmt.Errorf("deliver_to.channel %q is not supported", d.Channel)
 	}
-	token := s.cfg.Channels.Telegram.Token()
-	if token == "" {
-		return fmt.Errorf("no telegram bot token resolved; set channels.telegram.token_env or channels.telegram.token_file")
-	}
-	if err := telegram.SendOnce(cmd.Context(), token, d.ChatID, "", text); err != nil {
+	if err := s.sendTelegram(cmd.Context(), d.ChatID, "", text); err != nil {
 		return fmt.Errorf("deliver result: %w", err)
 	}
 	_, err := fmt.Fprintf(cmd.OutOrStdout(), "delivered to chat %s\n", d.ChatID)

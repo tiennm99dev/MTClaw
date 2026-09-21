@@ -40,7 +40,7 @@ func newConfigPathCmd(s *state) *cobra.Command {
 func newConfigShowCmd(s *state) *cobra.Command {
 	return &cobra.Command{
 		Use:   "show",
-		Short: "Print the resolved config with secrets redacted",
+		Short: "Print the resolved config with secrets redacted (not a loadable config file)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out, err := config.MarshalRedacted(s.cfg)

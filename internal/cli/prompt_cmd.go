@@ -4,13 +4,11 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log/slog"
 	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/tiennm99/MTClaw/internal/agent"
-	"github.com/tiennm99/MTClaw/internal/provider/openai"
 	"github.com/tiennm99/MTClaw/internal/store"
 	"github.com/tiennm99/MTClaw/internal/tools"
 )
@@ -25,7 +23,12 @@ func newPromptCmd(s *state) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "prompt <text>",
 		Short: "Run one turn of the agent loop from the terminal",
-		Args:  cobra.ExactArgs(1),
+		Long: "Run one turn of the agent loop from the terminal.\n\n" +
+			"Concurrent `mtclaw prompt` invocations against the shared cli/local " +
+			"session are not serialized (unlike `cron run`, which refuses to run a " +
+			"persistent job while the gateway holds its lock): two overlapping runs " +
+			"read the same history and can interleave the transcript.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -39,18 +42,11 @@ func newPromptCmd(s *state) *cobra.Command {
 				return err
 			}
 
-			client, err := openai.New(s.cfg.OpenAI)
+			approver := newPromptApprover(cmd, s)
+			loop, err := s.newLoop(st, approver)
 			if err != nil {
-				return fmt.Errorf("build openai client: %w", err)
+				return err
 			}
-
-			approver := tools.NewTerminalApprover(cmd.InOrStdin(), cmd.ErrOrStderr(), s.cfg.Tools.Exec.ApprovalTimeout.Std())
-			registry, err := tools.New(*s.cfg, st, approver, slog.Default())
-			if err != nil {
-				return fmt.Errorf("build tool registry: %w", err)
-			}
-
-			loop := agent.New(*s.cfg, client, st, registry, slog.Default())
 
 			result := loop.Run(ctx, sessionID, args[0], "", progressPrinter(cmd.ErrOrStderr()))
 			if result.Err != nil {
@@ -70,6 +66,16 @@ func newPromptCmd(s *state) *cobra.Command {
 	cmd.Flags().BoolVar(&newFlag, "new", false, "force a fresh session instead of reusing the default cli/local one")
 
 	return cmd
+}
+
+// newPromptApprover builds the approver `prompt` wires into its loop: an
+// interactive TerminalApprover reading y/N answers from the command's own
+// stdin, writing prompts to its stderr, bounded by
+// tools.exec.approval_timeout. Extracted so prompt_cmd_test.go can assert
+// this wiring directly, without running a whole turn (which would need a
+// live OpenAI client).
+func newPromptApprover(cmd *cobra.Command, s *state) *tools.TerminalApprover {
+	return tools.NewTerminalApprover(cmd.InOrStdin(), cmd.ErrOrStderr(), s.cfg.Tools.Exec.ApprovalTimeout.Std())
 }
 
 // resolveCLISession returns the session id `prompt` should run its turn

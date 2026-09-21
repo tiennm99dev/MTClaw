@@ -186,12 +186,37 @@ func expandConfigPaths(cfg *Config, baseDir string) error {
 	return nil
 }
 
-// ensureDirCreatable verifies storage.path's parent directory either
-// already exists or can be created, by actually creating it. Idempotent:
-// safe to call on every load, including read-only commands like
-// `config show`.
+// ensureDirCreatable verifies storage.path's parent directory - or, if it
+// does not exist yet, its nearest existing ancestor - exists as a
+// directory, without creating anything on disk and without inspecting
+// permission bits. A directory's owner-write bit says nothing about
+// whether this process can actually write into it: a group/ACL-writable
+// but not owner-writable directory would be a false reject, and an
+// owner-writable directory owned by someone else would be a false accept.
+// The fallible case (a directory that stats fine here but still refuses a
+// later write) is handled correctly either way by the read-write caller
+// that actually needs it to exist (state.openStore in internal/cli, via
+// sqlite.Open's MkdirAll). Load must stay side-effect-free for read-only
+// commands like `config show` and `config validate`.
 func ensureDirCreatable(dir string) error {
-	return os.MkdirAll(dir, 0o755)
+	d := filepath.Clean(dir)
+	for {
+		info, err := os.Stat(d)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("%s exists and is not a directory", d)
+			}
+			return nil
+		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return err
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return fmt.Errorf("no existing ancestor directory found for %s", dir)
+		}
+		d = parent
+	}
 }
 
 // MarshalRedacted renders cfg back to YAML with every resolved secret
