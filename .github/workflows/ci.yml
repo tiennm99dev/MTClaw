@@ -75,14 +75,18 @@ jobs:
           }
 
       # -race needs cgo (a real C compiler), independent of the CGO-free
-      # release build above. windows-latest does not ship one by default -
-      # see https://github.com/actions/runner-images/issues/2549 - so this
-      # installs mingw-w64 gcc only for that leg.
-      - name: Install a C compiler for -race (Windows)
+      # release build above. Current windows-latest images ship MinGW gcc
+      # on PATH; this step only installs one if that ever stops being true.
+      - name: Ensure a C compiler for -race (Windows)
         if: runner.os == 'Windows'
-        uses: egor-tensin/setup-mingw@v2
-        with:
-          platform: x64
+        shell: pwsh
+        run: |
+          if (Get-Command gcc -ErrorAction SilentlyContinue) {
+            gcc --version | Select-Object -First 1
+          } else {
+            choco install mingw -y --no-progress
+            echo "C:\ProgramData\mingw64\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          }
 
       - name: go test -race ./...
         env:
