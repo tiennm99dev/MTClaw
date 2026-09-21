@@ -78,7 +78,7 @@ func TestCronTurn_ExecApprover_UnmatchedRefused_AllowListedRuns(t *testing.T) {
 				Mode:            "approval",
 				Shell:           testShell(),
 				CWD:             t.TempDir(),
-				Timeout:         config.Duration(5 * time.Second),
+				Timeout:         config.Duration(30 * time.Second), // generous: PowerShell cold start on CI can exceed 5s
 				MaxOutputBytes:  4096,
 				ApprovalTimeout: config.Duration(200 * time.Millisecond),
 				Allow:           []string{`^echo allow-listed$`},
