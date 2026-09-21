@@ -68,3 +68,15 @@ func TestDrain_WaitsForCtxBeforeChecking(t *testing.T) {
 func testLog() *slog.Logger {
 	return slog.New(slog.NewTextHandler(discardWriter{}, nil))
 }
+
+// TestWaitForShutdown_PropagatesDrainResult is the M1 regression test:
+// waitForShutdown must forward drain's bool, not discard it - Run uses this
+// to decide whether closing the store is safe.
+func TestWaitForShutdown_PropagatesDrainResult(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup // nothing added: wg.Wait() returns immediately
+	cancel()
+
+	completed := waitForShutdown(ctx, &wg, testLog())
+	assert.True(t, completed, "waitForShutdown must report the drain outcome, not swallow it")
+}

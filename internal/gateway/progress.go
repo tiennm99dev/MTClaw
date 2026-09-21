@@ -31,6 +31,12 @@ type progressReporter struct {
 	threadID string
 	log      *slog.Logger
 
+	// slowNoticeDelay is slowToolNotice by default; tests shrink it so
+	// onEvent's real closure - the one that guards against sending a notice
+	// after the turn's own ctx is already done - can be exercised directly
+	// instead of a hand-copied stand-in.
+	slowNoticeDelay time.Duration
+
 	stopTyping chan struct{}
 	typingDone chan struct{}
 
@@ -43,12 +49,13 @@ type progressReporter struct {
 // promptly instead of lingering.
 func newProgressReporter(ctx context.Context, ch Channel, chatID, threadID string, log *slog.Logger) *progressReporter {
 	return &progressReporter{
-		ctx:      ctx,
-		ch:       ch,
-		chatID:   chatID,
-		threadID: threadID,
-		log:      log,
-		timer:    make(map[string]*time.Timer),
+		ctx:             ctx,
+		ch:              ch,
+		chatID:          chatID,
+		threadID:        threadID,
+		log:             log,
+		slowNoticeDelay: slowToolNotice,
+		timer:           make(map[string]*time.Timer),
 	}
 }
 
@@ -94,12 +101,27 @@ func (p *progressReporter) stop() {
 func (p *progressReporter) onEvent(ev agent.Event) {
 	switch ev.Kind {
 	case agent.EventToolStarted:
-		timer := time.AfterFunc(slowToolNotice, func() {
+		timer := time.AfterFunc(p.slowNoticeDelay, func() {
+			select {
+			case <-p.ctx.Done():
+				// The turn ended (and stop() already tried to cancel this
+				// timer) between it firing and this closure actually
+				// running - do not send a "running X..." notice after the
+				// turn's own reply already went out.
+				return
+			default:
+			}
 			if err := p.ch.Send(p.ctx, p.chatID, p.threadID, fmt.Sprintf("running `%s`...", ev.ToolName), ""); err != nil {
 				p.log.Debug("gateway: send slow-tool notice failed", "tool", ev.ToolName, "error", err)
 			}
 		})
 		p.mu.Lock()
+		if old, ok := p.timer[ev.ToolCallID]; ok {
+			// A tool call id reused within one turn (defensive - providers
+			// are not expected to do this) must not leak the earlier
+			// timer: stop it before this one replaces it in the map.
+			old.Stop()
+		}
 		p.timer[ev.ToolCallID] = timer
 		p.mu.Unlock()
 

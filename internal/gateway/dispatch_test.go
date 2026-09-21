@@ -284,6 +284,70 @@ func TestDispatch_WorkerExitWithQueuedItem_OnDoneCalledForEachQueued(t *testing.
 	}
 }
 
+// TestDispatch_AfterRootCtxCanceled_OnDoneFiresImmediately is the H3
+// regression test for dispatch's own early-return guard: a message
+// dispatched after rootCtx is already canceled must get its OnDone call
+// right away, without ever being hidden behind a spawned worker's queue.
+func TestDispatch_AfterRootCtxCanceled_OnDoneFiresImmediately(t *testing.T) {
+	d := newTestDispatcher(t, &fakeRunner{}, &fakeChannel{}, time.Minute, 4)
+
+	rootCtx, cancel := context.WithCancel(context.Background())
+	d.rootCtx = rootCtx
+	cancel()
+
+	var gotErr error
+	done := make(chan struct{})
+	in := inboundTo("after-shutdown", "hi")
+	in.OnDone = func(err error) { gotErr = err; close(done) }
+	d.dispatch(in)
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("OnDone was never called for a message dispatched after rootCtx was already canceled")
+	}
+	assert.ErrorIs(t, gotErr, context.Canceled)
+
+	d.mu.Lock()
+	_, exists := d.workers[sessionKey("telegram", "after-shutdown", "")]
+	d.mu.Unlock()
+	assert.False(t, exists, "no worker should be spawned for a message dropped before it ever ran")
+}
+
+// TestDispatch_RunWorker_RootCtxDoneRemovesItselfFromMap is the H3
+// regression test for runWorker's rootCtx.Done() branch: a live worker
+// exiting because the gateway is shutting down must remove itself from
+// d.workers exactly like the idle-reap branch does, so a dispatch racing
+// the exit sees a miss and spawns a fresh worker instead of enqueuing into
+// a queue nothing will ever drain.
+func TestDispatch_RunWorker_RootCtxDoneRemovesItselfFromMap(t *testing.T) {
+	d := newTestDispatcher(t, &fakeRunner{fn: func(ctx context.Context, sessionID, userText, messageID string, onProgress agent.Progress) agent.Result {
+		return agent.Result{NoReply: true}
+	}}, &fakeChannel{}, time.Minute, 4)
+
+	rootCtx, cancel := context.WithCancel(context.Background())
+	d.rootCtx = rootCtx
+
+	key := sessionKey("telegram", "ctx-done", "")
+	d.dispatch(inboundTo("ctx-done", "hi"))
+	waitCond(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		_, ok := d.workers[key]
+		return ok
+	}, time.Second)
+
+	cancel()
+
+	waitCond(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		_, exists := d.workers[key]
+		return !exists
+	}, time.Second)
+	waitGroupDone(t, &d.wg, time.Second)
+}
+
 // --- idle reap -------------------------------------------------------------
 
 func TestDispatch_IdleReap_RespawnsAndProcessesLaterMessages(t *testing.T) {
@@ -596,4 +660,65 @@ func TestDispatch_Timeout_BoundsTurnContext(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Inbound.Timeout never bounded the turn's context")
 	}
+}
+
+// TestDispatch_CronJobTimeout_DeliversTimeoutNotice is the M8 regression
+// test: unlike an interactive /stop or a shutdown drain (both already
+// explained to the user by whoever triggered them), nobody is watching a
+// cron fire - its own job.timeout elapsing must still tell the deliver
+// target something happened, not go silent.
+func TestDispatch_CronJobTimeout_DeliversTimeoutNotice(t *testing.T) {
+	runner := &fakeRunner{fn: func(ctx context.Context, sessionID, userText, messageID string, onProgress agent.Progress) agent.Result {
+		<-ctx.Done()
+		return agent.Result{Err: &provider.Error{Kind: provider.ErrCanceled, Err: ctx.Err()}}
+	}}
+	ch := &fakeChannel{}
+	d := newTestDispatcher(t, runner, ch, time.Minute, 4)
+
+	in := channel.Inbound{
+		Channel:   "cron",
+		ChatID:    "job:slow",
+		Text:      "do it",
+		Timeout:   20 * time.Millisecond,
+		DeliverTo: channel.DeliverTarget{Channel: "telegram", ChatID: "999888"},
+	}
+	d.dispatch(in)
+
+	waitCond(t, func() bool { return len(ch.sentSnapshot()) == 1 }, 2*time.Second)
+	sent := ch.sentSnapshot()
+	require.Len(t, sent, 1)
+	assert.Equal(t, "999888", sent[0].chatID)
+	assert.Contains(t, sent[0].text, "timed out")
+}
+
+// TestDispatch_CronShutdownCancel_StaysSilent proves the job.timeout notice
+// is not sent for a plain shutdown cancellation (context.Canceled, not
+// context.DeadlineExceeded) - the existing suppression for /stop and
+// shutdown drain must still hold.
+func TestDispatch_CronShutdownCancel_StaysSilent(t *testing.T) {
+	started := make(chan struct{})
+	runner := &fakeRunner{fn: func(ctx context.Context, sessionID, userText, messageID string, onProgress agent.Progress) agent.Result {
+		close(started)
+		<-ctx.Done()
+		return agent.Result{Err: &provider.Error{Kind: provider.ErrCanceled, Err: ctx.Err()}}
+	}}
+	ch := &fakeChannel{}
+	d := newTestDispatcher(t, runner, ch, time.Minute, 4)
+	rootCtx, cancel := context.WithCancel(context.Background())
+	d.rootCtx = rootCtx
+
+	in := channel.Inbound{
+		Channel:   "cron",
+		ChatID:    "job:slow",
+		Text:      "do it",
+		Timeout:   time.Minute,
+		DeliverTo: channel.DeliverTarget{Channel: "telegram", ChatID: "999888"},
+	}
+	d.dispatch(in)
+	<-started
+	cancel()
+
+	// Give runTurn a moment to finish and (not) reply.
+	time.Sleep(50 * time.Millisecond)
+	assert.Empty(t, ch.sentSnapshot(), "a shutdown/interactive cancellation must stay silent, not just a job timeout")
 }

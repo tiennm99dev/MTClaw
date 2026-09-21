@@ -52,7 +52,7 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 	if err != nil {
 		return nil, fmt.Errorf("gateway: resolve state directory: %w", err)
 	}
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return nil, fmt.Errorf("gateway: create state directory %s: %w", stateDir, err)
 	}
 	lockPath := filepath.Join(stateDir, lockFileName)
@@ -70,6 +70,24 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 		return nil, fmt.Errorf("gateway: open store: %w", err)
 	}
 	st := sqlite.New(db)
+
+	// A cron_runs row still "started" from a prior process (a SIGKILL, an
+	// OOM, a dropped dispatch - anything that skipped OnDone) would
+	// otherwise report as perpetually in flight forever; sweep it now,
+	// mirroring the Telegram approver's own ExpirePending sweep at its
+	// Start. Runs unconditionally, not just when cron.enabled, since a
+	// disabled job can still have a stale row from when it was enabled.
+	// Bounded, not context.Background(): a held write lock (a manual
+	// `mtclaw cron run`, a backup holding the database's write lock) must
+	// not hang startup indefinitely.
+	expireCtx, expireCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	n, err := st.CronRuns().ExpireStarted(expireCtx, time.Now())
+	expireCancel()
+	if err != nil {
+		log.Error("gateway: expire stale cron runs at startup failed", "error", err)
+	} else if n > 0 {
+		log.Info("gateway: expired cron runs left running by a prior process", "count", n)
+	}
 
 	client, err := openai.New(cfg.OpenAI)
 	if err != nil {
@@ -136,20 +154,45 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 // completes. Shutdown order is the reverse of startup: the channel's update
 // pump stops first (no new inbound arrives), in-flight turns drain (bounded
 // by drainDeadline), then the store closes and the lock releases - closing
-// the store while a worker is mid-Append would lose a turn.
+// the store while a worker is mid-Append would lose a turn. If the drain
+// deadline is breached, the store is deliberately left open (closing a
+// database out from under a still-writing worker is worse than leaking the
+// fd at process exit) and Run returns a non-nil error so the process exits
+// non-zero instead of looking like a clean shutdown.
 func (g *Gateway) Run(ctx context.Context) error {
+	var drained bool
 	defer func() {
-		if err := g.store.Close(); err != nil {
-			g.log.Error("gateway: close store failed", "error", err)
+		if drained {
+			if err := g.store.Close(); err != nil {
+				g.log.Error("gateway: close store failed", "error", err)
+			}
+		} else {
+			g.log.Error("gateway: drain deadline exceeded; leaving the store open for process exit to close instead of closing it under a possibly still-writing worker")
 		}
 		if err := g.release(); err != nil {
 			g.log.Error("gateway: release instance lock failed", "error", err)
 		}
 	}()
 
-	sigCtx, stop := notifyContext(ctx)
+	// A plain cancelable child of ctx, not a second signal.NotifyContext:
+	// the cli root already installs one (internal/cli/root.go) to catch
+	// SIGINT/SIGTERM, and a second registered handler here would steal the
+	// second, hard-kill Ctrl-C the cli's own handler is there to honor.
+	// runCtx still ends whenever ctx does (a real signal, or a caller-driven
+	// shutdown in tests); stop is additionally used below to end it early
+	// when the channel itself fails.
+	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	g.disp.rootCtx = sigCtx
+	g.disp.rootCtx = runCtx
+
+	// Mark the dispatcher closed as soon as runCtx ends, before
+	// waitForShutdown's own wg.Wait() can itself return - see dispatch's
+	// d.closed field and closeForShutdown for the wg.Add/wg.Wait race this
+	// closes.
+	go func() {
+		<-runCtx.Done()
+		g.disp.closeForShutdown()
+	}()
 
 	raw := make(chan channel.Inbound)
 	global := make(chan channel.Inbound, globalQueueSize)
@@ -167,8 +210,8 @@ func (g *Gateway) Run(ctx context.Context) error {
 	var channelFailure error
 	go func() {
 		defer pumps.Done()
-		err := g.channel.Start(sigCtx, raw)
-		if err != nil && sigCtx.Err() == nil {
+		err := g.channel.Start(runCtx, raw)
+		if err != nil && runCtx.Err() == nil {
 			// The channel is the gateway's only inbound surface: if its
 			// poll loop dies for a reason other than shutdown (a revoked
 			// token, a sustained network failure), there is no path left
@@ -183,22 +226,28 @@ func (g *Gateway) Run(ctx context.Context) error {
 	}()
 	go func() {
 		defer pumps.Done()
-		relayInbound(sigCtx, raw, global, g.log)
+		relayInbound(runCtx, raw, global, g.channel, g.log)
 	}()
 	go func() {
 		defer pumps.Done()
-		g.disp.pump(sigCtx, global)
+		g.disp.pump(runCtx, global)
 	}()
 	if g.cronSched != nil {
 		go func() {
 			defer pumps.Done()
-			g.cronSched.Start(sigCtx)
+			g.cronSched.Start(runCtx)
 		}()
 	}
 
-	waitForShutdown(sigCtx, &g.disp.wg, g.log)
+	drained = waitForShutdown(runCtx, &g.disp.wg, g.log)
 	pumps.Wait()
-	return channelFailure
+	if channelFailure != nil {
+		return channelFailure
+	}
+	if !drained {
+		return fmt.Errorf("gateway: shutdown drain deadline exceeded; some turns may still be running")
+	}
+	return nil
 }
 
 // telegramDeps implements telegram.Deps against a real store and the

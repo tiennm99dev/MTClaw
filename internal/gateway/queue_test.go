@@ -55,10 +55,11 @@ func TestRelayInbound_DropsAndWarnsWhenGlobalQueueFull(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	go relayInbound(ctx, in, out, log)
+	ch := &fakeChannel{}
+	go relayInbound(ctx, in, out, ch, log)
 
-	in <- channel.Inbound{Text: "1"} // fills out's one slot
-	in <- channel.Inbound{Text: "2"} // out is now full: must warn+drop, not block
+	in <- channel.Inbound{Text: "1"}                                    // fills out's one slot
+	in <- channel.Inbound{Channel: "telegram", ChatID: "42", Text: "2"} // out is now full: must warn+drop, not block
 
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) && !strings.Contains(buf.String(), "queue full") {
@@ -72,6 +73,44 @@ func TestRelayInbound_DropsAndWarnsWhenGlobalQueueFull(t *testing.T) {
 	default:
 		t.Fatal("expected the first message to still be queued")
 	}
+
+	// L6: the dropped message's sender must get the same honest overflow
+	// reply the per-session queue-full path sends, not silence.
+	waitCond(t, func() bool { return len(ch.sentSnapshot()) == 1 }, time.Second)
+	sent := ch.sentSnapshot()
+	require.Len(t, sent, 1)
+	assert.Equal(t, "42", sent[0].chatID)
+	assert.Contains(t, sent[0].text, "still working")
+}
+
+// TestRelayInbound_DropsFireOnDone is the L1 regression test: a message
+// dropped by global-queue overflow must still get its OnDone callback
+// invoked (with the drop's own error) instead of vanishing silently with no
+// terminal signal at all.
+func TestRelayInbound_DropsFireOnDone(t *testing.T) {
+	in := make(chan channel.Inbound)
+	out := make(chan channel.Inbound, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	log := slog.New(slog.NewTextHandler(discardWriter{}, nil))
+	go relayInbound(ctx, in, out, nil, log)
+
+	in <- channel.Inbound{Channel: "telegram", ChatID: "1", Text: "fills out's one slot"}
+
+	done := make(chan struct{})
+	var gotErr error
+	in <- channel.Inbound{Channel: "telegram", ChatID: "2", Text: "overflow", OnDone: func(err error) {
+		gotErr = err
+		close(done)
+	}}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("OnDone was never called for a message dropped by global-queue overflow")
+	}
+	assert.Error(t, gotErr)
 }
 
 func TestRelayInbound_StopsOnContextDone(t *testing.T) {
@@ -81,7 +120,7 @@ func TestRelayInbound_StopsOnContextDone(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		relayInbound(ctx, in, out, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
+		relayInbound(ctx, in, out, nil, slog.New(slog.NewTextHandler(discardWriter{}, nil)))
 		close(done)
 	}()
 

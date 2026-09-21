@@ -104,10 +104,22 @@ func (s *Scheduler) LogNextDue() {
 	}
 }
 
+// missedTickThreshold is how late a ticker firing can arrive before
+// tickWithCatchUp treats the gap as a missed tick (host suspend/resume, a
+// long GC pause, SIGSTOP) rather than ordinary ticker jitter.
+const missedTickThreshold = 90 * time.Second
+
+// maxCatchUpMinutes bounds how many of the most recently skipped whole
+// minutes one missed-tick gap evaluates, so an extreme gap (days of
+// suspend) cannot replay an unbounded backlog of due jobs in one burst.
+const maxCatchUpMinutes = 10
+
 // Start sleeps until the next wall-clock minute boundary (see alignDelay),
 // ticks once immediately, then once every minute until ctx is done. Started
 // after a job's due time, it does not replay that miss - the first tick only
-// evaluates jobs against the current minute, never anything in the past.
+// evaluates jobs against the current minute, never anything in the past;
+// that is a restart, not a missed tick, and only this already-running
+// process's own ticker being delayed (see tickWithCatchUp) counts as one.
 func (s *Scheduler) Start(ctx context.Context) {
 	s.LogNextDue()
 
@@ -119,18 +131,45 @@ func (s *Scheduler) Start(ctx context.Context) {
 	case <-ctx.Done():
 		return
 	}
-	s.tick(s.now())
+	lastTick := s.now()
+	s.tick(lastTick)
 
 	ticker := time.NewTicker(time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
-			s.tick(s.now())
+			lastTick = s.tickWithCatchUp(s.now(), lastTick)
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+// tickWithCatchUp evaluates now's tick and, if more than
+// missedTickThreshold has passed since lastTick, first evaluates the most
+// recently skipped whole minutes (bounded to maxCatchUpMinutes, walking
+// backwards from now) - so a ticker firing late while this process kept
+// running does not silently swallow a due job's only firing window. Walking
+// backwards, not forwards from lastTick, matters once the gap exceeds the
+// bound: an hourly job due 3 minutes ago must still fire even after a
+// 2-hour suspend, rather than the bounded window being spent on the ten
+// minutes right after lastTick - now two hours stale - while the job due
+// just before now is never evaluated at all. Returns now, the new lastTick.
+func (s *Scheduler) tickWithCatchUp(now, lastTick time.Time) time.Time {
+	if gap := now.Sub(lastTick); gap > missedTickThreshold {
+		s.log.Warn("cron: missed tick detected; catching up skipped minutes", "gap", gap.String())
+		start := lastTick.Truncate(time.Minute).Add(time.Minute)
+		earliest := now.Truncate(time.Minute).Add(-maxCatchUpMinutes * time.Minute)
+		if start.Before(earliest) {
+			start = earliest
+		}
+		for minute := start; minute.Before(now); minute = minute.Add(time.Minute) {
+			s.tick(minute)
+		}
+	}
+	s.tick(now)
+	return now
 }
 
 // alignDelay returns how long to wait from now until the next whole

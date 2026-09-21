@@ -259,3 +259,56 @@ func TestDecide_PositiveGroupIDConfigIsSimplyAnUnmatchedKey(t *testing.T) {
 	assert.False(t, accept)
 	assert.NotEmpty(t, reason)
 }
+
+// TestDecide_CaptionUsedWhenTextIsEmpty is the M2 regression test: a
+// captioned photo (Text is always empty on media messages; the caption
+// lives in a separate field) must not gate through as blank text - Decide
+// falls back to Caption so a captioned photo addressed to the bot is not
+// silently treated as having nothing to say.
+func TestDecide_CaptionUsedWhenTextIsEmpty(t *testing.T) {
+	cfg := config.TelegramConfig{AllowFrom: []int64{100}}
+	msg := &telego.Message{
+		Chat:    telego.Chat{ID: 100, Type: "private"},
+		From:    &telego.User{ID: 100},
+		Caption: "what is this?",
+	}
+	accept, text, reason := Decide(cfg, testBotUsername, testBotID, msg)
+	assert.True(t, accept)
+	assert.Equal(t, "what is this?", text)
+	assert.Empty(t, reason)
+}
+
+// TestDecide_CaptionEntitiesUsedForMentionDetection proves the caption
+// fallback also swaps in CaptionEntities (not the empty top-level Entities)
+// for require_mention's mention check in a group.
+func TestDecide_CaptionEntitiesUsedForMentionDetection(t *testing.T) {
+	cfg := config.TelegramConfig{
+		Groups: map[string]config.TelegramGroupConfig{
+			"-1001": {RequireMention: true, AllowFrom: []int64{100}},
+		},
+	}
+	msg := &telego.Message{
+		Chat:            telego.Chat{ID: -1001, Type: "supergroup"},
+		From:            &telego.User{ID: 100},
+		Caption:         "@mtclawbot look at this",
+		CaptionEntities: []telego.MessageEntity{mentionEntity(0, len("@mtclawbot"))},
+	}
+	accept, text, reason := Decide(cfg, testBotUsername, testBotID, msg)
+	assert.True(t, accept)
+	assert.Equal(t, "look at this", text)
+	assert.Empty(t, reason)
+}
+
+// TestDecide_TextTakesPriorityOverCaption proves a normal text message
+// (Caption empty) is entirely unaffected by the fallback.
+func TestDecide_TextTakesPriorityOverCaption(t *testing.T) {
+	cfg := config.TelegramConfig{AllowFrom: []int64{100}}
+	msg := &telego.Message{
+		Chat: telego.Chat{ID: 100, Type: "private"},
+		From: &telego.User{ID: 100},
+		Text: "hello there",
+	}
+	accept, text, _ := Decide(cfg, testBotUsername, testBotID, msg)
+	assert.True(t, accept)
+	assert.Equal(t, "hello there", text)
+}

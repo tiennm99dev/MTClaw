@@ -10,15 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// deadPID is a PID value far outside any range a real process ever
-// occupies on Windows or POSIX (both cap out many orders of magnitude
-// lower in practice), used as a guaranteed-dead PID. Spawning and waiting
-// on a short-lived real process was tried first and was flaky: Windows can
-// reuse a just-exited PID almost immediately, especially under `go test
-// -race`'s extra scheduling overhead while many short-lived test processes
-// start and stop.
-const deadPID = 2000000000
-
 func TestAcquire_SecondCallFailsWhileHeld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 
@@ -31,45 +22,39 @@ func TestAcquire_SecondCallFailsWhileHeld(t *testing.T) {
 	assert.Contains(t, err2.Error(), strconv.Itoa(os.Getpid()))
 }
 
-func TestAcquire_StaleLockFromDeadPIDIsRemovedAndReplaced(t *testing.T) {
+// TestAcquire_ExistingFileContentIsIrrelevant is the L1 regression test: the
+// kernel lock, not the file's bytes, is what gates acquisition now, so a
+// pre-existing file - whatever it contains, stale pid or garbage - must
+// never block startup or need a "stale lock" heuristic to remove it first.
+func TestAcquire_ExistingFileContentIsIrrelevant(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
-	require.NoError(t, os.WriteFile(path, []byte(strconv.Itoa(deadPID)), 0o644))
+	require.NoError(t, os.WriteFile(path, []byte("not-a-pid, definitely not json either"), 0o644))
 
 	release, err := Acquire(path)
-	require.NoError(t, err)
+	require.NoError(t, err, "existing file content must never block acquiring the lock")
 	defer release()
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
-	assert.Equal(t, strconv.Itoa(os.Getpid()), string(data), "the stale lock must be replaced with this process's own pid")
+	assert.Equal(t, strconv.Itoa(os.Getpid()), string(data), "Acquire must overwrite the file with this process's own pid")
 }
 
-func TestAcquire_CorruptLockFileIsTreatedAsStale(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "gateway.lock")
-	require.NoError(t, os.WriteFile(path, []byte("not-a-pid"), 0o644))
-
-	release, err := Acquire(path)
-	require.NoError(t, err, "a lock file whose liveness cannot be verified must not block startup forever")
-	defer release()
-}
-
-func TestAcquire_ReleaseRemovesFile(t *testing.T) {
+// TestAcquire_ReleaseThenReacquireSucceeds replaces the old
+// "release removes the file" assertion: flock-based locking intentionally
+// leaves the lock file in place after release (removing it would reopen the
+// exact TOCTOU window flock exists to close) - what actually matters is
+// that release genuinely drops the kernel lock, so a subsequent Acquire
+// succeeds.
+func TestAcquire_ReleaseThenReacquireSucceeds(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 
 	release, err := Acquire(path)
 	require.NoError(t, err)
 	require.NoError(t, release())
 
-	_, statErr := os.Stat(path)
-	assert.True(t, os.IsNotExist(statErr), "release must remove the lock file")
-}
-
-func TestProcessAlive_CurrentProcessIsAlive(t *testing.T) {
-	assert.True(t, processAlive(os.Getpid()))
-}
-
-func TestProcessAlive_DeadPIDIsNotAlive(t *testing.T) {
-	assert.False(t, processAlive(deadPID))
+	release2, err := Acquire(path)
+	require.NoError(t, err, "release must actually drop the lock, not just close the fd")
+	require.NoError(t, release2())
 }
 
 // --- Held (cron run's read-only lock check) ---------------------------
@@ -94,14 +79,38 @@ func TestHeld_LiveProcess_ReportsHeld(t *testing.T) {
 	assert.Equal(t, os.Getpid(), pid)
 }
 
-func TestHeld_StaleLockFromDeadPID_ReportsNotHeld(t *testing.T) {
+// TestHeld_UnlockedFileWithStalePIDContent_ReportsNotHeld proves Held
+// trusts the kernel lock, not the file's recorded pid: a file whose content
+// names some other (possibly long-dead) pid but that nothing currently
+// holds a flock on must report not held.
+func TestHeld_UnlockedFileWithStalePIDContent_ReportsNotHeld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
-	require.NoError(t, os.WriteFile(path, []byte(strconv.Itoa(deadPID)), 0o644))
+	const stalePID = 2000000000
+	require.NoError(t, os.WriteFile(path, []byte(strconv.Itoa(stalePID)), 0o644))
 
 	pid, held, err := Held(path)
 	require.NoError(t, err)
-	assert.False(t, held, "a dead pid must not be reported as held")
-	assert.Equal(t, deadPID, pid)
+	assert.False(t, held, "a file nobody holds the kernel lock on must not be reported as held")
+	assert.Equal(t, stalePID, pid, "the recorded pid is still surfaced for the caller's message, just not trusted for liveness")
+}
+
+// TestHeld_ReadOnlyLockFile_StillReportsHeld is the L7 regression test:
+// Held must open the lock file read-only, not read-write, so a caller that
+// lacks write permission on it (e.g. `mtclaw doctor` run as a different
+// user) still gets an accurate answer - flock works fine on a read-only fd -
+// instead of failing to open the file at all.
+func TestHeld_ReadOnlyLockFile_StillReportsHeld(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.lock")
+	release, err := Acquire(path)
+	require.NoError(t, err)
+	defer release()
+
+	require.NoError(t, os.Chmod(path, 0o400))
+
+	pid, held, err := Held(path)
+	require.NoError(t, err, "Held must succeed on a lock file this process cannot write")
+	assert.True(t, held)
+	assert.Equal(t, os.Getpid(), pid)
 }
 
 func TestHeld_NeverMutatesTheLockFile(t *testing.T) {

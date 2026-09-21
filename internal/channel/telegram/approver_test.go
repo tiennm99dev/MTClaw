@@ -3,6 +3,7 @@ package telegram
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -318,7 +319,17 @@ func TestApprover_RowExistsBeforePromptIsSent(t *testing.T) {
 	}
 
 	id := waitForCallbackID(t, api)
+	// sendFunc's own return - and so sawRow firing - races Ask's own
+	// SetMessageID call for the same send (both happen after SendMessage
+	// returns, on different goroutines with no ordering between them), so
+	// the row is not guaranteed to carry message_id yet the instant sawRow
+	// is received; poll briefly instead of checking exactly once.
 	row := mustGet(t, approvals, id)
+	deadline := time.Now().Add(time.Second)
+	for row.MessageID == "" && time.Now().Before(deadline) {
+		time.Sleep(2 * time.Millisecond)
+		row = mustGet(t, approvals, id)
+	}
 	assert.Equal(t, "1", row.MessageID, "message_id must be recorded on the row after the send confirms")
 
 	cb := &telego.CallbackQuery{
@@ -407,6 +418,107 @@ func TestApprover_Timeout(t *testing.T) {
 	id := callbackIDFromLastSend(t, api)
 	assert.Equal(t, "expired", approvals.state(id))
 	assert.NotEmpty(t, api.edited)
+}
+
+// TestApprover_FinishExpired_SkipsEditWhenAlreadyDecided is the M3
+// regression test: if a callback already decided the approval (Decide
+// returns ErrAlreadyDecided), finishExpired must not overwrite the message
+// that already shows that outcome with a contradictory "timed out".
+func TestApprover_FinishExpired_SkipsEditWhenAlreadyDecided(t *testing.T) {
+	api := &fakeBotAPI{}
+	approvals := newFakeApprovalStore()
+	require.NoError(t, approvals.Create(context.Background(), &store.Approval{
+		ID: "already1", ChatID: "100", ExpiresAt: time.Now().Add(time.Hour), State: "approved",
+	}))
+	a := testApprover(api, approvals, config.TelegramConfig{AllowFrom: []int64{100}}, time.Minute)
+
+	a.finishExpired(context.Background(), "already1", "100", 1, "timed out waiting for a response")
+
+	assert.Empty(t, api.edited, "finishExpired must not touch a message whose approval was already decided")
+	assert.Equal(t, "approved", approvals.state("already1"))
+}
+
+// TestApprover_AwaitDecision_TimerFireRacesBufferedDecision_NeverLosesIt is
+// the M3 regression test for the timer/callback race itself: with a
+// decision already sitting in wait and an already-elapsed timer, both
+// select cases are ready from the start, so Go's runtime picks between them
+// at random - run enough times, this reliably exercises both the direct
+// <-wait case and the timer case's own drain-before-timeout check. Neither
+// path may throw the buffered decision away.
+func TestApprover_AwaitDecision_TimerFireRacesBufferedDecision_NeverLosesIt(t *testing.T) {
+	api := &fakeBotAPI{}
+	approvals := newFakeApprovalStore()
+	a := testApprover(api, approvals, config.TelegramConfig{AllowFrom: []int64{100}}, time.Minute)
+
+	for i := 0; i < 500; i++ {
+		wait := make(chan bool, 1)
+		wait <- true
+		timer := time.NewTimer(0) // already elapsed: both cases are ready immediately
+
+		approved, err := a.awaitDecision(context.Background(), wait, timer, "no-such-id", "100", 1)
+		timer.Stop()
+
+		require.NoError(t, err, "iteration %d: a buffered decision must never be reported as a timeout", i)
+		assert.True(t, approved, "iteration %d", i)
+	}
+}
+
+// TestApprover_AwaitDecision_DecidedBetweenTimerFireAndFinishExpired_HonorsDB
+// is the H1 regression test: a callback commits its verdict to the
+// approvals row (Decide) noticeably before it pushes to wait - if the timer
+// fires inside that exact gap, wait is still empty, but the DB (and the
+// message the user already sees, via the callback's own edit) already say
+// "approved". awaitDecision must consult the approvals row once it loses
+// the finishExpired race and honor that verdict instead of reporting a
+// timeout.
+func TestApprover_AwaitDecision_DecidedBetweenTimerFireAndFinishExpired_HonorsDB(t *testing.T) {
+	api := &fakeBotAPI{}
+	approvals := newFakeApprovalStore()
+	require.NoError(t, approvals.Create(context.Background(), &store.Approval{
+		ID: "race1", ChatID: "100", ExpiresAt: time.Now().Add(time.Hour),
+	}))
+	a := testApprover(api, approvals, config.TelegramConfig{AllowFrom: []int64{100}}, time.Minute)
+
+	// The callback has committed the verdict but not yet reached its own
+	// push to wait: wait stays empty.
+	require.NoError(t, approvals.Decide(context.Background(), "race1", "approved", "100"))
+
+	wait := make(chan bool, 1)
+	timer := time.NewTimer(0) // already elapsed
+	defer timer.Stop()
+
+	approved, err := a.awaitDecision(context.Background(), wait, timer, "race1", "100", 1)
+	require.NoError(t, err, "a decision already committed to the DB must never be reported as a timeout")
+	assert.True(t, approved)
+	assert.Equal(t, "approved", approvals.state("race1"), "the winning callback's own verdict must survive, not get overwritten by expiry")
+}
+
+// TestApprover_CallbackWithNoWaiter_EditsNoLongerWaiting is the M3
+// regression test: a callback for an id nobody in this process is waiting
+// on (e.g. a pending row surviving a restart, tapped before the startup
+// sweep) must still record the verdict, but the message must say so is no
+// longer being waited on rather than falsely implying the gated action will
+// run.
+func TestApprover_CallbackWithNoWaiter_EditsNoLongerWaiting(t *testing.T) {
+	api := &fakeBotAPI{}
+	approvals := newFakeApprovalStore()
+	require.NoError(t, approvals.Create(context.Background(), &store.Approval{
+		ID: "orphan1", ChatID: "100", ExpiresAt: time.Now().Add(time.Hour),
+	}))
+	a := testApprover(api, approvals, config.TelegramConfig{AllowFrom: []int64{100}}, time.Minute)
+
+	cb := &telego.CallbackQuery{
+		ID:      "cbq1",
+		From:    telego.User{ID: 100},
+		Data:    "ok:orphan1",
+		Message: &telego.Message{Chat: telego.Chat{ID: 100, Type: "private"}, MessageID: 5},
+	}
+	a.HandleCallback(context.Background(), cb)
+
+	require.NotEmpty(t, api.edited)
+	last := api.edited[len(api.edited)-1]
+	assert.Contains(t, last.Text, "no longer waiting")
+	assert.Equal(t, "approved", approvals.state("orphan1"), "Decide still records the verdict; only the message text changes for an orphaned request")
 }
 
 func TestApprover_ContextCancelWhilePendingReturnsPromptly(t *testing.T) {
@@ -605,6 +717,88 @@ func TestSendOne_FallsBackToPlainTextOnParseError(t *testing.T) {
 	assert.Equal(t, 2, calls, "exactly one retry: the message is delivered exactly once")
 }
 
+// TestSendOne_FallsBackToPlainTextOnTooLongError is the H1 regression test
+// for the other 400 wording Telegram uses when MarkdownV2 escaping inflates
+// an otherwise in-bounds chunk past 4096 chars: "message is too long" names
+// no parsing problem, but must still degrade to plain text instead of
+// dropping the reply.
+func TestSendOne_FallsBackToPlainTextOnTooLongError(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(params *telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			if calls == 1 {
+				return nil, &ta.Error{ErrorCode: 400, Description: "Bad Request: message is too long"}
+			}
+			assert.Empty(t, params.ParseMode, "the retry must drop parse_mode entirely")
+			return &telego.Message{MessageID: 1}, nil
+		},
+	}
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "escaped text", ParseMode: telego.ModeMarkdownV2}
+	msg, err := sendOne(context.Background(), api, params, "plain text")
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	assert.Equal(t, 2, calls)
+}
+
+func TestSendOne_RetriesOnceOn5xxThenSucceeds(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(params *telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			if calls == 1 {
+				return nil, &ta.Error{ErrorCode: 500, Description: "Internal Server Error"}
+			}
+			return &telego.Message{MessageID: 1}, nil
+		},
+	}
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	start := time.Now()
+	msg, err := sendOne(context.Background(), api, params, "hi")
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	assert.Equal(t, 2, calls, "a 5xx gets exactly one bounded retry")
+	assert.GreaterOrEqual(t, time.Since(start), transientRetryDelay)
+}
+
+// TestSendOne_NetworkErrorIsNotRetried is the H2 regression test: unlike a
+// 5xx (which Telegram never accepted), a raw network error can surface
+// after Telegram already delivered the message, and Telegram has no
+// idempotency key - retrying risks a user-visible duplicate send (or a
+// second, unresolved approval prompt), so sendOne must return the error
+// immediately instead of retrying it.
+func TestSendOne_NetworkErrorIsNotRetried(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(params *telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			return nil, errors.New("connection reset by peer")
+		},
+	}
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	_, err := sendOne(context.Background(), api, params, "hi")
+	require.Error(t, err)
+	assert.Equal(t, 1, calls, "a non-API network error must not be retried - Telegram may have already delivered the message")
+}
+
+func TestSendOne_GivesUpAfterOneTransientRetry(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(params *telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			return nil, &ta.Error{ErrorCode: 503, Description: "Service Unavailable"}
+		},
+	}
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	_, err := sendOne(context.Background(), api, params, "hi")
+	require.Error(t, err)
+	assert.Equal(t, 2, calls, "exactly one retry, not a retry storm against a persistently failing backend")
+}
+
 // --- Channel.Send thread routing -------------------------------------------
 
 func TestSendText_CarriesMessageThreadID(t *testing.T) {
@@ -625,6 +819,103 @@ func TestSendText_EmptyThreadIDTargetsGeneralTimeline(t *testing.T) {
 	params := api.lastSent()
 	require.NotNil(t, params)
 	assert.Equal(t, 0, params.MessageThreadID)
+}
+
+// TestSendText_EscapedChunksNeverExceedLimit is the H1 regression test: text
+// dense in MarkdownV2-special characters (every rune escapes to two bytes)
+// must still produce only chunks whose *escaped* length fits Telegram's
+// 4096-char ceiling, not just its pre-escape length.
+func TestSendText_EscapedChunksNeverExceedLimit(t *testing.T) {
+	var b strings.Builder
+	for b.Len() < 20_000 {
+		b.WriteString("a.b-c!d(e)f_g*h~i>j#k+l=m|n{o}p.")
+	}
+	text := b.String()
+
+	api := &fakeBotAPI{}
+	require.NoError(t, sendText(context.Background(), api, "100", "", text, ""))
+
+	require.NotEmpty(t, api.sent)
+	for i, params := range api.sent {
+		assert.LessOrEqualf(t, len(params.Text), DefaultChunkLimit, "chunk %d escaped to %d bytes, over the limit", i, len(params.Text))
+	}
+
+	// Every chunk actually sent must reassemble (once unescaped) back into
+	// the original text, so the re-split did not drop or reorder content.
+	var reassembled strings.Builder
+	for _, params := range api.sent {
+		reassembled.WriteString(unescapeMDV2ForTest(t, params.Text))
+	}
+	assert.Equal(t, text, reassembled.String())
+}
+
+func TestEscapeChunk_ReSplitsWhenEscapingInflatesPastLimit(t *testing.T) {
+	// Every character escapes to two bytes, so a chunk exactly at
+	// DefaultChunkLimit pre-escape length inflates to 2x that - over the
+	// limit - and must come back as more than one part, each fitting.
+	chunk := strings.Repeat(".", DefaultChunkLimit)
+	parts := escapeChunk(chunk, DefaultChunkLimit)
+
+	require.Greater(t, len(parts), 1)
+	var plainTotal strings.Builder
+	for _, p := range parts {
+		assert.LessOrEqual(t, len(p.escaped), DefaultChunkLimit)
+		assert.Equal(t, EscapeMarkdownV2(p.plain), p.escaped)
+		plainTotal.WriteString(p.plain)
+	}
+	assert.Equal(t, chunk, plainTotal.String())
+}
+
+// TestEscapeChunk_FenceInfoStringLongerThanLimit_TerminatesQuickly is the
+// C1 regression test: a fence whose opening line's info string alone
+// exceeds the limit makes splitFence's own overhead clamp every piece back
+// to (near) the full input, so naive re-split-and-recurse never terminates.
+// escapeChunk must still return promptly, and every emitted chunk must
+// still fit the limit once escaped.
+func TestEscapeChunk_FenceInfoStringLongerThanLimit_TerminatesQuickly(t *testing.T) {
+	text := "```" + strings.Repeat("A", 5000) + "\nxy\n```"
+
+	done := make(chan []escapedPart, 1)
+	go func() {
+		var parts []escapedPart
+		for _, chunk := range Split(text, DefaultChunkLimit) {
+			parts = append(parts, escapeChunk(chunk, DefaultChunkLimit)...)
+		}
+		done <- parts
+	}()
+
+	select {
+	case parts := <-done:
+		require.NotEmpty(t, parts)
+		for i, p := range parts {
+			assert.LessOrEqualf(t, len(p.escaped), DefaultChunkLimit, "part %d escaped to %d bytes, over the limit", i, len(p.escaped))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("escapeChunk did not terminate on a fence whose info string alone exceeds the limit")
+	}
+}
+
+func TestEscapeChunk_FitsWithoutSplittingWhenAlreadyUnderLimit(t *testing.T) {
+	chunk := "just plain prose with no special characters at all"
+	parts := escapeChunk(chunk, DefaultChunkLimit)
+	require.Len(t, parts, 1)
+	assert.Equal(t, chunk, parts[0].plain)
+	assert.Equal(t, chunk, parts[0].escaped)
+}
+
+// unescapeMDV2ForTest strips the backslash MarkdownV2 escaping inserts
+// before every special character, so a sent chunk's escaped text can be
+// compared back against the original plain input.
+func unescapeMDV2ForTest(t *testing.T, s string) string {
+	t.Helper()
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }
 
 // --- test helpers ------------------------------------------------------

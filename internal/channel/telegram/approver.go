@@ -156,31 +156,89 @@ func (a *Approver) Ask(ctx context.Context, req tools.Request) (bool, error) {
 	timer := time.NewTimer(a.timeout)
 	defer timer.Stop()
 
+	return a.awaitDecision(ctx, wait, timer, id, req.ChatID, msg.MessageID)
+}
+
+// awaitDecision blocks until wait delivers a decision, timer fires, or ctx
+// ends - whichever comes first - and is the exact select Ask's own doc
+// comment describes. Split out from Ask so the timer/wait race (a callback
+// landing at the same instant the timer fires) can be driven directly in
+// tests with a synthetic wait/timer pair instead of racing real goroutines
+// against real time.
+func (a *Approver) awaitDecision(ctx context.Context, wait <-chan bool, timer *time.Timer, id, chatID string, messageID int) (bool, error) {
 	select {
 	case approved := <-wait:
 		return approved, nil
 
 	case <-timer.C:
-		a.finishExpired(context.WithoutCancel(ctx), id, req.ChatID, msg.MessageID, "timed out waiting for a response")
+		// A callback's Decide can land at the exact instant the timer
+		// fires (Go's select picks randomly between two ready cases) or in
+		// the small window between the timer firing and this goroutine
+		// winning the scheduler - drain wait non-blocking before accepting
+		// the timeout, so a decision that actually landed is not thrown
+		// away in favor of a contradictory "timed out".
+		select {
+		case approved := <-wait:
+			return approved, nil
+		default:
+		}
+		if raced, approved := a.finishExpiredOrRace(context.WithoutCancel(ctx), id, chatID, messageID, "timed out waiting for a response"); raced {
+			return approved, nil
+		}
 		return false, context.DeadlineExceeded
 
 	case <-ctx.Done():
 		// A SIGTERM or turn cancellation while buttons sit unanswered must
 		// not block phase 7's shutdown drain for the full approval_timeout:
 		// this case is why ctx is a select arm here, not garnish.
-		a.finishExpired(context.WithoutCancel(ctx), id, req.ChatID, msg.MessageID, "the gateway is shutting down")
+		if raced, approved := a.finishExpiredOrRace(context.WithoutCancel(ctx), id, chatID, messageID, "the gateway is shutting down"); raced {
+			return approved, nil
+		}
 		return false, ctx.Err()
 	}
 }
 
+// finishExpiredOrRace marks id expired (see finishExpired) and, if it lost
+// the race to a decision a callback had already committed, reads the
+// approvals row back and reports the actual verdict instead - so a timer or
+// ctx.Done() firing in the narrow window between Decide committing and the
+// callback's own push to wait does not report a contradictory timeout (or
+// cancellation) while the DB, and the message the user already sees, say
+// "approved"/"denied". raced is false - meaning the caller should report
+// its own timeout/cancellation error as before - both when finishExpired
+// won the race (genuinely expired) and when the follow-up read itself
+// fails.
+func (a *Approver) finishExpiredOrRace(ctx context.Context, id, chatID string, messageID int, note string) (raced, approved bool) {
+	if !a.finishExpired(ctx, id, chatID, messageID, note) {
+		return false, false
+	}
+	ap, err := a.approvals.Get(ctx, id)
+	if err != nil {
+		a.log.Error("telegram: load approval after losing the timeout race failed", "approval_id", id, "error", err)
+		return false, false
+	}
+	return true, ap.State == "approved"
+}
+
 // finishExpired marks id expired and edits its message to explain why,
-// removing the keyboard. Both are best-effort: a failure here must not
-// itself change the (already decided) outcome Ask returns.
-func (a *Approver) finishExpired(ctx context.Context, id, chatID string, messageID int, note string) {
-	if err := a.approvals.Decide(ctx, id, "expired", ""); err != nil && !errors.Is(err, store.ErrAlreadyDecided) {
+// removing the keyboard, reporting whether it lost the race to a callback
+// that had already committed a decision (Decide returns ErrAlreadyDecided).
+// Both the Decide call and the edit are otherwise best-effort: a failure
+// here must not itself change the (already decided) outcome Ask returns. If
+// the approval was already decided by a callback that won the race, the
+// message already shows that outcome - overwriting it with "timed out"
+// would contradict a decision that actually landed, so the edit is skipped
+// entirely.
+func (a *Approver) finishExpired(ctx context.Context, id, chatID string, messageID int, note string) (alreadyDecided bool) {
+	err := a.approvals.Decide(ctx, id, "expired", "")
+	if err != nil {
+		if errors.Is(err, store.ErrAlreadyDecided) {
+			return true
+		}
 		a.log.Error("telegram: mark approval expired failed", "approval_id", id, "error", err)
 	}
 	a.editOutcome(ctx, chatID, messageID, "\u23F1 "+note)
+	return false
 }
 
 // HandleCallback processes one CallbackQuery arriving from an inline
@@ -254,11 +312,22 @@ func (a *Approver) HandleCallback(ctx context.Context, cb *telego.CallbackQuery)
 	a.mu.Lock()
 	wait, ok := a.waiters[id]
 	a.mu.Unlock()
-	if ok {
-		select {
-		case wait <- verdict:
-		default:
-		}
+
+	if !ok {
+		// Decide committed the verdict, but nobody in this process is
+		// blocked on it - typically a pending row surviving a restart,
+		// tapped before the startup ExpirePending sweep caught it, or Ask
+		// having already returned for some other reason. Whatever tool call
+		// this was gating belongs to a process that no longer exists to run
+		// it, so "approved by user N" would be misleading; say so instead.
+		a.editOutcome(ctx, chatID, cb.Message.GetMessageID(), "\u2753 this approval is no longer waiting for a response")
+		a.answer(ctx, cb.ID, "")
+		return
+	}
+
+	select {
+	case wait <- verdict:
+	default:
 	}
 
 	icon := "\u2705"

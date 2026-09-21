@@ -3,10 +3,7 @@ package gateway
 import (
 	"context"
 	"log/slog"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 )
 
@@ -16,23 +13,15 @@ import (
 // already large enough.
 const drainDeadline = 30 * time.Second
 
-// notifyContext wraps parent in a context canceled by either parent itself
-// ending or a SIGINT/SIGTERM arriving, so a turn context derived from the
-// result is canceled by both a caller-driven shutdown (tests) and a real OS
-// signal (production). On Windows, SIGTERM is never actually delivered by
-// the OS - registering it is harmless, and Ctrl-C (os.Interrupt) is what a
-// user there actually gets.
-func notifyContext(parent context.Context) (context.Context, context.CancelFunc) {
-	return signal.NotifyContext(parent, os.Interrupt, syscall.SIGTERM)
-}
-
 // waitForShutdown blocks until ctx is done, then waits on wg (every worker
 // goroutine) with drainDeadline, logging whichever outcome actually
-// happened. It is the production entry point; drain (below) is the
+// happened, and reports whether every worker finished before the deadline -
+// the caller uses this to decide whether closing the store is safe (see
+// gateway.go's Run). It is the production entry point; drain (below) is the
 // deadline-parameterized implementation tests use directly with a short
 // deadline instead of waiting out the real 30s.
-func waitForShutdown(ctx context.Context, wg *sync.WaitGroup, log *slog.Logger) {
-	drain(ctx, wg, log, drainDeadline)
+func waitForShutdown(ctx context.Context, wg *sync.WaitGroup, log *slog.Logger) bool {
+	return drain(ctx, wg, log, drainDeadline)
 }
 
 // drain waits for ctx to end, then waits on wg up to deadline, returning
@@ -54,7 +43,7 @@ func drain(ctx context.Context, wg *sync.WaitGroup, log *slog.Logger, deadline t
 		log.Info("gateway: all workers drained cleanly")
 		return true
 	case <-time.After(deadline):
-		log.Warn("gateway: drain deadline exceeded; some workers may still be running")
+		log.Error("gateway: drain deadline exceeded; some workers may still be running")
 		return false
 	}
 }

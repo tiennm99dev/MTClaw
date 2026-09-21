@@ -10,6 +10,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/mymmrac/telego"
@@ -37,6 +39,13 @@ type Channel struct {
 
 	username string
 	botID    int64
+
+	// cbWG tracks every callback-handling goroutine pumpUpdates spawns, so
+	// Start can wait for them to finish before returning - otherwise a
+	// callback still in flight when the gateway's shutdown drain closes the
+	// store loses its verdict to "sql: database is closed" with no signal
+	// back to the user who tapped the button.
+	cbWG sync.WaitGroup
 }
 
 // New constructs a Channel from a resolved token (cfg.Channels.Telegram.Token()
@@ -45,10 +54,13 @@ type Channel struct {
 // backend and cancel registry exist; until then, bot commands that need it
 // degrade to an explanatory reply instead of panicking.
 //
-// It deliberately never passes telego.WithDefaultDebugLogger (or otherwise
-// enables telego's own logger): that option's own docs warn it can log the
-// bot token, and WithDiscardLogger keeps the token out of every log line at
-// every level.
+// It never passes telego.WithDefaultDebugLogger (that option's own docs warn
+// it can log the bot token) and instead wires botLogger: Debugf is a no-op,
+// and Errorf routes through log with the token redacted. A discarded logger
+// (the prior behavior) meant a poll failure - a revoked token, a sustained
+// network failure, a second poller's 409 Conflict - was logged nowhere and
+// silently retried forever; this keeps the token out of every log line
+// while making that failure visible.
 func New(cfg *config.Config, approvals store.ApprovalStore, deps Deps, log *slog.Logger) (*Channel, error) {
 	if log == nil {
 		log = slog.Default()
@@ -58,7 +70,7 @@ func New(cfg *config.Config, approvals store.ApprovalStore, deps Deps, log *slog
 		return nil, fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
 	}
 
-	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
+	bot, err := telego.NewBot(token, telego.WithLogger(newBotLogger(log, token)))
 	if err != nil {
 		return nil, fmt.Errorf("telegram: construct bot: %w", err)
 	}
@@ -158,6 +170,49 @@ func (c *Channel) Start(ctx context.Context, out chan<- channel.Inbound) error {
 
 	c.pumpUpdates(ctx, updates, out)
 	// Closing ctx is what closes the updates channel (telego's documented
-	// shutdown hook), so a clean range-loop exit here means ctx ended.
+	// shutdown hook), so a clean range-loop exit here means ctx ended. Wait
+	// for every callback goroutine pumpUpdates spawned to finish inside the
+	// same drain window the gateway already gives pumpUpdates itself,
+	// before the caller can go on to close the store.
+	c.cbWG.Wait()
 	return ctx.Err()
 }
+
+// botLogger adapts telego's Logger interface (Debugf/Errorf) to log/slog.
+// Debugf is a no-op - telego's own docs warn its debug output can include
+// the bot token, and there is nothing operationally useful in it this
+// package needs. Errorf is what makes a poll failure visible at all: telego
+// logs every getUpdates error (and its own "retrying in Ns..." line) through
+// this interface, and with WithDiscardLogger that output went nowhere,
+// leaving a revoked token or a sustained network failure silently retried
+// forever with zero log output. Errorf routes to slog's Warn level, not
+// Error: telego calls it for every failed API call, not just polling, so
+// cases this package already recovers from on its own (a MarkdownV2 400
+// that triggers the plain-text fallback, a 429 that gets retried,
+// editMessageText's harmless "message is not modified") would otherwise
+// each log an ERROR line for a request that ultimately succeeded.
+type botLogger struct {
+	log   *slog.Logger
+	token string
+}
+
+// newBotLogger builds a botLogger. token, when non-empty, is redacted from
+// every Errorf message before it reaches log - telego's error strings for a
+// getUpdates failure do not normally include the token, but this is
+// defensive: a future telego release, or a transport error wrapping the
+// request URL, could include it.
+func newBotLogger(log *slog.Logger, token string) *botLogger {
+	return &botLogger{log: log, token: token}
+}
+
+func (l *botLogger) Debugf(format string, args ...any) {}
+
+func (l *botLogger) Errorf(format string, args ...any) {
+	msg := fmt.Sprintf(format, args...)
+	if l.token != "" {
+		msg = strings.ReplaceAll(msg, l.token, "<redacted>")
+	}
+	l.log.Warn("telegram: " + msg)
+}
+
+var _ telego.Logger = (*botLogger)(nil)

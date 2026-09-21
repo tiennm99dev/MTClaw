@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -42,6 +43,26 @@ func TestEscapeMarkdownV2_UnmatchedBacktickIsEscaped(t *testing.T) {
 
 func TestEscapeMarkdownV2_Empty(t *testing.T) {
 	assert.Equal(t, "", EscapeMarkdownV2(""))
+}
+
+func TestEscapeMarkdownV2_EscapesBackslashInsideFencedCode(t *testing.T) {
+	in := "```\nC:\\Users\\a\n```"
+	got := EscapeMarkdownV2(in)
+	assert.Equal(t, "```\nC:\\\\Users\\\\a\n```", got)
+}
+
+func TestEscapeMarkdownV2_LeavesFenceLanguageTagUnescaped(t *testing.T) {
+	in := "```go\nfmt.Println(`x`)\n```"
+	got := EscapeMarkdownV2(in)
+	// The language tag line ("go") is not entity content and must stay
+	// untouched even though it precedes escaped code content.
+	assert.True(t, strings.HasPrefix(got, "```go\n"), "language tag line must be left alone: %q", got)
+}
+
+func TestEscapeMarkdownV2_EscapesBackslashInsideInlineCode(t *testing.T) {
+	in := "path `C:\\temp` here."
+	got := EscapeMarkdownV2(in)
+	assert.Equal(t, "path `C:\\\\temp` here\\.", got)
 }
 
 func countBackslashes(s string) int {

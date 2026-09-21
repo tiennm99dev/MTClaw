@@ -1,6 +1,7 @@
 package cron
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -151,6 +152,106 @@ func TestScheduler_MissedRun_NotReplayed(t *testing.T) {
 	// tick this in-process scheduler ever sees is t0+10m, not t0+1m..t0+9m.
 	s.tick(t0.Add(10 * time.Minute))
 	assert.Equal(t, 2, fe.count(), "exactly one more fire for the new tick, no backlog replay")
+}
+
+// --- missed-tick catch-up (tickWithCatchUp, driven only from Start's own
+// ticker loop, never from tick() directly - a fresh process's first tick,
+// tested above, is a restart and must never replay; only an already-running
+// process whose own ticker fires late counts as a missed tick) -----------
+
+// TestScheduler_TickWithCatchUp_SmallGapFiresOnlyTheArrivingTick proves
+// ordinary ticker jitter (well under missedTickThreshold) never triggers
+// catch-up - only the arriving tick's own minute fires.
+func TestScheduler_TickWithCatchUp_SmallGapFiresOnlyTheArrivingTick(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("every-minute", "* * * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	t0 := time.Date(2024, 6, 1, 8, 0, 0, 0, time.UTC)
+	lastTick := s.tickWithCatchUp(t0, t0.Add(-30*time.Second))
+	assert.Equal(t, t0, lastTick)
+	assert.Equal(t, 1, fe.count())
+}
+
+// TestScheduler_TickWithCatchUp_LargeGapFiresSkippedMinutes proves a gap
+// past missedTickThreshold evaluates every whole minute skipped in between,
+// not just the arriving tick's own minute - the actual catch-up behavior a
+// delayed ticker (host suspend, a long GC pause) needs.
+func TestScheduler_TickWithCatchUp_LargeGapFiresSkippedMinutes(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("every-minute", "* * * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	t0 := time.Date(2024, 6, 1, 8, 0, 0, 0, time.UTC)
+	later := t0.Add(5 * time.Minute)
+	lastTick := s.tickWithCatchUp(later, t0)
+
+	assert.Equal(t, later, lastTick)
+	assert.Equal(t, 5, fe.count(), "t0+1m..t0+4m caught up, plus the arriving t0+5m tick itself")
+}
+
+// TestScheduler_TickWithCatchUp_BoundedToMaxCatchUpMinutes proves an
+// extreme gap (e.g. days of host suspend) does not replay an unbounded
+// backlog: catch-up is capped at maxCatchUpMinutes, plus the arriving tick.
+func TestScheduler_TickWithCatchUp_BoundedToMaxCatchUpMinutes(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("every-minute", "* * * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	t0 := time.Date(2024, 6, 1, 8, 0, 0, 0, time.UTC)
+	muchLater := t0.Add(time.Hour)
+	s.tickWithCatchUp(muchLater, t0)
+
+	assert.Equal(t, maxCatchUpMinutes+1, fe.count(), "bounded catch-up plus the arriving tick, not the full hour's worth of minutes")
+}
+
+// TestScheduler_TickWithCatchUp_LogsAWarningOnlyWhenCatchingUp proves the
+// warning fires exactly when catch-up actually happens, not on an ordinary
+// tick.
+func TestScheduler_TickWithCatchUp_LogsAWarningOnlyWhenCatchingUp(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("every-minute", "* * * * *")}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, log, nil)
+
+	t0 := time.Date(2024, 6, 1, 8, 0, 0, 0, time.UTC)
+	s.tickWithCatchUp(t0, t0.Add(-10*time.Second))
+	assert.NotContains(t, buf.String(), "missed tick")
+
+	s.tickWithCatchUp(t0.Add(5*time.Minute), t0)
+	assert.Contains(t, buf.String(), "missed tick")
+}
+
+// TestScheduler_TickWithCatchUp_ReplaysRecentMinutesNotOldestOnes is the M3
+// regression test: after a 2-hour gap, catch-up must evaluate the minutes
+// closest to now, not the ones right after the stale lastTick - a job due 3
+// minutes ago must fire, while a job that was only due right after
+// lastTick (now two hours in the past, outside the bounded window) must
+// not.
+func TestScheduler_TickWithCatchUp_ReplaysRecentMinutesNotOldestOnes(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{
+		testJob("recent", "57 9 * * *"), // due 09:57, 3 minutes before now
+		testJob("stale", "1 8 * * *"),   // due 08:01, 2 hours before now
+	}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	t0 := time.Date(2024, 6, 1, 8, 0, 0, 0, time.UTC) // lastTick
+	now := t0.Add(2 * time.Hour)                      // 10:00:00
+	s.tickWithCatchUp(now, t0)
+
+	fired := make(map[string]bool)
+	for i := 0; i < fe.count(); i++ {
+		fired[fe.at(i).ChatID] = true
+	}
+	assert.True(t, fired["job:recent"], "the minute due 3 minutes ago must fire")
+	assert.False(t, fired["job:stale"], "the minute due 2 hours ago must stay outside the bounded catch-up window")
 }
 
 // --- overlap guard -----------------------------------------------------------

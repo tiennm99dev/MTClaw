@@ -28,12 +28,14 @@ func Decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *tel
 		fromID = msg.From.ID
 	}
 
+	text, entities := messageText(msg)
+
 	switch msg.Chat.Type {
 	case "private":
 		if !containsID(cfg.AllowFrom, fromID) {
 			return false, "", "dm sender not in allow_from"
 		}
-		return true, msg.Text, ""
+		return true, text, ""
 
 	case "group", "supergroup":
 		group, ok := lookupGroup(cfg.Groups, msg.Chat.ID)
@@ -53,10 +55,10 @@ func Decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *tel
 		}
 
 		if !group.RequireMention {
-			return true, msg.Text, ""
+			return true, text, ""
 		}
 
-		mentioned, clean := detectMention(msg, botUsername, botID)
+		mentioned, clean := detectMention(msg, text, entities, botUsername, botID)
 		if !mentioned {
 			return false, "", "require_mention is true and no mention found"
 		}
@@ -65,6 +67,17 @@ func Decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *tel
 	default:
 		return false, "", "unsupported chat type " + msg.Chat.Type
 	}
+}
+
+// messageText returns the text to gate/forward and its entities: msg.Text
+// with msg.Entities normally, falling back to msg.Caption with
+// msg.CaptionEntities when Text is empty, so a captioned photo or document
+// addressed to the bot is not silently treated as blank.
+func messageText(msg *telego.Message) (text string, entities []telego.MessageEntity) {
+	if msg.Text != "" {
+		return msg.Text, msg.Entities
+	}
+	return msg.Caption, msg.CaptionEntities
 }
 
 // containsID reports whether id appears in ids. A nil/empty ids never
@@ -96,30 +109,31 @@ func lookupGroup(groups map[string]config.TelegramGroupConfig, chatID int64) (co
 // the bot's own messages, a "@botusername" mention entity, or a
 // "/command@botusername" bot_command entity. It never falls back to a bare
 // substring search - only entities, which Telegram computes itself, decide
-// this. clean is msg.Text with a leading "@botusername" mention stripped;
-// the reply-to and /cmd@bot cases return the text unchanged, since there is
-// no leading token to remove.
-func detectMention(msg *telego.Message, botUsername string, botID int64) (matched bool, clean string) {
-	clean = msg.Text
+// this. text/entities are msg.Text/msg.Entities or, for a captioned media
+// message, msg.Caption/msg.CaptionEntities - see messageText. clean is text
+// with a leading "@botusername" mention stripped; the reply-to and /cmd@bot
+// cases return it unchanged, since there is no leading token to remove.
+func detectMention(msg *telego.Message, text string, entities []telego.MessageEntity, botUsername string, botID int64) (matched bool, clean string) {
+	clean = text
 
 	if msg.ReplyToMessage != nil && msg.ReplyToMessage.From != nil && msg.ReplyToMessage.From.ID == botID {
 		return true, clean
 	}
 
-	for _, e := range msg.Entities {
+	for _, e := range entities {
 		switch e.Type {
 		case telego.EntityTypeMention:
-			token := utf16Slice(msg.Text, e.Offset, e.Length)
+			token := utf16Slice(text, e.Offset, e.Length)
 			if !strings.EqualFold(strings.TrimPrefix(token, "@"), botUsername) {
 				continue
 			}
 			if e.Offset == 0 {
-				clean = strings.TrimSpace(utf16Slice(msg.Text, e.Offset+e.Length, -1))
+				clean = strings.TrimSpace(utf16Slice(text, e.Offset+e.Length, -1))
 			}
 			return true, clean
 
 		case telego.EntityTypeBotCommand:
-			token := utf16Slice(msg.Text, e.Offset, e.Length)
+			token := utf16Slice(text, e.Offset, e.Length)
 			at := strings.IndexByte(token, '@')
 			if at < 0 {
 				continue
