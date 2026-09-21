@@ -284,3 +284,28 @@ func TestTerminalApprover_EOFFailsFastOnEveryAsk(t *testing.T) {
 		assert.Less(t, elapsed, time.Second, "Ask #%d after EOF must fail fast, not wait out the approval timeout", i+1)
 	}
 }
+
+// Answers piped in ahead of the prompt (scripted use) are consumed in
+// order, including when the input has already reached EOF: only a line
+// typed after an unanswered prompt is treated as stale.
+func TestTerminalApprover_PrefedAnswersAreConsumedInOrder(t *testing.T) {
+	in := strings.NewReader("y\nn\n")
+	var out bytes.Buffer
+	a := NewTerminalApprover(in, &out, time.Second)
+
+	for i := 0; i < 20; i++ { // let the reader goroutine reach EOF first
+		if a.terminalError() != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	first, err := a.Ask(context.Background(), Request{Tool: "exec", Command: "ls"})
+	require.NoError(t, err)
+	assert.True(t, first)
+	second, err := a.Ask(context.Background(), Request{Tool: "exec", Command: "ls"})
+	require.NoError(t, err)
+	assert.False(t, second)
+	_, err = a.Ask(context.Background(), Request{Tool: "exec", Command: "ls"})
+	require.ErrorIs(t, err, io.EOF, "a third prompt must fail fast once input is exhausted")
+}

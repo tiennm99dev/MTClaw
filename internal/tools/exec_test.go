@@ -246,7 +246,12 @@ func TestExec_OutputCappedAtWriteTimeNotAfter(t *testing.T) {
 		c.MaxOutputBytes = 100
 	})
 
-	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: "yes | head -c 2000000"}), testMeta())
+	// Two megabytes of output, far past the 100-byte cap on both shells.
+	cmd := "yes | head -c 2000000"
+	if runtime.GOOS == "windows" {
+		cmd = "Write-Output ([string]::new('y', 2000000))"
+	}
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: cmd}), testMeta())
 	require.NoError(t, err)
 	assert.Contains(t, out, "[output truncated to 100 bytes]")
 

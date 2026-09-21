@@ -90,6 +90,13 @@ type TerminalApprover struct {
 
 	mu      sync.Mutex
 	readErr error // set once readLines hits EOF/error, then lines is closed
+	// unanswered is set when the previous Ask ended without consuming a
+	// line (timeout or cancellation). Anything typed after that point and
+	// before the next prompt was an answer to the dead prompt, so the next
+	// Ask discards it. Lines queued while no prompt ever went unanswered
+	// are legitimate pipeline input (`printf 'y\n' | mtclaw prompt ...`)
+	// and are consumed in order.
+	unanswered bool
 }
 
 var _ Approver = (*TerminalApprover)(nil)
@@ -136,24 +143,27 @@ func (t *TerminalApprover) terminalError() error {
 }
 
 func (t *TerminalApprover) Ask(ctx context.Context, req Request) (bool, error) {
-	if err := t.terminalError(); err != nil {
-		return false, fmt.Errorf("tools: read approval response: %w", err)
-	}
-
-	// Drain any line already queued before this prompt is shown, so a
-	// human's answer to a previous prompt (in particular one that already
-	// timed out) can never be mistaken for the answer to this one. This is
-	// the real enforcement boundary alongside deny: consent must be
-	// per-prompt.
-drain:
-	for {
-		select {
-		case _, ok := <-t.lines:
-			if !ok {
+	// Consent must be per-prompt: a human's late answer to a prompt that
+	// already timed out can never be mistaken for the answer to this one.
+	// Only that case drains, so answers piped in ahead of time still work.
+	// EOF is not checked up front: a closed channel with answers still
+	// buffered must hand them out first, and once empty the receive below
+	// returns immediately with ok == false, which is the fast failure.
+	t.mu.Lock()
+	drainStale := t.unanswered
+	t.unanswered = false
+	t.mu.Unlock()
+	if drainStale {
+	drain:
+		for {
+			select {
+			case _, ok := <-t.lines:
+				if !ok {
+					break drain
+				}
+			default:
 				break drain
 			}
-		default:
-			break drain
 		}
 	}
 
@@ -173,6 +183,9 @@ drain:
 
 	select {
 	case <-waitCtx.Done():
+		t.mu.Lock()
+		t.unanswered = true
+		t.mu.Unlock()
 		fmt.Fprintln(t.Out, "\n[mtclaw] no response in time; refusing")
 		return false, waitCtx.Err()
 	case line, ok := <-t.lines:

@@ -13,15 +13,19 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 )
 
-// New builds an *slog.Logger from cfg. An unrecognized level falls back to
-// info rather than failing, so a typo'd --log-level flag degrades
-// gracefully instead of blocking startup; the only real failure mode is an
-// unwritable log file.
-func New(cfg config.LogConfig) (*slog.Logger, error) {
+// New builds an *slog.Logger from cfg and returns the function that
+// releases the log file it opened (a no-op when logging to stderr). The
+// caller must invoke it at process exit: an open handle keeps the file
+// undeletable on Windows and leaks a descriptor per New otherwise. An
+// unrecognized level falls back to info rather than failing, so a typo'd
+// --log-level flag degrades gracefully instead of blocking startup; the
+// only real failure mode is an unwritable log file.
+func New(cfg config.LogConfig) (*slog.Logger, func() error, error) {
 	var w io.Writer = os.Stderr
+	closeFn := func() error { return nil }
 	if cfg.File != "" {
 		if err := os.MkdirAll(filepath.Dir(cfg.File), 0o700); err != nil {
-			return nil, fmt.Errorf("create log directory for %s: %w", cfg.File, err)
+			return nil, nil, fmt.Errorf("create log directory for %s: %w", cfg.File, err)
 		}
 		// Best-effort: O_CREATE's mode only applies at creation, so a log
 		// file left at a looser mode by a pre-fix run would otherwise keep
@@ -30,9 +34,10 @@ func New(cfg config.LogConfig) (*slog.Logger, error) {
 		_ = os.Chmod(cfg.File, 0o600)
 		f, err := os.OpenFile(cfg.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
 		if err != nil {
-			return nil, fmt.Errorf("open log file %s: %w", cfg.File, err)
+			return nil, nil, fmt.Errorf("open log file %s: %w", cfg.File, err)
 		}
 		w = f
+		closeFn = f.Close
 	}
 
 	opts := &slog.HandlerOptions{Level: parseLevel(cfg.Level)}
@@ -42,7 +47,7 @@ func New(cfg config.LogConfig) (*slog.Logger, error) {
 	} else {
 		handler = slog.NewTextHandler(w, opts)
 	}
-	return slog.New(handler), nil
+	return slog.New(handler), closeFn, nil
 }
 
 func parseLevel(level string) slog.Level {

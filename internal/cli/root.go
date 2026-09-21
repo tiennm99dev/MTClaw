@@ -35,6 +35,8 @@ type state struct {
 	cfg          *config.Config
 
 	store store.Store
+	// closeLog releases the log file prepare opened; nil until then.
+	closeLog func() error
 }
 
 // newRootContext builds the context Execute drives the whole command tree
@@ -69,6 +71,11 @@ func Execute() error {
 	err := newRootCmd(s).ExecuteContext(ctx)
 	if closeErr := s.closeStore(); closeErr != nil && err == nil {
 		err = closeErr
+	}
+	// The log file is released last so the store's own close errors, if
+	// any, are still logged.
+	if s.closeLog != nil {
+		_ = s.closeLog()
 	}
 	return err
 }
@@ -201,10 +208,11 @@ func (s *state) prepare(cmd *cobra.Command) error {
 	if isReadOnlyCommand(cmd) {
 		logCfg.File = ""
 	}
-	logger, err := logging.New(logCfg)
+	logger, closeLog, err := logging.New(logCfg)
 	if err != nil {
 		return err
 	}
+	s.closeLog = closeLog
 	slog.SetDefault(logger)
 
 	return nil

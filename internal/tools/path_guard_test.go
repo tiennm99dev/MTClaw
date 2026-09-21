@@ -102,14 +102,25 @@ func TestResolve_NonExistentFileInExistingDir(t *testing.T) {
 	root := t.TempDir()
 	got, err := Resolve([]string{root}, "brand-new-file.txt")
 	require.NoError(t, err)
-	assert.Equal(t, filepath.Join(root, "brand-new-file.txt"), filepath.Clean(got))
+	assert.Equal(t, filepath.Join(realTempDir(t, root), "brand-new-file.txt"), filepath.Clean(got))
 }
 
 func TestResolve_NonExistentNestedPathInExistingDir(t *testing.T) {
 	root := t.TempDir()
 	got, err := Resolve([]string{root}, filepath.Join("sub", "new", "file.txt"))
 	require.NoError(t, err)
-	assert.Equal(t, filepath.Join(root, "sub", "new", "file.txt"), filepath.Clean(got))
+	assert.Equal(t, filepath.Join(realTempDir(t, root), "sub", "new", "file.txt"), filepath.Clean(got))
+}
+
+// realTempDir returns dir with symlinks resolved, because Resolve resolves
+// the deepest existing ancestor: macOS puts temp dirs under /var, a
+// symlink to /private/var, and Windows hands out 8.3 short names
+// (RUNNER~1) that resolve to the long form.
+func realTempDir(t *testing.T, dir string) string {
+	t.Helper()
+	real, err := filepath.EvalSymlinks(dir)
+	require.NoError(t, err)
+	return real
 }
 
 func TestResolve_MultipleRootsFirstMatchWins(t *testing.T) {

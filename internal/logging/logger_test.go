@@ -14,16 +14,18 @@ import (
 )
 
 func TestNew_InvalidLevelFallsBackToInfo(t *testing.T) {
-	logger, err := New(config.LogConfig{Level: "not-a-level"})
+	logger, closeLog, err := New(config.LogConfig{Level: "not-a-level"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 	assert.False(t, logger.Enabled(nil, slog.LevelDebug), "debug must be filtered out under the info fallback")
 	assert.True(t, logger.Enabled(nil, slog.LevelInfo))
 }
 
 func TestNew_JSONFormat(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log.json")
-	logger, err := New(config.LogConfig{Level: "info", Format: "json", File: path})
+	logger, closeLog, err := New(config.LogConfig{Level: "info", Format: "json", File: path})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 	logger.Info("hello")
 
 	data, err := os.ReadFile(path)
@@ -33,8 +35,9 @@ func TestNew_JSONFormat(t *testing.T) {
 
 func TestNew_TextFormatIsDefault(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "log.txt")
-	logger, err := New(config.LogConfig{Level: "info", Format: "text", File: path})
+	logger, closeLog, err := New(config.LogConfig{Level: "info", Format: "text", File: path})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 	logger.Info("hello")
 
 	data, err := os.ReadFile(path)
@@ -44,8 +47,9 @@ func TestNew_TextFormatIsDefault(t *testing.T) {
 }
 
 func TestNew_EmptyFileWritesToStderr(t *testing.T) {
-	logger, err := New(config.LogConfig{Level: "info"})
+	logger, closeLog, err := New(config.LogConfig{Level: "info"})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 	require.NotNil(t, logger)
 }
 
@@ -54,8 +58,9 @@ func TestNew_LogFileIsCreatedWithMode0600(t *testing.T) {
 		t.Skip("POSIX permission bits only")
 	}
 	path := filepath.Join(t.TempDir(), "mtclaw.log")
-	_, err := New(config.LogConfig{Level: "info", File: path})
+	_, closeLog, err := New(config.LogConfig{Level: "info", File: path})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
@@ -68,8 +73,9 @@ func TestNew_LogDirectoryIsCreatedWithMode0700(t *testing.T) {
 	}
 	dir := filepath.Join(t.TempDir(), "nested", "logs")
 	path := filepath.Join(dir, "mtclaw.log")
-	_, err := New(config.LogConfig{Level: "info", File: path})
+	_, closeLog, err := New(config.LogConfig{Level: "info", File: path})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 
 	info, err := os.Stat(dir)
 	require.NoError(t, err)
@@ -83,8 +89,9 @@ func TestNew_ExistingLogFileIsNarrowedTo0600(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "mtclaw.log")
 	require.NoError(t, os.WriteFile(path, []byte("stale\n"), 0o644))
 
-	_, err := New(config.LogConfig{Level: "info", File: path})
+	_, closeLog, err := New(config.LogConfig{Level: "info", File: path})
 	require.NoError(t, err)
+	t.Cleanup(func() { _ = closeLog() })
 
 	info, err := os.Stat(path)
 	require.NoError(t, err)
@@ -99,7 +106,7 @@ func TestNew_UnwritablePathErrors(t *testing.T) {
 	require.NoError(t, os.Chmod(dir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
 
-	_, err := New(config.LogConfig{Level: "info", File: filepath.Join(dir, "mtclaw.log")})
+	_, _, err := New(config.LogConfig{Level: "info", File: filepath.Join(dir, "mtclaw.log")})
 	require.Error(t, err)
 }
 
