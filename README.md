@@ -21,19 +21,23 @@ real bot token at this.
 
 ## Install
 
-Requires Go 1.25+ to build from source; no Go toolchain is required if you
-download a release binary.
+Requires Go 1.25.7 or newer to build from source (the `go` directive in
+`go.mod` is a minimum, not a pin: with the default `GOTOOLCHAIN=auto`, an
+older local Go fetches 1.25.7 automatically; `GOTOOLCHAIN=local` needs a
+toolchain that is already at least 1.25.7). No Go toolchain is required if
+you download a release binary.
 
-**From a release** (no Go toolchain needed): download the archive for your
-OS/arch from the [releases page](https://github.com/tiennm99/MTClaw/releases),
-verify it against `SHA256SUMS`, and put the `mtclaw` binary on your `PATH`.
+**From a release** (no Go toolchain needed): download the `mtclaw` binary for
+your OS/arch from the [releases page](https://github.com/tiennm99/MTClaw/releases)
+(bare binaries, not archives), verify it against the accompanying
+`SHA256SUMS`, and put it on your `PATH`.
 
 **From source:**
 
 ```sh
 git clone https://github.com/tiennm99/MTClaw.git
 cd MTClaw
-make build      # -> bin/mtclaw
+make build      # -> bin/mtclaw, version-stamped from git
 ```
 
 Or, without cloning:
@@ -41,6 +45,10 @@ Or, without cloning:
 ```sh
 go install github.com/tiennm99/MTClaw@latest
 ```
+
+`go install` applies no `-ldflags`, so that binary reports `mtclaw dev
+(commit none, built unknown)` from `mtclaw version` - only `make
+build`/`install` and the release workflow stamp a real version.
 
 `CGO_ENABLED=0` is used everywhere, so every build - local or released - is
 a single static binary with no runtime dependency.

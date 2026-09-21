@@ -48,9 +48,7 @@ shortcuts:
 
 ```mermaid
 flowchart TD
-    CMD[exec tool call] --> PARSE{tokenizes?}
-    PARSE -->|no| ASK1[ASK / refuse]
-    PARSE -->|yes| DENY{matches tools.exec.deny?}
+    CMD[exec tool call] --> DENY{matches tools.exec.deny?}
     DENY -->|yes| REFUSE["REFUSE permanently<br/>audit: denied_rule<br/>never prompts"]
     DENY -->|no| ALLOW{matches tools.exec.allow?}
     ALLOW -->|yes| RUN1["RUN<br/>audit: allowed_rule"]
@@ -67,11 +65,13 @@ flowchart TD
     APPR -->|timeout / no approver| REF3["refuse to model<br/>audit: expired"]
 ```
 
-Every ambiguity fails closed to **ASK**, never to RUN: a regex compile error,
-a classifier error/timeout/unparseable response, an unparseable command, an
-approval timeout, or the absence of an approver at all (cron turns always
-use `DenyAllApprover`) - all of these ask a human, or refuse if none exists,
-never silently execute.
+Every ambiguity fails closed to **ASK**, never to RUN: a regex compile error
+(caught at startup, before any command reaches this pipeline), a classifier
+error/timeout/unparseable response, an approval timeout, or the absence of an
+approver at all (cron turns always use `DenyAllApprover`) - all of these ask a
+human, or refuse if none exists, never silently execute. The raw command
+string reaches deny-list matching unmodified and first, with nothing ahead of
+it in the pipeline that could downgrade a deny match to a prompt.
 
 ## What the deny-list does and does not stop
 
@@ -87,9 +87,15 @@ clearing - and the PowerShell equivalents on Windows.
 determined attacker who already has message access.** Base64-decode-then-pipe,
 environment-variable indirection, writing a script to disk and then running
 it, or simply rephrasing a blocked command in a way the regex does not
-match, are all realistic bypasses. The honest boundary is: *do not give the
-bot token, or an allow_from entry, to anyone you would not give a shell to.*
-That sentence belongs here and in the README, not just here.
+match, are all realistic bypasses. Each deny rule is also checked against a
+lightly normalized copy of the command (quotes and a backslash directly
+before the command word stripped, e.g. `'rm' -rf /` or `\rm -rf /`), which
+closes the cheapest one-character rephrasing - but an interpreter wrapper
+like `sh -c 'rm -rf /'`, `bash -c "..."`, or `eval "..."` is not unwrapped and
+remains an accepted, documented bypass, same as base64-decode-then-pipe. The
+honest boundary is: *do not give the bot token, or an allow_from entry, to
+anyone you would not give a shell to.* That sentence belongs here and in the
+README, not just here.
 
 **Known accepted false positives**, recorded so a confused user knows the
 fix instead of discovering it by trial and error: `docker rm -f <container>`
@@ -150,9 +156,12 @@ sk-..."`, `PGPASSWORD=... psql`, `aws --secret-access-key ...`) would publish
 that credential to a third party the moment MTClaw asks about it, so
 `RedactSecrets` masks common credential shapes (`Bearer` tokens,
 `Authorization:` headers, `--token`/`--password`/`--secret*` flags, `-p<value>`,
-`KEY=`/`TOKEN=`/`SECRET=`/`PASSWORD=` assignments, and common key shapes like
-`sk-...`, `ghp_...`, `AKIA...`, and long base64/hex runs) before a command
-ever reaches an approval prompt or the `exec_audit` table.
+any `*_KEY=`/`*_TOKEN=`/`*_SECRET=`/`*_PASSWORD=`/`*_PASSWD=` assignment (so
+`API_KEY=`, `GITHUB_TOKEN=`, `AWS_SECRET_ACCESS_KEY=`, and the bare
+`PASSWORD=` form are all caught, not just the exact keyword alone), and
+common key shapes like `sk-...`, `ghp_...`, `AKIA...`, and long base64/hex
+runs) before a command ever reaches an approval prompt or the `exec_audit`
+table.
 
 **This is pattern matching over plain text, not a security boundary.** It
 will miss credentials in shapes it does not recognize, and it does not
@@ -161,6 +170,13 @@ rule is: **do not let the agent handle credentials as command arguments.**
 Put them in an env file the command reads instead, or in the shell
 environment MTClaw's own process inherits, never as literal text the model
 has to type into a command.
+
+A spawned command's environment is not the full inherited environment
+either: `exec` strips the specific variables MTClaw itself resolved its own
+secrets from (`openai.api_key_env`, `channels.telegram.token_env`) before
+starting the child, so `env` or `echo $OPENAI_API_KEY` inside a command
+cannot read this process's own API key or bot token back out and hand it to
+the model. Nothing else in the environment is filtered.
 
 ## The atomicity/crash exposure
 

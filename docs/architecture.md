@@ -48,8 +48,14 @@ internal/
               main.go imports.
   config/     types (yaml: tags, Duration), load (decode -> resolve secrets
               -> expand paths -> validate), defaults, validate, paths.
-              A pure function of (file bytes, env map, OS) - no other
-              package reads os.Getenv for config purposes.
+              Load/Validate never write to the filesystem, but neither is a
+              pure function of its inputs alone: resolving a `*_file` secret
+              reads that file from disk when one is set, and Validate's
+              storage-dir check stats the filesystem up to the nearest
+              existing ancestor of storage.path. LoadFile is Load's impure,
+              os.ReadFile-based shim; internal/cli's onboard command also
+              reads os.Getenv directly to verify a key/token the user just
+              typed, without ever writing it to cfg.
   store/      interfaces (Store, SessionStore, MessageStore, ApprovalStore,
               AuditStore, CronRunStore) + sqlite/ (open, embedded
               migrations, one file per table). Every other package depends

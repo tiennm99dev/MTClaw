@@ -5,7 +5,8 @@ MTClaw reads one YAML file, by default `~/.mtclaw/config.yaml` (override with
 lists every key: its type, its default, what it controls, and what breaks if
 it is wrong. A test (`internal/config/docs_coverage_test.go`) asserts every
 field in the config struct appears verbatim on this page, so a new key
-cannot ship undocumented.
+cannot ship undocumented; that test only checks presence of the field name,
+not that the type/default/effect text in its row is still accurate.
 
 Precedence for everything except secrets: **config file value > built-in
 default**. Secrets (the OpenAI key, the Telegram token) use a separate env/file
@@ -18,6 +19,11 @@ Run `mtclaw config validate` to check a file against every rule below in one
 pass, or `mtclaw doctor` to additionally check things validation cannot see
 (files that exist on disk, network reachability, whether the model name is
 real).
+
+`mtclaw prompt` runs its turn against the shared `cli`/`local` session by
+default; unlike `cron run`, it takes no lock, so two `mtclaw prompt`
+invocations running at the same time can interleave that session's
+transcript.
 
 ## `version`
 
@@ -37,8 +43,8 @@ real).
 | `agent.temperature` | float | `0.7` | Sampling temperature passed straight to the OpenAI request. | Must be between `0` and `2`; out of range fails validation. |
 | `agent.max_iterations` | integer | `20` | Hard cap on think/act/observe loop iterations within one turn (tool call -> result -> tool call -> ...). | Must be `1`-`100`. Too low cuts off legitimate multi-step tool use early, returning whatever partial answer exists; too high (near 100) risks a very expensive runaway turn if the model loops on a failing tool. |
 | `agent.max_history_turns` | integer | `40` | Hard trim on how many past turns of a session's history are replayed to the model - the only history bound in v1 (no summarization). | Must be at least `2`. Too low loses context the model needs mid-conversation; there is no other memory mechanism to fall back on. |
-| `agent.workspace` | path | `~/mtclaw-workspace` | The agent's filesystem root: created if missing, and the default for `tools.filesystem.roots` and `tools.exec.cwd`. | If it does not exist on disk, `mtclaw doctor`'s "Workspace exists and writable" check fails; a missing workspace does not stop the gateway from starting, but filesystem-tool calls into it will fail at call time. |
-| `agent.system_prompt_files` | list of paths | `[]` | Files concatenated, in order, as the system prompt. `onboard` writes one entry here pointing at the starter `~/.mtclaw/prompts/AGENTS.md`. | A listed file that does not exist fails when the agent loop first tries to read it (at the first turn, not at load time) - `mtclaw doctor` does not currently check these paths individually. |
+| `agent.workspace` | path | `~/mtclaw-workspace` | The agent's filesystem root, and the default for `tools.filesystem.roots` and `tools.exec.cwd`. `mtclaw onboard` creates it; otherwise it is created the first time `write_file` targets a missing root (mode `0755`), rather than that call failing. | If it does not exist on disk, `mtclaw doctor`'s "Workspace exists and writable" check fails; a missing workspace does not stop the gateway from starting - `read_file`/`list_dir` fail at call time until something creates it, while `write_file` creates it as a side effect of its first call. |
+| `agent.system_prompt_files` | list of paths | `[]` | Files concatenated, in order, as the system prompt. `onboard` writes one entry here pointing at the starter `AGENTS.md` it writes next to the config file being onboarded (`<directory of --config>/prompts/AGENTS.md` - not always `~/.mtclaw`). | A listed file that does not exist fails when the agent loop first tries to read it (at the first turn, not at load time) - `mtclaw doctor` does not currently check these paths individually. |
 
 ## `openai`
 
@@ -49,7 +55,7 @@ real).
 | `openai.api_key` | string | *(must be empty)* | Exists only so a literal `api_key:` in the YAML is a recognized field - and therefore a clear validation error naming `api_key_env`/`api_key_file` - instead of an opaque "unknown field" decode failure. **Never set this.** | Any non-empty value here is a load error: `must not be set inline in the config file; use openai.api_key_env (or openai.api_key_file) instead`. |
 | `openai.base_url` | string (URL) | `https://api.openai.com/v1` | The OpenAI-compatible endpoint every request goes to. | Must be an absolute `http(s)` URL or load fails. Pointing at the wrong host either fails outright or, worse, silently talks to something that is not OpenAI - only ever point this at an endpoint you trust with the key. |
 | `openai.timeout` | duration (e.g. `120s`, `2m`) | `120s` | Per-request HTTP client timeout for OpenAI calls. | Must be greater than `0`. Too short aborts legitimately slow completions (large tool outputs, long generations) with a timeout error instead of an answer. |
-| `openai.max_retries` | integer | `3` | Retries the OpenAI SDK performs internally on transient failures (5xx, rate limits) before giving up. | Not validated beyond being an integer; `0` means no retries (used deliberately by the exec auto-mode classifier, which builds its own client - see `tools.exec.auto`). |
+| `openai.max_retries` | integer | `3` | Retries the OpenAI SDK performs internally on transient failures (5xx, rate limits) before giving up. | Must be `0` or greater. `0` means no retries (used deliberately by the exec auto-mode classifier, which builds its own client - see `tools.exec.auto`). |
 
 ## `channels.telegram`
 
@@ -72,16 +78,16 @@ The only channel in v1.
 |---|---|---|---|---|
 | `tools.filesystem.enabled` | bool | `true` | Registers `read_file`/`write_file`/`list_dir`. `false` removes them from the model's tool list entirely. | N/A |
 | `tools.filesystem.roots` | list of paths | `[~/mtclaw-workspace]` | Every filesystem-tool path is confined to (symlink-resolved against) one of these roots. This is the sandbox boundary for file access. | Must be non-empty and each entry must be absolute after expansion, or load fails. A root that does not exist on disk loads fine but `mtclaw doctor`'s "filesystem.roots exist" check fails, and every filesystem-tool call into it fails at call time. |
-| `tools.filesystem.max_read_bytes` | integer | `262144` | Caps how much of a file `read_file` returns in one call; the rest is truncated with an explicit marker. | Too low silently truncates large files the model needed in full, though it is told truncation happened. |
-| `tools.filesystem.max_write_bytes` | integer | `1048576` | Caps how much content `write_file` accepts in one call. | Too low refuses legitimate large writes with a clear tool-result error (not a crash). |
+| `tools.filesystem.max_read_bytes` | integer | `262144` | Caps how much of a file `read_file` returns in one call; the rest is truncated with an explicit marker. | Must be greater than `0` when the tool is enabled, or load fails. Too low silently truncates large files the model needed in full, though it is told truncation happened. |
+| `tools.filesystem.max_write_bytes` | integer | `1048576` | Caps how much content `write_file` accepts in one call. | Must be greater than `0` when the tool is enabled, or load fails. Too low refuses legitimate large writes with a clear tool-result error (not a crash). |
 
 ## `tools.web_fetch`
 
 | Key | Type | Default | Effect | If wrong |
 |---|---|---|---|---|
 | `tools.web_fetch.enabled` | bool | `true` | Registers the `web_fetch` tool (GET only). | N/A |
-| `tools.web_fetch.timeout` | duration | `30s` | Per-request timeout for a fetch. | Too short aborts fetches of legitimately slow pages. |
-| `tools.web_fetch.max_bytes` | integer | `1048576` | Caps how much of a response body is read before truncating. | Too low truncates large pages; the model is told this happened. |
+| `tools.web_fetch.timeout` | duration | `30s` | Per-request timeout for a fetch. | Must be greater than `0` when the tool is enabled, or load fails - `0` used to mean "no timeout"; it is now rejected instead. Too short aborts fetches of legitimately slow pages. |
+| `tools.web_fetch.max_bytes` | integer | `1048576` | Caps how much of a response body is read before truncating. | Must be greater than `0` when the tool is enabled, or load fails. Too low truncates large pages; the model is told this happened. |
 
 `web_fetch` always refuses loopback, link-local, unspecified, private, and
 cloud-metadata address space at connect time - see `docs/security.md` - this
@@ -97,10 +103,10 @@ anything here.
 | `tools.exec.enabled` | bool | `true` | Registers the `exec` tool at all. `false` is the only way to remove shell access entirely. | N/A |
 | `tools.exec.mode` | string: `approval` \| `auto` \| `off` | `approval` | The policy pipeline's third stage (after deny-list, then allow-list). `approval` asks a human every unmatched command. `auto` (**beta**) asks an LLM classifier and only interrupts for commands it flags as risky. `off` never registers the exec tool at all (equivalent to `enabled: false` for this tool). | Must be one of the three values or load fails. **`auto` is not a security control** - `mtclaw doctor` always warns when it is set, and `onboard` never offers it as a choice; it is a deliberate, documented config edit only. |
 | `tools.exec.shell` | list of strings | `[]` (OS default: `[/bin/bash, -lc]` on POSIX, `[powershell, -NoProfile, -Command]` on Windows) | The shell argv every exec command runs under. | `shell[0]` not found on `PATH` loads fine but every command fails at run time; `mtclaw doctor`'s "Shell exists" check catches this ahead of time. |
-| `tools.exec.cwd` | path | `~/mtclaw-workspace` | Starting working directory for every exec command. **Not a jail** - any command can `cd` elsewhere. | Must resolve inside one of `tools.filesystem.roots` or load fails. A path that satisfies that check but does not exist on disk passes validation but fails `mtclaw doctor`'s "exec.cwd inside a root" check and every real command at run time. |
-| `tools.exec.timeout` | duration | `120s` | Per-command wall-clock timeout, layered on top of (not instead of) the turn's own context - cancelling the turn kills the command too. | Too short kills legitimately long-running commands (builds, big downloads) partway through. |
-| `tools.exec.max_output_bytes` | integer | `65536` | Caps captured combined stdout+stderr; the rest is truncated with an explicit marker. | Too low hides output the model needed to see, though truncation is marked. |
-| `tools.exec.approval_timeout` | duration | `5m` | How long an `approval`-mode (or auto-mode "ask") prompt waits for a human decision before expiring. | Expiry is treated as a refusal (audited as `expired`, distinct from a human `denied_user`), never as an implicit approval. |
+| `tools.exec.cwd` | path | `~/mtclaw-workspace` | Starting working directory for every exec command. **Not a jail** - any command can `cd` elsewhere, and nothing in the product ever compares this value against `tools.filesystem.roots`, at load time or at exec call time; the deny-list is the only real enforcement boundary (see `docs/security.md`). | Not checked against `tools.filesystem.roots` at all - `config.Validate` cannot see the filesystem, and this is a usability convention, not a security boundary. A cwd that does not exist on disk passes validation but fails `mtclaw doctor`'s "exec.cwd exists" check and every real command at run time. |
+| `tools.exec.timeout` | duration | `120s` | Per-command wall-clock timeout, layered on top of (not instead of) the turn's own context - cancelling the turn kills the command too. | Must be greater than `0` when the tool is enabled, or load fails. Too short kills legitimately long-running commands (builds, big downloads) partway through. |
+| `tools.exec.max_output_bytes` | integer | `65536` | Caps captured combined stdout+stderr; the rest is truncated with an explicit marker. | Must be greater than `0` when the tool is enabled, or load fails. Too low hides output the model needed to see, though truncation is marked. |
+| `tools.exec.approval_timeout` | duration | `5m` | How long an `approval`-mode (or auto-mode "ask") prompt waits for a human decision before expiring. | Must be greater than `0` when the tool is enabled, or load fails. Expiry is treated as a refusal (audited as `expired`, distinct from a human `denied_user`), never as an implicit approval. |
 | `tools.exec.deny` | list of regexes | `[]` (onboard writes an OS-appropriate starter list) | **The only real enforcement boundary in this design.** Checked first, unconditionally; a match refuses the command permanently - not overridable by the allow-list, the classifier, or a human approval. | An invalid regex fails to load, naming the pattern. An **empty list with exec enabled is not a load error, but `mtclaw doctor` warns loudly** - see `docs/security.md` for what this list does and does not stop, including two known false positives (`docker rm -f`, `npm rm -f`). |
 | `tools.exec.allow` | list of regexes | `[]` | Commands matching here run with no prompt, unless a `deny` pattern also matched (deny always wins). | An invalid regex fails to load, naming the pattern. A pattern that is too broad silently removes the approval step for more than intended - review these like you would a firewall rule. |
 | `tools.exec.auto` | object | *(see sub-keys)* | Groups the `auto`-mode classifier's own settings; only consulted when `tools.exec.mode: auto`. | N/A |
