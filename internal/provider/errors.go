@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"fmt"
 )
 
 // ErrKind classifies why a Provider.Complete call failed, so the agent loop
@@ -64,14 +65,23 @@ type Error struct {
 	Err    error
 }
 
+// Error renders the kind (and HTTP status, when known) alongside the
+// underlying message, so a log line built from this error - the loop and
+// gateway branch on Kind directly and never need to parse this string back
+// out - still shows the taxonomy a caller classified this as, not just
+// whatever text the backend happened to send.
 func (e *Error) Error() string {
-	if e.Msg != "" {
-		return e.Msg
+	msg := e.Msg
+	if msg == "" && e.Err != nil {
+		msg = e.Err.Error()
 	}
-	if e.Err != nil {
-		return e.Err.Error()
+	if msg == "" {
+		return e.Kind.String()
 	}
-	return e.Kind.String()
+	if e.Status != 0 {
+		return fmt.Sprintf("%s (%d): %s", e.Kind, e.Status, msg)
+	}
+	return fmt.Sprintf("%s: %s", e.Kind, msg)
 }
 
 // Unwrap exposes the underlying error so callers can still errors.Is/As
@@ -83,7 +93,16 @@ func (e *Error) Unwrap() error { return e.Err }
 // provider-specific classifier (e.g. internal/provider/openai's) calls once
 // it has ruled out its own SDK-specific error type, so the ctx/net handling
 // stays in one place rather than duplicated per provider.
-func Classify(err error) *Error {
+//
+// ctx, not err's shape, is the only source of truth for whether this was a
+// cancellation: an HTTP client's own request timeout (e.g. http.Client.
+// Timeout) also produces an error satisfying errors.Is(err,
+// context.DeadlineExceeded), even though ctx itself never expired and the
+// caller got no cancellation signal at all. Trusting err's shape there would
+// report a slow backend as "the caller already cancelled this, say nothing",
+// leaving the turn with no reply. Only ctx.Err() != nil means the caller
+// actually gave up.
+func Classify(ctx context.Context, err error) *Error {
 	if err == nil {
 		return nil
 	}
@@ -93,7 +112,7 @@ func Classify(err error) *Error {
 		return already
 	}
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx != nil && ctx.Err() != nil {
 		return &Error{Kind: ErrCanceled, Msg: err.Error(), Err: err}
 	}
 

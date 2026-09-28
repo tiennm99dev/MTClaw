@@ -50,7 +50,11 @@ func (s *sessionStore) List(ctx context.Context, limit int) ([]*store.Session, e
 	if limit <= 0 {
 		limit = -1
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT `+sessionColumns+` FROM sessions ORDER BY updated_at DESC LIMIT ?`, limit)
+	// id DESC breaks ties within the same updated_at millisecond
+	// deterministically (ids embed a creation-order timestamp prefix, see
+	// newSessionID), rather than leaving same-millisecond rows in
+	// undefined order.
+	rows, err := s.db.QueryContext(ctx, `SELECT `+sessionColumns+` FROM sessions ORDER BY updated_at DESC, id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("list sessions: %w", err)
 	}
@@ -78,21 +82,6 @@ func (s *sessionStore) Delete(ctx context.Context, id string) error {
 	n, err := res.RowsAffected()
 	if err != nil {
 		return fmt.Errorf("delete session %s: %w", id, err)
-	}
-	if n == 0 {
-		return store.ErrNotFound
-	}
-	return nil
-}
-
-func (s *sessionStore) SetSummary(ctx context.Context, id, summary string) error {
-	res, err := s.db.ExecContext(ctx, `UPDATE sessions SET summary = ?, updated_at = ? WHERE id = ?`, summary, toMillis(time.Now()), id)
-	if err != nil {
-		return fmt.Errorf("set summary for session %s: %w", id, err)
-	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("set summary for session %s: %w", id, err)
 	}
 	if n == 0 {
 		return store.ErrNotFound

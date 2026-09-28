@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// validMinimalYAML is the smallest document that satisfies every phase 1
+// validMinimalYAML is the smallest document that satisfies every
 // validation rule against Default()'s built-in values: it sets the one
 // field with no built-in default (agent.model) and disables telegram so
 // the fail-closed allowlist rule does not trip.
@@ -297,6 +297,74 @@ openai:
 		assert.Equal(t, "secret-from-env", cfg.OpenAI.APIKey())
 		assert.Equal(t, "env:OPENAI_API_KEY", cfg.OpenAI.APIKeySource())
 	})
+
+	t.Run("empty secret file resolves to unset, not an empty-string secret", func(t *testing.T) {
+		secretPath := filepath.Join(baseDir, "openai-key-empty.secret")
+		require.NoError(t, os.WriteFile(secretPath, []byte("\n"), 0o600))
+
+		yaml := fmt.Sprintf(`
+version: 1
+agent:
+  model: gpt-5
+channels:
+  telegram:
+    enabled: false
+openai:
+  api_key_file: %q
+`, secretPath)
+		cfg, err := Load([]byte(yaml), baseDir, map[string]string{})
+		require.NoError(t, err)
+		assert.Equal(t, "", cfg.OpenAI.APIKey())
+		assert.Equal(t, "unset", cfg.OpenAI.APIKeySource(), "an empty file must report as unset, not file:<path>, so config show never renders <set:file:...> for a secret that resolved to nothing")
+	})
+
+	t.Run("secret file longer than the read cap is truncated, not hung on", func(t *testing.T) {
+		secretPath := filepath.Join(baseDir, "openai-key-huge.secret")
+		huge := make([]byte, maxSecretFileBytes+4096)
+		for i := range huge {
+			huge[i] = 'a'
+		}
+		require.NoError(t, os.WriteFile(secretPath, huge, 0o600))
+
+		yaml := fmt.Sprintf(`
+version: 1
+agent:
+  model: gpt-5
+channels:
+  telegram:
+    enabled: false
+openai:
+  api_key_file: %q
+`, secretPath)
+		cfg, err := Load([]byte(yaml), baseDir, map[string]string{})
+		require.NoError(t, err)
+		assert.Len(t, cfg.OpenAI.APIKey(), maxSecretFileBytes, "a secret file over the cap must be read only up to maxSecretFileBytes, never the whole file")
+	})
+
+}
+
+// TestLoad_ExecModeOffNormalizesToEnabledFalse proves the two documented
+// spellings of "no shell access" collapse to one authoritative field right
+// after decode: tools.exec.mode: "off" is still accepted in the YAML, but
+// Load turns it into tools.exec.enabled: false so every reader past Load
+// (the tool registry, `mtclaw doctor`) only ever has to check one field.
+func TestLoad_ExecModeOffNormalizesToEnabledFalse(t *testing.T) {
+	yaml := `
+version: 1
+agent:
+  model: gpt-5
+channels:
+  telegram:
+    enabled: false
+tools:
+  exec:
+    enabled: true
+    mode: off
+`
+	cfg, err := Load([]byte(yaml), t.TempDir(), map[string]string{})
+	require.NoError(t, err)
+	assert.False(t, cfg.Tools.Exec.Enabled, "mode: off must normalize to enabled: false")
+	assert.Equal(t, "off", cfg.Tools.Exec.Mode, "the mode field itself is left as written, only Enabled is normalized")
 }
 
 func TestLoad_FileNotFound(t *testing.T) {
@@ -344,6 +412,42 @@ channels:
 	// rather than the literal (possibly-escaped) path string.
 	assert.Contains(t, rendered, "<set:file:")
 	assert.Contains(t, rendered, filepath.Base(tokenPath))
+}
+
+// TestMarshalRedacted_ShowsEffectiveRequireMentionEvenWhenOmitted proves
+// `config show` renders the effective require_mention (see
+// TelegramGroupConfig.MentionRequired) for a listed group that omits the
+// key, instead of relying on RequireMention's own `omitempty` YAML tag -
+// which would print no require_mention line at all, and could easily be
+// misread as an effective `false` rather than the documented default of
+// `true`.
+func TestMarshalRedacted_ShowsEffectiveRequireMentionEvenWhenOmitted(t *testing.T) {
+	yaml := `
+version: 1
+agent:
+  model: gpt-5
+channels:
+  telegram:
+    enabled: true
+    allow_from: [111]
+    groups:
+      "-1002":
+        allow_from: [222]
+`
+	cfg, err := Load([]byte(yaml), t.TempDir(), map[string]string{"OPENAI_API_KEY": "sk-x"})
+	require.NoError(t, err)
+	require.True(t, cfg.Channels.Telegram.Groups["-1002"].MentionRequired(), "sanity: the effective default is true")
+
+	out, err := MarshalRedacted(cfg)
+	require.NoError(t, err)
+	rendered := string(out)
+
+	assert.Contains(t, rendered, "require_mention: true", "the effective value must be shown explicitly, not omitted")
+
+	// The original cfg passed in must not be mutated by rendering it - a
+	// second call, or any other reader of cfg, must see the same group
+	// config as before.
+	assert.Nil(t, cfg.Channels.Telegram.Groups["-1002"].RequireMention)
 }
 
 func TestMarshalRedacted_UnsetSecretsShownAsUnset(t *testing.T) {

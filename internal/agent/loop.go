@@ -9,7 +9,6 @@ package agent
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -32,12 +31,14 @@ const noReplySentinel = "NO_REPLY"
 const contextLengthRetryTurns = 4
 
 // toolResultElidedPlaceholder replaces a buffered tool-role message's
-// content on the ErrContextLength retry. history is not always what pushed
-// a request over the limit: a tool-heavy turn's own in-progress buffer -
-// several large tool results accumulated across earlier iterations of the
-// same turn - can dominate it, and trimming history alone does nothing for
-// that. Every tool message keeps its ToolCallID so the assistant/tool
-// pairing invariant survives; only Content shrinks.
+// content on the ErrContextLength retry, for every such message buffered up
+// to the point the retry fired (see elideBufferedToolResults and Run's
+// elideUpTo). history is not always what pushed a request over the limit: a
+// tool-heavy turn's own in-progress buffer - several large tool results
+// accumulated across earlier iterations of the same turn - can dominate it,
+// and trimming history alone does nothing for that. Every tool message keeps
+// its ToolCallID so the assistant/tool pairing invariant survives; only
+// Content shrinks.
 const toolResultElidedPlaceholder = "[tool output elided to fit the context window]"
 
 // ToolRunner executes tool calls the model requests. Run never returns a
@@ -95,11 +96,10 @@ func New(cfg config.Config, prov provider.Provider, st store.Store, tools ToolRu
 // Run executes one turn: load history, think, act on any tool calls,
 // observe the results, repeat until the model stops, NO_REPLY, the
 // iteration cap is hit, or an unrecoverable error occurs. Every exit path
-// persists what happened (or explicitly limits itself to the user's
-// message) before returning, per the turn-buffering contract documented in
-// the phase 4 plan: messages accumulate in memory and are flushed to the
-// store exactly once, so a crash mid-turn can never leave an assistant
-// tool_calls row without its matching tool rows.
+// goes through finish, which persists what happened before returning:
+// messages accumulate in memory and are flushed to the store exactly once,
+// so a crash mid-turn can never leave an assistant tool_calls row without
+// its matching tool rows.
 func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, onProgress Progress) Result {
 	if onProgress == nil {
 		onProgress = func(Event) {}
@@ -117,10 +117,9 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 
 	userMsg := provider.Message{Role: provider.RoleUser, Content: userText}
 	buffer := []provider.Message{userMsg}
-	toolNames := map[string]string{}
 
-	summary := sess.Summary
 	contextRetried := false
+	elideUpTo := 0 // set once contextRetried fires; see elideBufferedToolResults
 	var totalUsage provider.Usage
 	iterations := 0
 	maxIter := l.cfg.Agent.MaxIterations
@@ -128,60 +127,57 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 	meta := Meta{SessionID: sessionID, Channel: sess.Channel, ChatID: sess.ChatID, ThreadID: sess.ThreadID, MessageID: messageID}
 
 	for {
-		if err := ctx.Err(); err != nil {
-			return l.abortForCancellation(ctx, sessionID, buffer, toolNames, totalUsage, iterations, err)
+		if ctx.Err() != nil {
+			return l.abortForCancellation(ctx, sessionID, buffer, totalUsage, iterations, ctx.Err())
 		}
 
 		iterations++
 		onProgress(Event{Kind: EventIteration, Iteration: iterations})
 
-		// The request sends an elided copy of buffer once the retry
-		// below has fired, but buffer itself is never mutated: flush
-		// must still persist the real tool output, not the
-		// placeholder sent to the provider.
+		// The request sends an elided copy of buffer[:elideUpTo] once the
+		// retry below has fired, but buffer itself is never mutated: flush
+		// must still persist the real tool output, not the placeholder sent
+		// to the provider. Results buffered after the retry (elideUpTo:)
+		// are sent - and later flushed - in full: eliding them too would
+		// mean the model never sees any tool output for the rest of the
+		// turn, forcing it to re-run every tool call up to max_iterations.
 		requestBuffer := buffer
 		if contextRetried {
-			requestBuffer = elideBufferedToolResults(buffer)
+			requestBuffer = elideBufferedToolResults(buffer, elideUpTo)
 		}
 		req := provider.Request{
 			Model:       l.cfg.Agent.Model,
-			Messages:    l.assembleMessages(systemPrompt, summary, history, requestBuffer),
+			Messages:    l.assembleMessages(systemPrompt, history, requestBuffer),
 			Tools:       l.tools.Specs(),
-			Temperature: &l.cfg.Agent.Temperature,
+			Temperature: l.cfg.Agent.Temperature,
 		}
 
 		resp, err := l.prov.Complete(ctx, req)
 		if err != nil {
-			perr := provider.Classify(err)
+			perr := provider.Classify(ctx, err)
 
-			if perr.Kind == provider.ErrCanceled {
-				return l.abortForCancellation(ctx, sessionID, buffer, toolNames, totalUsage, iterations, perr)
+			if ctx.Err() != nil {
+				return l.abortForCancellation(ctx, sessionID, buffer, totalUsage, iterations, perr)
 			}
 
 			if perr.Kind == provider.ErrContextLength && !contextRetried {
 				contextRetried = true
+				elideUpTo = len(buffer)
 				iterations-- // the retry is not a new agent step, just recovery
 				history = HardTrim(history, contextLengthRetryTurns)
-				// buffer itself is left untouched: the loop's next pass
-				// through this iteration builds requestBuffer as an
-				// elided copy for the request only, so a flush after
-				// this point still persists the real tool output.
-				summary = ""
 				continue
 			}
 
 			// Any other provider error - including a second
-			// ErrContextLength - flushes only the user's message and
-			// returns the classified error; buffered tool activity from
-			// earlier iterations in this turn is deliberately not
-			// persisted, per the phase 4 spec. totalUsage still reflects
-			// whatever was actually spent and billed across those earlier
-			// iterations, so the caller-facing Result reports it even
-			// though it is not written to the store here.
-			if flushErr := l.flush(ctx, sessionID, []provider.Message{userMsg}, nil, provider.Usage{}); flushErr != nil {
-				l.log.Error("agent: flush user message after provider error failed", "session_id", sessionID, "error", flushErr)
-			}
-			return Result{Iterations: iterations, Usage: totalUsage, Err: perr}
+			// ErrContextLength - flushes the buffer and reports the
+			// classified error, the same policy the cancellation and
+			// tool-error exits below use: backfillAbortedToolCalls (run
+			// after every tool call, not just a failing one) keeps buffer
+			// pairing-consistent between iterations, so a provider error
+			// arriving mid-turn is safe to persist along with whatever
+			// tool activity already ran, rather than losing that activity
+			// (and the usage it billed) from the transcript.
+			return l.finish(ctx, sessionID, buffer, totalUsage, Result{Iterations: iterations, Usage: totalUsage, Err: perr})
 		}
 
 		totalUsage.Prompt += resp.Usage.Prompt
@@ -197,39 +193,60 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 		if len(resp.Message.ToolCalls) > 0 {
 			buffer = append(buffer, resp.Message)
 
-			for _, call := range resp.Message.ToolCalls {
-				toolNames[call.ID] = call.Name
+			for i, call := range resp.Message.ToolCalls {
 				onProgress(Event{Kind: EventToolStarted, ToolName: call.Name, ToolCallID: call.ID})
 
 				result, runErr := l.tools.Run(ctx, call, meta)
 				if runErr != nil {
+					// registry.Run's uniform rule (see its own doc comment)
+					// turns a tool call that actually ran to completion into
+					// a Go error whenever ctx had already ended by the time
+					// it returned - a /stop, or the turn's own deadline,
+					// landing right as an exec command or a write_file
+					// finished. result in that case is the call's real,
+					// successful output, not a failure description:
+					// discarding it in favor of a generic "failed: context
+					// canceled" line would both lose real information the
+					// model could use next turn, and risk the model
+					// re-running a side-effecting call (exec, write_file)
+					// that already succeeded, because the history says it
+					// failed. A tool that fails for its own reason (not ctx
+					// ending) still gets the plain failure line - most such
+					// failures report no output at all (result == "").
+					content := fmt.Sprintf("tool %q failed: %v", call.Name, runErr)
+					if ctx.Err() != nil && result != "" {
+						content = fmt.Sprintf("%s\n\n[turn canceled right after this tool call completed - the result above is real and already happened]", result)
+					}
+
 					// Always buffer exactly one tool message per call id,
 					// even on failure: a missing tool result is what
 					// makes every subsequent request in this session an
 					// API error.
 					buffer = append(buffer, provider.Message{
 						Role:       provider.RoleTool,
-						Content:    fmt.Sprintf("tool %q failed: %v", call.Name, runErr),
+						Content:    content,
 						ToolCallID: call.ID,
 					})
 					onProgress(Event{Kind: EventToolFinished, ToolName: call.Name, ToolCallID: call.ID, Err: runErr})
 
 					// resp.Message may carry further calls after this one
-					// that never got a turn to run: backfill a synthetic
-					// result for each before flushing, so the turn persisted
-					// below is internally consistent (no orphaned
-					// tool_calls) no matter which call in the batch aborted
-					// it.
-					buffer = backfillAbortedToolCalls(buffer, toolNames, resp.Message, runErr.Error())
+					// that never got a turn to run (call i is answered
+					// above; everything after it in the same batch is
+					// not): backfill a synthetic result for each before
+					// flushing, so the turn persisted below is internally
+					// consistent (no orphaned tool_calls) no matter which
+					// call in the batch aborted it.
+					buffer = backfillAbortedToolCalls(buffer, resp.Message.ToolCalls[i+1:], runErr.Error())
 
-					if errors.Is(runErr, context.Canceled) || errors.Is(runErr, context.DeadlineExceeded) {
-						return l.abortForCancellation(ctx, sessionID, buffer, toolNames, totalUsage, iterations, runErr)
+					// ctx.Err() decides a turn cancellation, not runErr's
+					// shape: a tool hitting its own internal deadline (an
+					// exec timeout, say) is a tool failure, not a signal
+					// that the caller gave up on the whole turn.
+					if ctx.Err() != nil {
+						return l.abortForCancellation(ctx, sessionID, buffer, totalUsage, iterations, runErr)
 					}
 
-					if flushErr := l.flush(ctx, sessionID, buffer, toolNames, totalUsage); flushErr != nil {
-						l.log.Error("agent: flush aborted turn failed", "session_id", sessionID, "error", flushErr)
-					}
-					return Result{Iterations: iterations, Usage: totalUsage, Err: fmt.Errorf("agent: tool %q: %w", call.Name, runErr)}
+					return l.finish(ctx, sessionID, buffer, totalUsage, Result{Iterations: iterations, Usage: totalUsage, Err: fmt.Errorf("agent: tool %q: %w", call.Name, runErr)})
 				}
 
 				onProgress(Event{Kind: EventToolFinished, ToolName: call.Name, ToolCallID: call.ID})
@@ -243,10 +260,7 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 			if iterations >= maxIter {
 				capText := fmt.Sprintf("Reached the maximum of %d iterations for this turn without a final answer. Ask again, or raise agent.max_iterations, to let it continue.", maxIter)
 				buffer = append(buffer, provider.Message{Role: provider.RoleAssistant, Content: capText})
-				if flushErr := l.flush(ctx, sessionID, buffer, toolNames, totalUsage); flushErr != nil {
-					return Result{Text: capText, Iterations: iterations, Usage: totalUsage, Err: flushErr}
-				}
-				return Result{Text: capText, Iterations: iterations, Usage: totalUsage}
+				return l.finish(ctx, sessionID, buffer, totalUsage, Result{Text: capText, Iterations: iterations, Usage: totalUsage})
 			}
 			continue
 		}
@@ -266,16 +280,26 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 		// appended here never carries ToolCalls.
 		buffer = append(buffer, resp.Message)
 
-		if flushErr := l.flush(ctx, sessionID, buffer, toolNames, totalUsage); flushErr != nil {
-			return Result{Text: resultText, NoReply: noReply, Iterations: iterations, Usage: totalUsage, Err: flushErr}
-		}
-		return Result{Text: resultText, NoReply: noReply, Iterations: iterations, Usage: totalUsage}
+		return l.finish(ctx, sessionID, buffer, totalUsage, Result{Text: resultText, NoReply: noReply, Iterations: iterations, Usage: totalUsage})
 	}
 }
 
+// maxHistoryBytes bounds the total Content size of the history loadHistory
+// hands to assembleMessages, independent of max_history_turns: a tool-heavy
+// session can blow past the model's real context window on turn count alone
+// long before max_history_turns says to stop, and once it does, every turn
+// pays for a failed request first (see the ErrContextLength retry above). It
+// does not need to know the model's actual context window - it only needs to
+// be comfortably under what any real deployment target supports, so the
+// retry stays the rare exception instead of the routine case. Fixed rather
+// than configurable: it is an internal implementation budget, not a user-
+// facing tuning knob. 256 KiB is roughly 64k tokens, under the 128k window
+// of current OpenAI chat models.
+const maxHistoryBytes = 256 * 1024
+
 // loadHistory fetches a generous raw window (max_history_turns*8 messages,
-// a heuristic covering typical turn sizes) and hard-trims it to whole
-// turns.
+// a heuristic covering typical turn sizes), hard-trims it to whole turns,
+// then trims again to maxHistoryBytes.
 func (l *Loop) loadHistory(ctx context.Context, sessionID string) ([]provider.Message, error) {
 	maxTurns := l.cfg.Agent.MaxHistoryTurns
 	raw, err := l.store.Messages().Recent(ctx, sessionID, maxTurns*8)
@@ -290,44 +314,34 @@ func (l *Loop) loadHistory(ctx context.Context, sessionID string) ([]provider.Me
 		}
 		msgs = append(msgs, pm)
 	}
-	return HardTrim(msgs, maxTurns), nil
+	trimmed := HardTrim(msgs, maxTurns)
+	return TrimToByteBudget(trimmed, maxHistoryBytes), nil
 }
 
 // assembleMessages builds one request's message list: system prompt, then
-// sessions.summary as a system message when non-empty (nothing writes it
-// in v1, but the loop still injects it if a future compaction path does),
-// then trimmed history, then the turn buffered so far.
-func (l *Loop) assembleMessages(systemPrompt, summary string, history, buffer []provider.Message) []provider.Message {
-	out := make([]provider.Message, 0, 2+len(history)+len(buffer))
+// trimmed history, then the turn buffered so far.
+func (l *Loop) assembleMessages(systemPrompt string, history, buffer []provider.Message) []provider.Message {
+	out := make([]provider.Message, 0, 1+len(history)+len(buffer))
 	out = append(out, provider.Message{Role: provider.RoleSystem, Content: systemPrompt})
-	if summary != "" {
-		out = append(out, provider.Message{Role: provider.RoleSystem, Content: summary})
-	}
 	out = append(out, history...)
 	out = append(out, buffer...)
 	return out
 }
 
-// backfillAbortedToolCalls appends a synthetic tool result - and records its
-// tool name in toolNames - for every call in msg.ToolCalls that has no
-// corresponding tool message already in buffer. It is what keeps a
+// backfillAbortedToolCalls appends a synthetic tool result for every call in
+// unanswered: the calls after the one that just aborted the turn, in the
+// same batch, found by position (the slice starting right after the
+// aborting call) rather than by scanning buffer for which ids already have a
+// tool row - a reused call id (several OpenAI-compatible backends emit
+// non-unique ids) would otherwise look "already answered" from an earlier,
+// unrelated batch and get silently skipped here. It is what keeps a
 // multi-call batch internally consistent when one call aborts the turn
 // partway through: without this, calls after the aborting one would be
 // buffered (and then persisted) as part of an assistant tool_calls message
 // with no matching tool row, which makes every later request in the session
 // a 400 from the provider.
-func backfillAbortedToolCalls(buffer []provider.Message, toolNames map[string]string, msg provider.Message, reason string) []provider.Message {
-	answered := make(map[string]bool, len(msg.ToolCalls))
-	for _, m := range buffer {
-		if m.Role == provider.RoleTool {
-			answered[m.ToolCallID] = true
-		}
-	}
-	for _, call := range msg.ToolCalls {
-		if answered[call.ID] {
-			continue
-		}
-		toolNames[call.ID] = call.Name
+func backfillAbortedToolCalls(buffer []provider.Message, unanswered []provider.ToolCall, reason string) []provider.Message {
+	for _, call := range unanswered {
 		buffer = append(buffer, provider.Message{
 			Role:       provider.RoleTool,
 			Content:    fmt.Sprintf("tool execution aborted: %s", reason),
@@ -337,38 +351,41 @@ func backfillAbortedToolCalls(buffer []provider.Message, toolNames map[string]st
 	return buffer
 }
 
-// abortForCancellation flushes whatever is buffered so far using a
-// background context (context.WithoutCancel), so the partial turn is
-// still recorded even though ctx itself is done, then returns a Result
-// classified as provider.ErrCanceled.
-func (l *Loop) abortForCancellation(ctx context.Context, sessionID string, buffer []provider.Message, toolNames map[string]string, usage provider.Usage, iterations int, cause error) Result {
-	// context.WithoutCancel strips ctx's deadline along with its
-	// cancellation, and the writer handle is capped at one physical
-	// connection (sqlite.Open's db.SetMaxOpenConns(1)), so an unbounded
-	// bg would let Append block forever behind a wedged writer. 5s
-	// matches the DSN's busy_timeout(5000) (see sqlite's dsn helper), so
-	// this flush gives up on the same budget the driver itself already
-	// uses for that one connection, rather than on no budget at all.
-	bg, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-	defer cancel()
-	if err := l.flush(bg, sessionID, buffer, toolNames, usage); err != nil {
-		l.log.Error("agent: flush on cancellation failed", "session_id", sessionID, "error", err)
-	}
-	return Result{Iterations: iterations, Usage: usage, Err: provider.Classify(cause)}
+// abortForCancellation ends the turn because ctx is done - a caller cancel,
+// a shutdown drain, or a deadline (job.timeout, /stop) expiring - and always
+// reports it as provider.ErrCanceled: by the time a caller reaches this
+// function, ctx.Err() != nil already established that this is a genuine
+// cancellation, regardless of cause's own shape (an already-classified
+// *provider.Error would otherwise pass through Classify's error-type
+// shortcut with whatever Kind it already carried). flush (via finish) still
+// records whatever was buffered so far, on a context detached from ctx's own
+// cancellation.
+func (l *Loop) abortForCancellation(ctx context.Context, sessionID string, buffer []provider.Message, usage provider.Usage, iterations int, cause error) Result {
+	return l.finish(ctx, sessionID, buffer, usage, Result{
+		Iterations: iterations,
+		Usage:      usage,
+		Err:        &provider.Error{Kind: provider.ErrCanceled, Msg: cause.Error(), Err: cause},
+	})
 }
 
-// elideBufferedToolResults replaces every buffered tool-role message's
-// Content with a short placeholder, keeping every message (and therefore
-// the assistant/tool pairing invariant) intact. It is what the
-// ErrContextLength retry uses to shrink the in-turn buffer itself, not just
-// history: by the time a tool-heavy turn overflows, the buffer accumulated
-// across this turn's own earlier iterations can dominate the request, and
-// trimming history alone does nothing for that case.
-func elideBufferedToolResults(buffer []provider.Message) []provider.Message {
+// elideBufferedToolResults replaces every tool-role message's Content within
+// buffer[:upTo] with a short placeholder, keeping every message (and
+// therefore the assistant/tool pairing invariant) intact; messages at or
+// after upTo are returned unchanged. It is what the ErrContextLength retry
+// uses to shrink the in-turn buffer itself, not just history: by the time a
+// tool-heavy turn overflows, the buffer accumulated across this turn's own
+// earlier iterations can dominate the request, and trimming history alone
+// does nothing for that case. upTo is fixed at the point the retry fires
+// (Run's elideUpTo): eliding the whole buffer on every later iteration too
+// would replace real tool output produced *after* the retry with the same
+// placeholder, so the model would never see any tool result for the rest of
+// the turn and would keep re-running tools up to max_iterations.
+func elideBufferedToolResults(buffer []provider.Message, upTo int) []provider.Message {
 	out := make([]provider.Message, len(buffer))
 	copy(out, buffer)
-	for i, m := range out {
-		if m.Role == provider.RoleTool {
+	for i := 0; i < upTo && i < len(out); i++ {
+		if out[i].Role == provider.RoleTool {
+			m := out[i]
 			m.Content = toolResultElidedPlaceholder
 			out[i] = m
 		}
@@ -376,17 +393,42 @@ func elideBufferedToolResults(buffer []provider.Message) []provider.Message {
 	return out
 }
 
+// flushTimeout bounds a detached flush (see flush): it matches the DSN's
+// busy_timeout(5000) (sqlite's dsn helper), and the writer handle is capped
+// at one physical connection (sqlite.Open's db.SetMaxOpenConns(1)), so an
+// unbounded wait would let Append block forever behind a wedged writer.
+const flushTimeout = 5 * time.Second
+
 // flush converts the buffered turn to store rows and appends them in one
-// call, then records accumulated usage in one AddUsage call. toolNames
-// supplies the tool name for each buffered tool-role message (keyed by
-// ToolCallID), since provider.Message itself carries no tool name.
-func (l *Loop) flush(ctx context.Context, sessionID string, buffer []provider.Message, toolNames map[string]string, usage provider.Usage) error {
+// call, then records accumulated usage in one AddUsage call. The tool name
+// for each buffered tool-role message is worked out here, from the nearest
+// preceding assistant tool_calls declaration in buffer, rather than threaded
+// through Run as a separate map: a call id reused across two different runs
+// in the same turn (several OpenAI-compatible backends emit non-unique ids)
+// then always resolves to whichever run actually preceded it, instead of
+// whichever run happened to declare that id first.
+//
+// flush always runs on a context detached from ctx's own cancellation
+// (context.WithoutCancel), bounded by flushTimeout: a turn that finished (or
+// aborted) after ctx itself was done - a shutdown drain, /stop, or a cron
+// job.timeout expiring - must still be able to record what happened, instead
+// of losing it to "context canceled" on the write that follows.
+func (l *Loop) flush(ctx context.Context, sessionID string, buffer []provider.Message, usage provider.Usage) error {
 	if len(buffer) == 0 {
 		return nil
 	}
 
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), flushTimeout)
+	defer cancel()
+
+	toolNames := map[string]string{}
 	storeMsgs := make([]store.Message, 0, len(buffer))
 	for _, m := range buffer {
+		if m.Role == provider.RoleAssistant {
+			for _, tc := range m.ToolCalls {
+				toolNames[tc.ID] = tc.Name
+			}
+		}
 		sm, err := store.FromProviderMessage(m)
 		if err != nil {
 			return fmt.Errorf("agent: encode message for session %s: %w", sessionID, err)
@@ -407,4 +449,20 @@ func (l *Loop) flush(ctx context.Context, sessionID string, buffer []provider.Me
 		}
 	}
 	return nil
+}
+
+// finish flushes the buffered turn and applies the one flush-failure policy
+// every exit path shares: a flush error is always logged, and becomes res.Err
+// only when the turn itself did not already fail for a more specific reason
+// - that existing Err (a cancellation, a tool error, a provider error)
+// describes something the caller needs to see more than a storage failure
+// for an already-decided outcome does.
+func (l *Loop) finish(ctx context.Context, sessionID string, buffer []provider.Message, usage provider.Usage, res Result) Result {
+	if err := l.flush(ctx, sessionID, buffer, usage); err != nil {
+		l.log.Error("agent: flush failed", "session_id", sessionID, "error", err)
+		if res.Err == nil {
+			res.Err = err
+		}
+	}
+	return res
 }

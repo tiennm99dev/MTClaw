@@ -71,6 +71,61 @@ func HardTrim(msgs []provider.Message, maxTurns int) []provider.Message {
 	return dropLeadingNonUser(msgs)
 }
 
+// TrimToByteBudget drops whole oldest turns (see SegmentTurns) from msgs,
+// same as HardTrim's turn-count trim, until the total Content length across
+// every kept message is at or under maxBytes, or only the last turn
+// remains - a single very large turn is left as is rather than gutted
+// mid-turn. maxBytes <= 0 disables the trim.
+//
+// This runs on output HardTrim already produced (see Loop.loadHistory), so
+// msgs is already turn-aligned and free of orphaned tool_calls; dropping only
+// whole turns preserves both properties without a second repair pass, since
+// repairOrphanedToolCalls never lets a tool_calls run span across a user-
+// message turn boundary in the first place.
+func TrimToByteBudget(msgs []provider.Message, maxBytes int) []provider.Message {
+	if maxBytes <= 0 {
+		return msgs
+	}
+
+	turns := SegmentTurns(msgs)
+	total := 0
+	for _, m := range msgs {
+		total += messageByteSize(m)
+	}
+
+	drop := 0
+	for total > maxBytes && drop < len(turns)-1 {
+		for _, m := range turns[drop].Messages {
+			total -= messageByteSize(m)
+		}
+		drop++
+	}
+	if drop == 0 {
+		return msgs
+	}
+
+	out := make([]provider.Message, 0, len(msgs))
+	for _, t := range turns[drop:] {
+		out = append(out, t.Messages...)
+	}
+	return out
+}
+
+// messageByteSize is what TrimToByteBudget counts against maxBytes for one
+// message: Content plus every tool call's own Args. An assistant message
+// with tool calls typically has empty Content (see Message.ToolCalls' own
+// doc comment), so counting Content alone would let an arbitrarily large
+// write_file body or exec command sitting in a tool call's arguments go
+// completely unbudgeted - it still occupies real space in the request sent
+// to the model.
+func messageByteSize(m provider.Message) int {
+	n := len(m.Content)
+	for _, tc := range m.ToolCalls {
+		n += len(tc.Args)
+	}
+	return n
+}
+
 // dropLeadingNonUser discards any prefix of msgs before the first
 // role=="user" message, returning nil if msgs holds no user message at all.
 func dropLeadingNonUser(msgs []provider.Message) []provider.Message {

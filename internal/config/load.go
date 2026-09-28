@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -11,6 +12,13 @@ import (
 
 	yaml "github.com/goccy/go-yaml"
 )
+
+// maxSecretFileBytes bounds how much of a *_file secret (openai.api_key_file,
+// channels.telegram.token_file) is ever read into memory: a config value
+// pointed at an endless stream (/dev/zero, a FIFO nothing ever closes) must
+// not hang or exhaust memory loading a value that is never more than a
+// short line of text in practice.
+const maxSecretFileBytes = 64 * 1024
 
 // FileNotFoundError is returned by LoadFile when the config file does not
 // exist, distinct from other read errors, so callers such as a future
@@ -48,10 +56,13 @@ func processEnv() map[string]string {
 	return env
 }
 
-// Load decodes YAML bytes onto Default(), resolves secret indirection,
-// expands paths relative to baseDir (the config file's directory), and
-// validates the result. env stands in for the process environment so the
-// whole pipeline is a pure function of its inputs.
+// Load decodes YAML bytes onto Default(), normalizes a couple of
+// intentionally-duplicated spellings, resolves secret indirection, expands
+// paths relative to baseDir (the config file's directory), and validates
+// the result. env stands in for the process environment; this is still not
+// a pure function of (data, baseDir, env) alone, since resolving a *_file
+// secret reads that file from disk when one is set - see resolveSecret and
+// LoadFile, its impure os.ReadFile-based shim.
 func Load(data []byte, baseDir string, env map[string]string) (*Config, error) {
 	cfg := Default()
 
@@ -59,6 +70,8 @@ func Load(data []byte, baseDir string, env map[string]string) (*Config, error) {
 	if err := dec.Decode(cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
+
+	normalizeExecMode(cfg)
 
 	if err := resolveSecrets(cfg, baseDir, env); err != nil {
 		return nil, err
@@ -73,6 +86,18 @@ func Load(data []byte, baseDir string, env map[string]string) (*Config, error) {
 	}
 
 	return cfg, nil
+}
+
+// normalizeExecMode collapses the "mode: off" spelling into "enabled:
+// false" right after decode, so every reader past this point (the tool
+// registry, doctor's checks) only ever has to look at one field. "off" is
+// still accepted in the YAML itself for backward compatibility and remains
+// a valid tools.exec.mode value (see validateTools); it is just no longer
+// authoritative once Load returns.
+func normalizeExecMode(cfg *Config) {
+	if cfg.Tools.Exec.Mode == "off" {
+		cfg.Tools.Exec.Enabled = false
+	}
 }
 
 // resolveSecrets fills in the unexported secret fields from *_env / *_file
@@ -99,8 +124,12 @@ func resolveSecrets(cfg *Config, baseDir string, env map[string]string) error {
 // named env var (falling back to defaultEnvName when envName is empty)
 // wins if set to a non-empty value; otherwise the *_file path is read and
 // trimmed of a trailing newline. Neither being set is not an error at load
-// time - a later phase (doctor / provider construction) is responsible for
-// deciding whether the assistant can actually run without it.
+// time - `mtclaw doctor` and provider construction are what decide whether
+// the assistant can actually run without it. The file read
+// is capped at maxSecretFileBytes and refuses anything that is not a
+// regular file, so a *_file pointed at a FIFO or an endless device
+// (/dev/zero, a pipe nothing ever closes) cannot hang or exhaust memory
+// loading a value that is never more than a short line of text in practice.
 func resolveSecret(defaultEnvName, envName, filePath, baseDir string, env map[string]string) (value, source string, err error) {
 	name := envName
 	if name == "" {
@@ -120,11 +149,34 @@ func resolveSecret(defaultEnvName, envName, filePath, baseDir string, env map[st
 	}
 	warnIfWorldReadable(resolvedPath)
 
-	data, err := os.ReadFile(resolvedPath)
+	info, err := os.Stat(resolvedPath)
 	if err != nil {
 		return "", "", fmt.Errorf("read secret file %s: %w", filePath, err)
 	}
-	return strings.TrimRight(string(data), "\r\n"), "file:" + filePath, nil
+	if !info.Mode().IsRegular() {
+		return "", "", fmt.Errorf("read secret file %s: not a regular file", filePath)
+	}
+
+	f, err := os.Open(resolvedPath)
+	if err != nil {
+		return "", "", fmt.Errorf("read secret file %s: %w", filePath, err)
+	}
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxSecretFileBytes))
+	if err != nil {
+		return "", "", fmt.Errorf("read secret file %s: %w", filePath, err)
+	}
+
+	trimmed := strings.TrimRight(string(data), "\r\n")
+	if trimmed == "" {
+		// An empty (or all-newline) secret file is the same as none set: a
+		// non-empty apiKeySource of "file:..." would otherwise render as
+		// "<set:file:...>" in `config show`, misreporting a secret that
+		// resolved to nothing.
+		return "", "unset", nil
+	}
+	return trimmed, "file:" + filePath, nil
 }
 
 // warnIfWorldReadable enforces that a *_file secret is not readable by
@@ -222,11 +274,26 @@ func ensureDirCreatable(dir string) error {
 // MarshalRedacted renders cfg back to YAML with every resolved secret
 // replaced by a placeholder describing its source ("<set:env:NAME>",
 // "<set:file:PATH>") or "<unset>" - never the secret value itself, which
-// lives only in unexported fields that yaml.Marshal cannot reach.
+// lives only in unexported fields that yaml.Marshal cannot reach. Every
+// group's require_mention is also rendered as its effective value (see
+// TelegramGroupConfig.MentionRequired): RequireMention's `omitempty` YAML
+// tag means a group that omits the key prints no require_mention line at
+// all, which a reader could easily mistake for an effective `false` instead
+// of the documented default of `true`.
 func MarshalRedacted(cfg *Config) ([]byte, error) {
 	redacted := *cfg
 	redacted.OpenAI.APIKeyInline = redactedSecretLabel(cfg.OpenAI.APIKeySource())
 	redacted.Channels.Telegram.TokenInline = redactedSecretLabel(cfg.Channels.Telegram.TokenSource())
+
+	if cfg.Channels.Telegram.Groups != nil {
+		groups := make(map[string]TelegramGroupConfig, len(cfg.Channels.Telegram.Groups))
+		for key, g := range cfg.Channels.Telegram.Groups {
+			g.RequireMention = Bool(g.MentionRequired())
+			groups[key] = g
+		}
+		redacted.Channels.Telegram.Groups = groups
+	}
+
 	return yaml.Marshal(&redacted)
 }
 

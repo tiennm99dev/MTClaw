@@ -62,7 +62,7 @@ CREATE TABLE cron_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   job_name    TEXT NOT NULL,
   session_id  TEXT NOT NULL DEFAULT '',
-  status      TEXT NOT NULL,                   -- ok|error|skipped
+  status      TEXT NOT NULL,                   -- started|ok|error|skipped|interrupted
   error       TEXT NOT NULL DEFAULT '',
   started_at  INTEGER NOT NULL,
   finished_at INTEGER

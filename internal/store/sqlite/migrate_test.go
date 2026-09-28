@@ -36,6 +36,23 @@ func TestOpen_FreshDatabaseMigratesToLatest(t *testing.T) {
 	assert.Equal(t, 1, tableCount)
 }
 
+// TestOpen_ApprovalsSessionIDIndexExists pins the index a fresh database
+// gets on approvals.session_id: it is an FK child with ON DELETE CASCADE and
+// otherwise unindexed, so a session delete's cascade (and any other lookup
+// by session_id) would scan the whole table.
+func TestOpen_ApprovalsSessionIDIndexExists(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "index.db")
+
+	db, err := Open(ctx, path, false)
+	require.NoError(t, err)
+	defer db.Close()
+
+	var count int
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND tbl_name='approvals' AND sql LIKE '%session_id%'`).Scan(&count))
+	assert.GreaterOrEqual(t, count, 1)
+}
+
 func TestOpen_ReopenUpToDateDatabaseAppliesNoMigrations(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "reopen.db")

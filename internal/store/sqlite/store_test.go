@@ -54,14 +54,22 @@ func TestSessions_GetAndListNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
+// TestSessions_List_OrderedByUpdatedAtDesc plants a's updated_at explicitly
+// into the past instead of racing millisecond-resolution timestamps with a
+// sleep (see TestMessages_Append_BumpsSessionUpdatedAt below, which uses the
+// same pattern), so the assertion is deterministic on a loaded box.
 func TestSessions_List_OrderedByUpdatedAtDesc(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
 
 	a, err := st.Sessions().Ensure(ctx, "telegram", "chat-a", "")
 	require.NoError(t, err)
-	time.Sleep(2 * time.Millisecond)
 	b, err := st.Sessions().Ensure(ctx, "telegram", "chat-b", "")
+	require.NoError(t, err)
+
+	dbHandle := storeDB(t, st)
+	past := toMillis(time.Now().Add(-time.Hour))
+	_, err = dbHandle.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id = ?`, past, a.ID)
 	require.NoError(t, err)
 
 	list, err := st.Sessions().List(ctx, 0)
@@ -69,6 +77,37 @@ func TestSessions_List_OrderedByUpdatedAtDesc(t *testing.T) {
 	require.Len(t, list, 2)
 	assert.Equal(t, b.ID, list[0].ID, "most recently updated session first")
 	assert.Equal(t, a.ID, list[1].ID)
+}
+
+// TestSessions_List_TiesBrokenByIDDesc plants two sessions at the exact same
+// updated_at millisecond (real traffic can collide at millisecond
+// resolution) and proves List still orders them deterministically by id,
+// rather than leaving same-millisecond rows in whatever order SQLite
+// happens to return them.
+func TestSessions_List_TiesBrokenByIDDesc(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	a, err := st.Sessions().Ensure(ctx, "telegram", "chat-a", "")
+	require.NoError(t, err)
+	b, err := st.Sessions().Ensure(ctx, "telegram", "chat-b", "")
+	require.NoError(t, err)
+
+	dbHandle := storeDB(t, st)
+	tied := toMillis(time.Now())
+	_, err = dbHandle.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id IN (?, ?)`, tied, a.ID, b.ID)
+	require.NoError(t, err)
+
+	list, err := st.Sessions().List(ctx, 0)
+	require.NoError(t, err)
+	require.Len(t, list, 2)
+
+	wantFirst, wantSecond := a.ID, b.ID
+	if b.ID > a.ID {
+		wantFirst, wantSecond = b.ID, a.ID
+	}
+	assert.Equal(t, wantFirst, list[0].ID, "ties at the same updated_at millisecond break by id DESC")
+	assert.Equal(t, wantSecond, list[1].ID)
 }
 
 // TestMessages_Append_BumpsSessionUpdatedAt proves a turn with no usage to
@@ -143,19 +182,19 @@ func TestMessages_AppendIsAtomicAndGaplessUnderConcurrency(t *testing.T) {
 }
 
 func TestMessages_Append_ATurnIsAtomicallyVisible(t *testing.T) {
-	// The correctness crux of this phase: an assistant tool_calls row must
-	// never be visible without its matching tool rows. Append commits the
-	// whole slice in one transaction, so simulate a crash mid-turn by
-	// forcing the *last* insert in the batch to fail, and assert that none
-	// of the batch - not even the earlier, individually-valid rows in the
-	// same call - persisted.
+	// An assistant tool_calls row must never be visible without its
+	// matching tool rows. Append commits the whole slice in one
+	// transaction, so simulate a crash mid-turn by forcing the *last*
+	// insert in the batch to fail, and assert that none of the batch - not
+	// even the earlier, individually-valid rows in the same call -
+	// persisted.
 	//
-	// The schema (001_init.sql, kept verbatim from the phase spec) has no
-	// per-row CHECK that content alone could trip, and the UNIQUE(session_
-	// id, seq) constraint can never fire from stale data because Append
-	// always recomputes MAX(seq) inside the same transaction it inserts
-	// in - by construction, a seq collision within one Append call cannot
-	// happen. So this test adds a connection-local, test-only trigger
+	// The schema (001_init.sql) has no per-row CHECK that content alone
+	// could trip, and the UNIQUE(session_id, seq) constraint can never
+	// fire from stale data because Append always recomputes MAX(seq)
+	// inside the same transaction it inserts in - by construction, a seq
+	// collision within one Append call cannot happen. So this test adds a
+	// connection-local, test-only trigger
 	// (not touching the production schema) that aborts an insert carrying
 	// a sentinel content value, standing in for whatever real error
 	// (disk full, cancelled context, ...) could interrupt persisting a
@@ -292,9 +331,10 @@ func TestApprovals_DecideUnknownIDReturnsNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
-// TestApprovals_SetMessageID_RecordsAfterCreate proves the M2 ordering fix's
-// store side: a row can be created with no message_id yet (the prompt has
-// not been sent when Create runs) and SetMessageID fills it in afterward.
+// TestApprovals_SetMessageID_RecordsAfterCreate proves the store side of
+// ordering an approval's Create before its prompt is sent: a row can be
+// created with no message_id yet (the prompt has not been sent when Create
+// runs) and SetMessageID fills it in afterward.
 func TestApprovals_SetMessageID_RecordsAfterCreate(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)
@@ -362,7 +402,7 @@ func TestApprovals_ExpirePending(t *testing.T) {
 	}
 	require.NoError(t, st.Approvals().Create(ctx, stillPending))
 
-	n, err := st.Approvals().ExpirePending(ctx, time.Now())
+	n, err := st.Approvals().ExpirePending(ctx, time.Now(), "telegram")
 	require.NoError(t, err)
 	assert.Equal(t, 1, n)
 
@@ -371,6 +411,34 @@ func TestApprovals_ExpirePending(t *testing.T) {
 	assert.Equal(t, "expired", got.State)
 
 	got, err = st.Approvals().Get(ctx, stillPending.ID)
+	require.NoError(t, err)
+	assert.Equal(t, "pending", got.State)
+}
+
+// TestApprovals_ExpirePending_ScopedToChannel proves the channel argument
+// actually narrows the sweep: a pending row on a different channel, however
+// expired, must survive a sweep scoped to "telegram" - the guarantee that
+// lets one channel's startup sweep never expire a sibling channel's still-
+// live approvals, should a second channel ever start writing rows into this
+// same table.
+func TestApprovals_ExpirePending_ScopedToChannel(t *testing.T) {
+	ctx := context.Background()
+	st := newTestStore(t)
+
+	sess, err := st.Sessions().Ensure(ctx, "telegram", "chat-1", "")
+	require.NoError(t, err)
+
+	otherChannel := &store.Approval{
+		SessionID: sess.ID, Channel: "cli", ChatID: "chat-1", Tool: "exec", Command: "ls",
+		ExpiresAt: time.Now().Add(-time.Minute),
+	}
+	require.NoError(t, st.Approvals().Create(ctx, otherChannel))
+
+	n, err := st.Approvals().ExpirePending(ctx, time.Now(), "telegram")
+	require.NoError(t, err)
+	assert.Equal(t, 0, n, "a row on a different channel must not be swept")
+
+	got, err := st.Approvals().Get(ctx, otherChannel.ID)
 	require.NoError(t, err)
 	assert.Equal(t, "pending", got.State)
 }
@@ -420,10 +488,10 @@ func TestCronRuns_Finish_UnknownIDReturnsErrNotFound(t *testing.T) {
 	assert.ErrorIs(t, err, store.ErrNotFound)
 }
 
-// TestCronRuns_ExpireStarted_MovesStartedRowsBeforeCutoff is the M6
-// regression test: a row still "started" as of a prior process's crash (no
-// Finish ever ran) must be swept to "interrupted" at the next startup, the
-// same restart-safety pattern ApprovalStore.ExpirePending already provides.
+// TestCronRuns_ExpireStarted_MovesStartedRowsBeforeCutoff proves a row still
+// "started" as of a prior process's crash (no Finish ever ran) must be swept
+// to "interrupted" at the next startup, the same restart-safety pattern
+// ApprovalStore.ExpirePending already provides.
 func TestCronRuns_ExpireStarted_MovesStartedRowsBeforeCutoff(t *testing.T) {
 	ctx := context.Background()
 	st := newTestStore(t)

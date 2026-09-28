@@ -194,17 +194,19 @@ func TestRun_ToolGoError_AbortsTurn(t *testing.T) {
 	assert.Contains(t, msgs[2].Content, "registry crashed")
 }
 
-// TestRun_ToolCancelMidBatch_BackfillsUnrunCalls is the H1 regression test:
-// a two-tool-call batch where the first call aborts the turn (context.
-// Canceled, the shape a /stop or cron timeout produces) must not leave the
-// second call's id unanswered in the persisted transcript. Feeding that
-// transcript back through HardTrim must find no orphaned tool_calls id
-// either - the exact failure mode that poisons every later request in the
-// session.
+// TestRun_ToolCancelMidBatch_BackfillsUnrunCalls covers a two-tool-call batch
+// where the first call aborts the turn because the turn's own ctx is
+// actually done (a /stop or cron timeout cancelling it, not just a tool
+// returning a context.Canceled-shaped error on its own - see loop.go's
+// ctx.Err() check): it must not leave the second call's id unanswered in the
+// persisted transcript. Feeding that transcript back through HardTrim must
+// find no orphaned tool_calls id either - the exact failure mode that
+// poisons every later request in the session.
 func TestRun_ToolCancelMidBatch_BackfillsUnrunCalls(t *testing.T) {
 	st := newTestStore(t)
 	sessionID := newTestSession(t, st)
 
+	ctx, cancel := context.WithCancel(context.Background())
 	calls := []provider.ToolCall{
 		{ID: "call_1", Name: "slow_tool"},
 		{ID: "call_2", Name: "slow_tool"},
@@ -213,6 +215,7 @@ func TestRun_ToolCancelMidBatch_BackfillsUnrunCalls(t *testing.T) {
 	tools := &fakeToolRunner{
 		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
 			if call.ID == "call_1" {
+				cancel()
 				return "", context.Canceled
 			}
 			t.Fatalf("call %q must never run: the turn already aborted on call_1", call.ID)
@@ -221,7 +224,7 @@ func TestRun_ToolCancelMidBatch_BackfillsUnrunCalls(t *testing.T) {
 	}
 
 	loop := New(testAgentConfig(), prov, st, tools, nil)
-	result := loop.Run(context.Background(), sessionID, "run two slow things", "", nil)
+	result := loop.Run(ctx, sessionID, "run two slow things", "", nil)
 
 	require.Error(t, result.Err)
 	var perr *provider.Error
@@ -246,6 +249,79 @@ func TestRun_ToolCancelMidBatch_BackfillsUnrunCalls(t *testing.T) {
 		provMsgs[i] = pm
 	}
 	assertNoOrphans(t, HardTrim(provMsgs, 10))
+}
+
+// TestRun_ToolSucceedsButCtxEndsAtReturn_PersistsRealResultNotJustFailure
+// covers registry.Run's uniform (out, nil) -> (out, ctx.Err()) rule (see
+// its own doc comment): a tool call that actually completed successfully,
+// but whose caller ctx had already ended (a /stop, or the turn's own
+// deadline) by the time it returned. The side effect (an exec command, a
+// write_file) already happened; discarding its real output in favor of a
+// generic "tool X failed: context canceled" line would both lose that
+// information and risk the model re-running the same side-effecting call
+// on the next turn because the history says it failed.
+func TestRun_ToolSucceedsButCtxEndsAtReturn_PersistsRealResultNotJustFailure(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	prov := mock.New(mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "exec"}}})
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			// Mirrors registry.Run's own wrapping: the call itself already
+			// produced its real result, and only then does the caller's
+			// ctx end - here, right at the point the fake tool "returns".
+			cancel()
+			return "exit_code: 0\noutput:\nreal output that already happened", ctx.Err()
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(ctx, sessionID, "run something", "", nil)
+
+	require.Error(t, result.Err)
+	var perr *provider.Error
+	require.ErrorAs(t, result.Err, &perr)
+	assert.Equal(t, provider.ErrCanceled, perr.Kind)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3, "user, assistant(tool_calls), tool result")
+	toolMsg := msgs[2]
+	assert.Equal(t, "tool", toolMsg.Role)
+	assert.Contains(t, toolMsg.Content, "real output that already happened", "the tool's actual, completed result must be preserved, not discarded")
+	assert.NotContains(t, toolMsg.Content, "failed:", "a call that actually completed must not be described as having failed")
+}
+
+// TestRun_ToolOwnDeadlineExceeded_IsAToolErrorNotATurnCancel covers a tool
+// that hits its own internal deadline (an exec timeout, say) and returns a
+// context.DeadlineExceeded-shaped error, while the turn's own ctx
+// (context.Background() here) never expired at all: this must surface as an
+// ordinary tool error, the same as any other failed tool call, not get
+// mistaken for the caller having cancelled the whole turn.
+func TestRun_ToolOwnDeadlineExceeded_IsAToolErrorNotATurnCancel(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "exec"}}})
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			return "", context.DeadlineExceeded
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "run something with its own timeout", "", nil)
+
+	require.Error(t, result.Err)
+	var perr *provider.Error
+	assert.False(t, errors.As(result.Err, &perr), "a tool's own deadline must not be reported as a classified provider.Error cancellation")
+	assert.Contains(t, result.Err.Error(), "exec")
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3, "user, assistant(tool_calls), and the one tool row - a normal tool-error turn is still fully persisted, not just the user message")
+	assert.Equal(t, "tool", msgs[2].Role)
 }
 
 func TestRun_IterationCap_EnforcedAndExplained(t *testing.T) {
@@ -273,6 +349,52 @@ func TestRun_IterationCap_EnforcedAndExplained(t *testing.T) {
 	assert.Equal(t, cfg.Agent.MaxIterations, result.Iterations)
 	assert.Len(t, prov.Requests(), cfg.Agent.MaxIterations)
 	assert.Contains(t, result.Text, fmt.Sprintf("%d iterations", cfg.Agent.MaxIterations))
+}
+
+// TestRun_LoadHistory_DropsOldestTurnsPastByteBudget proves
+// TrimToByteBudget's wiring into loadHistory (see loop.go's own
+// maxHistoryBytes/loadHistory) actually reaches the request Loop.Run
+// sends, not just as an isolated unit test of TrimToByteBudget itself:
+// several turns whose stored history is individually well under
+// max_history_turns but whose combined size comfortably exceeds
+// maxHistoryBytes must have their oldest turns dropped from the request,
+// while the most recent turn (and the new user message) survive.
+func TestRun_LoadHistory_DropsOldestTurnsPastByteBudget(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	// maxHistoryBytes is 256 KiB; four ~90 KiB turns comfortably exceed it
+	// (~360 KiB total) while staying well under MaxHistoryTurns (10, see
+	// testAgentConfig) so HardTrim's own turn-count trim never fires here -
+	// only the byte-budget trim can be responsible for what gets dropped.
+	const turns = 4
+	filler := strings.Repeat("x", 90*1024)
+	for i := 0; i < turns; i++ {
+		require.NoError(t, st.Messages().Append(context.Background(), sessionID, []store.Message{
+			{Role: "user", Content: fmt.Sprintf("turn-marker-%d ", i) + filler},
+			{Role: "assistant", Content: fmt.Sprintf("reply-marker-%d", i)},
+		}))
+	}
+
+	prov := mock.New(mock.Step{Content: "ok"})
+	tools := &fakeToolRunner{}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "one more question", "", nil)
+	require.NoError(t, result.Err)
+
+	requests := prov.Requests()
+	require.Len(t, requests, 1)
+
+	var sent strings.Builder
+	for _, m := range requests[0].Messages {
+		sent.WriteString(m.Content)
+	}
+	assembled := sent.String()
+
+	assert.NotContains(t, assembled, "turn-marker-0", "the oldest turn must be dropped once the combined history exceeds maxHistoryBytes")
+	assert.Contains(t, assembled, fmt.Sprintf("turn-marker-%d", turns-1), "the most recent turn must survive the byte-budget trim")
+	assert.Contains(t, assembled, "one more question", "the new user message itself is never part of the trimmed history")
 }
 
 func TestRun_ErrContextLength_RetriesOnceWithSmallerRequest(t *testing.T) {
@@ -319,14 +441,17 @@ func TestRun_ErrContextLength_SecondFailureReturnsError(t *testing.T) {
 	require.Error(t, result.Err)
 	assert.Len(t, prov.Requests(), 2, "only one retry is attempted")
 
-	// Only the user message is persisted on a non-recovered provider error.
+	// Nothing beyond the user message was ever buffered in this script (both
+	// Complete calls failed before any tool activity), so that is all that
+	// gets persisted; see TestRun_ProviderErrorMidTurn_PersistsToolActivityAlreadyRun
+	// for the case where a provider error follows tool activity.
 	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "user", msgs[0].Role)
 }
 
-func TestRun_OtherProviderError_FlushesOnlyUserMessage(t *testing.T) {
+func TestRun_OtherProviderError_PersistsWhateverWasBuffered(t *testing.T) {
 	st := newTestStore(t)
 	sessionID := newTestSession(t, st)
 
@@ -339,10 +464,58 @@ func TestRun_OtherProviderError_FlushesOnlyUserMessage(t *testing.T) {
 	require.ErrorAs(t, result.Err, &perr)
 	assert.Equal(t, provider.ErrAuth, perr.Kind)
 
+	// No tool activity ran before the error in this script, so the buffer
+	// held only the user message.
 	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
 	require.NoError(t, err)
 	require.Len(t, msgs, 1)
 	assert.Equal(t, "user", msgs[0].Role)
+}
+
+// TestRun_ProviderErrorMidTurn_PersistsToolActivityAlreadyRun proves a
+// provider error that arrives after one or more tool calls already ran in
+// this turn persists that activity - and the usage it billed - instead of
+// discarding it: the same policy the cancellation and tool-Go-error exits
+// already use, since backfillAbortedToolCalls keeps the buffer
+// pairing-consistent between iterations regardless of which exit ends the
+// turn.
+func TestRun_ProviderErrorMidTurn_PersistsToolActivityAlreadyRun(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "exec"}}, Usage: provider.Usage{Prompt: 10, Completion: 5}},
+		mock.Step{Err: &provider.Error{Kind: provider.ErrAuth, Msg: "bad key"}},
+	)
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			return "ran the command", nil
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "run something then explain", "", nil)
+
+	require.Error(t, result.Err)
+	var perr *provider.Error
+	require.ErrorAs(t, result.Err, &perr)
+	assert.Equal(t, provider.ErrAuth, perr.Kind)
+	assert.Equal(t, 10, result.Usage.Prompt, "usage already billed for the failed turn is still reported")
+	assert.Equal(t, 5, result.Usage.Completion)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3, "user, assistant(tool_calls), and the tool result that already ran")
+	assert.Equal(t, "user", msgs[0].Role)
+	assert.Equal(t, "assistant", msgs[1].Role)
+	assert.Equal(t, "tool", msgs[2].Role)
+	assert.Equal(t, "ran the command", msgs[2].Content)
+	assert.Equal(t, "exec", msgs[2].ToolName)
+
+	sess, err := st.Sessions().Get(context.Background(), sessionID)
+	require.NoError(t, err)
+	assert.Equal(t, 10, sess.PromptTokens, "usage billed before the error must still be recorded")
+	assert.Equal(t, 5, sess.CompletionTokens)
 }
 
 func TestRun_CancelMidTurn_PersistsPartialTurn(t *testing.T) {
@@ -457,11 +630,11 @@ func TestRun_EmptyToolCallsWithToolCallsFinishReason_EndsTurnImmediately(t *test
 	assert.Len(t, prov.Requests(), 1)
 }
 
-// TestRun_LengthTruncation_NoticeNotPersistedAsModelContent is the M4
-// regression test: the "[response truncated ...]" notice must only appear
-// in the caller-facing Result.Text, never in what gets persisted as the
-// model's own content, since a future turn's loadHistory would otherwise
-// replay our own editorial note back to the model as something it said.
+// TestRun_LengthTruncation_NoticeNotPersistedAsModelContent proves the
+// "[response truncated ...]" notice only appears in the caller-facing
+// Result.Text, never in what gets persisted as the model's own content,
+// since a future turn's loadHistory would otherwise replay our own
+// editorial note back to the model as something it said.
 func TestRun_LengthTruncation_NoticeNotPersistedAsModelContent(t *testing.T) {
 	st := newTestStore(t)
 	sessionID := newTestSession(t, st)
@@ -543,4 +716,115 @@ func TestRun_ErrContextLength_RetryAlsoElidesBufferedToolResults(t *testing.T) {
 	}
 	require.NotNil(t, toolMsg)
 	assert.Equal(t, bigResult, toolMsg.Content, "the persisted tool row must keep the real tool output; only the retried request may see the elided placeholder")
+}
+
+// TestRun_ErrContextLengthRetry_ElidesOnlyUpToRetryPoint covers the iteration
+// *after* the one ErrContextLength retry: a tool call that runs once the
+// turn has recovered must reach the model in full on every later request,
+// not the elided placeholder. Eliding the whole buffer on every request
+// after the retry (rather than only buffer[:elideUpTo], the slice that
+// actually caused the overflow) would mean the model never sees any tool
+// output for the rest of the turn - it would re-run the same tool call over
+// and over, once per remaining iteration, until max_iterations.
+func TestRun_ErrContextLengthRetry_ElidesOnlyUpToRetryPoint(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	firstResult := strings.Repeat("x", 5000)
+	secondResult := "REAL_ANSWER_" + strings.Repeat("y", 5000)
+	prov := mock.New(
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "big_tool"}}},
+		mock.Step{Err: &provider.Error{Kind: provider.ErrContextLength}},
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_2", Name: "big_tool"}}},
+		mock.Step{Content: "final answer"},
+	)
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			if call.ID == "call_1" {
+				return firstResult, nil
+			}
+			return secondResult, nil
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "do two big things", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Equal(t, "final answer", result.Text)
+
+	requests := prov.Requests()
+	require.Len(t, requests, 4)
+
+	// requests[2] is the elided retry that recovers into call_2's tool_calls;
+	// call_2 does not exist yet at that point - it is the response to this
+	// very request.
+	for _, m := range requests[2].Messages {
+		assert.NotEqual(t, "call_2", m.ToolCallID)
+	}
+
+	// requests[3] is the next request, sent after call_2's tool already ran:
+	// it must still elide call_1's result (buffer[:elideUpTo], fixed at the
+	// point the retry fired) but must carry call_2's result in full, so the
+	// model never has to re-run a tool it already got a result for.
+	call1Elided, call2Full := false, false
+	for _, m := range requests[3].Messages {
+		if m.ToolCallID == "call_1" {
+			assert.NotEqual(t, firstResult, m.Content)
+			call1Elided = true
+		}
+		if m.ToolCallID == "call_2" {
+			assert.Equal(t, secondResult, m.Content)
+			call2Full = true
+		}
+	}
+	require.True(t, call1Elided)
+	require.True(t, call2Full)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	var call2Msg *store.Message
+	for i := range msgs {
+		if msgs[i].ToolCallID == "call_2" {
+			call2Msg = &msgs[i]
+		}
+	}
+	require.NotNil(t, call2Msg)
+	assert.Equal(t, secondResult, call2Msg.Content, "the persisted row for call_2 must keep the real tool output")
+}
+
+// TestRun_ReusedCallID_RecordsTheToolNameActuallyDeclared covers a call id
+// reused across two different tool_calls declarations in the same turn -
+// the shape several OpenAI-compatible backends actually send. Each
+// persisted tool row's ToolName must reflect the assistant declaration that
+// actually preceded it, not whichever declaration for that id happened to
+// run last in the turn.
+func TestRun_ReusedCallID_RecordsTheToolNameActuallyDeclared(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_0", Name: "exec"}}},
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_0", Name: "fs_read"}}},
+		mock.Step{Content: "done"},
+	)
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			return "ok for " + call.Name, nil
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "run two different tools", "", nil)
+	require.NoError(t, result.Err)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 6) // user, assistant(exec), tool(exec), assistant(fs_read), tool(fs_read), assistant(final)
+	assert.Equal(t, "tool", msgs[2].Role)
+	assert.Equal(t, "call_0", msgs[2].ToolCallID)
+	assert.Equal(t, "exec", msgs[2].ToolName, "the first call_0 row must keep the tool name its own declaration used")
+	assert.Equal(t, "tool", msgs[4].Role)
+	assert.Equal(t, "call_0", msgs[4].ToolCallID)
+	assert.Equal(t, "fs_read", msgs[4].ToolName, "the second call_0 row must use the later declaration's name, not the first")
 }

@@ -73,9 +73,9 @@ func TestConverterRoundTrip_AssistantPlainText(t *testing.T) {
 	assert.Empty(t, got.ToolCalls)
 }
 
-// TestConverterRoundTrip_AssistantTwoToolCalls is the fiddly case called out
-// by the phase spec: an assistant turn carrying two tool calls must survive
-// toSDKMessage -> JSON -> fromSDK unchanged.
+// TestConverterRoundTrip_AssistantTwoToolCalls is the fiddly case: an
+// assistant turn carrying two tool calls must survive toSDKMessage -> JSON
+// -> fromSDK unchanged.
 func TestConverterRoundTrip_AssistantTwoToolCalls(t *testing.T) {
 	original := provider.Message{
 		Role: provider.RoleAssistant,

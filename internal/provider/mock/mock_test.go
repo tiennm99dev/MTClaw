@@ -13,8 +13,8 @@ import (
 
 // TestScriptedTwoStepToolConversation drives a fake agent loop: send a user
 // message, get back a tool-call step, append the tool result, send again,
-// get back the final text step. This is the shape phases 4-8 depend on the
-// mock provider for.
+// get back the final text step. This is the shape internal/agent's tests
+// depend on the mock provider for.
 func TestScriptedTwoStepToolConversation(t *testing.T) {
 	p := New(
 		Step{

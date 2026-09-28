@@ -44,9 +44,8 @@ func (d Duration) MarshalYAML() ([]byte, error) {
 	return []byte(fmt.Sprintf("%q", time.Duration(d).String())), nil
 }
 
-// Config is the root of the MTClaw YAML schema. See
-// plans/260731-2219-mtclaw-core-system/phase-01-foundation-and-config.md for
-// the authoritative annotated example.
+// Config is the root of the MTClaw YAML schema. See docs/configuration.md
+// for the authoritative, field-by-field reference.
 type Config struct {
 	Version  int            `yaml:"version"`
 	Agent    AgentConfig    `yaml:"agent"`
@@ -60,9 +59,15 @@ type Config struct {
 
 // AgentConfig controls the agent loop's identity and turn limits.
 type AgentConfig struct {
-	Name              string   `yaml:"name"`
-	Model             string   `yaml:"model"`
-	Temperature       float64  `yaml:"temperature"`
+	Name  string `yaml:"name"`
+	Model string `yaml:"model"`
+	// Temperature is nil when the user never set agent.temperature, which
+	// leaves the field out of the OpenAI request entirely (see
+	// provider.Request.Temperature and Loop.Run) instead of sending a
+	// value the model may reject: current OpenAI reasoning models (gpt-5,
+	// o3, o4-mini) return a 400 for any explicit temperature other than
+	// their own default of 1.
+	Temperature       *float64 `yaml:"temperature,omitempty"`
 	MaxIterations     int      `yaml:"max_iterations"`
 	MaxHistoryTurns   int      `yaml:"max_history_turns"`
 	Workspace         string   `yaml:"workspace"`
@@ -140,9 +145,26 @@ func (t *TelegramConfig) setSecret(value, source string) {
 // any group not otherwise listed; its AllowFrom, when empty, inherits the
 // channel-level allowlist rather than granting access on its own.
 type TelegramGroupConfig struct {
-	RequireMention bool    `yaml:"require_mention"`
+	// RequireMention is a pointer so an entry that omits the key entirely
+	// (any listed group, not just "*") still defaults to requiring a
+	// mention: a plain bool's zero value would otherwise silently mean
+	// "false" for every group the user lists without this key, undoing the
+	// documented default the moment any group entry exists at all. Use
+	// MentionRequired to read the effective value.
+	RequireMention *bool   `yaml:"require_mention,omitempty"`
 	AllowFrom      []int64 `yaml:"allow_from"`
 }
+
+// MentionRequired reports the effective value of RequireMention: true when
+// unset (nil), so a listed group that omits the key still requires a
+// mention like the documented default, not Go's bool zero value.
+func (g TelegramGroupConfig) MentionRequired() bool {
+	return g.RequireMention == nil || *g.RequireMention
+}
+
+// Bool returns a pointer to b, for building a TelegramGroupConfig (or any
+// other *bool-typed config field) literal without an intermediate variable.
+func Bool(b bool) *bool { return &b }
 
 // ToolsConfig groups every built-in tool's configuration.
 type ToolsConfig struct {
@@ -168,7 +190,11 @@ type WebFetchConfig struct {
 
 // ExecConfig configures the shell exec tool and its layered policy engine.
 type ExecConfig struct {
-	Enabled         bool           `yaml:"enabled"`
+	Enabled bool `yaml:"enabled"`
+	// Mode is "off" as an accepted, equivalent spelling of Enabled: false -
+	// Load normalizes Mode: "off" to Enabled = false right after decode (see
+	// normalizeExecMode), so every reader past that point only ever needs to
+	// check Enabled.
 	Mode            string         `yaml:"mode"` // approval | auto | off
 	Shell           []string       `yaml:"shell"`
 	CWD             string         `yaml:"cwd"`
@@ -186,9 +212,7 @@ type ExecAutoConfig struct {
 	ConfirmOn []string `yaml:"confirm_on"`
 }
 
-// CronConfig declares scheduled prompt jobs. Expression validity is not
-// checked in phase 1 (gronx is not yet a dependency); only structural rules
-// (unique names, non-empty prompt/deliver_to, a loadable timezone) apply.
+// CronConfig declares scheduled prompt jobs.
 type CronConfig struct {
 	Enabled  bool      `yaml:"enabled"`
 	Timezone string    `yaml:"timezone"` // IANA name or "Local"
@@ -198,7 +222,7 @@ type CronConfig struct {
 // CronJob is one scheduled prompt.
 type CronJob struct {
 	Name      string        `yaml:"name"`
-	Schedule  string        `yaml:"schedule"` // 5-field cron expression, validated in phase 8
+	Schedule  string        `yaml:"schedule"` // exactly 5 fields; see validateCron
 	Prompt    string        `yaml:"prompt"`
 	Enabled   bool          `yaml:"enabled"`
 	Session   string        `yaml:"session"` // persistent | ephemeral

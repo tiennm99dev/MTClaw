@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math/rand"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -72,10 +73,96 @@ func TestHardTrim_ZeroOrNegativeDisablesTrimming(t *testing.T) {
 	assert.Equal(t, msgs, HardTrim(msgs, -1))
 }
 
-// TestHardTrim_InvariantsHoldOverGeneratedHistories is the property-style
-// test the phase 4 plan calls for: trimming a randomly generated, but
-// structurally valid, history to any maxTurns must never start the result
-// with a tool message and must never leave an assistant tool_calls id
+func TestTrimToByteBudget_DropsOldestWholeTurnsUntilUnderBudget(t *testing.T) {
+	big := strings.Repeat("x", 100)
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: big},
+		{Role: provider.RoleAssistant, Content: big},
+		{Role: provider.RoleUser, Content: big},
+		{Role: provider.RoleAssistant, Content: big},
+		{Role: provider.RoleUser, Content: "recent"},
+		{Role: provider.RoleAssistant, Content: "reply"},
+	}
+
+	out := TrimToByteBudget(msgs, 100)
+
+	require.Len(t, out, 2, "only the last turn fits the budget")
+	assert.Equal(t, "recent", out[0].Content)
+	assert.Equal(t, "reply", out[1].Content)
+}
+
+func TestTrimToByteBudget_KeepsAtLeastTheLastTurnEvenIfOversize(t *testing.T) {
+	huge := strings.Repeat("x", 1000)
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: "old"},
+		{Role: provider.RoleAssistant, Content: "old reply"},
+		{Role: provider.RoleUser, Content: huge},
+	}
+
+	out := TrimToByteBudget(msgs, 10)
+
+	require.Len(t, out, 1, "the last turn is never dropped, even over budget")
+	assert.Equal(t, huge, out[0].Content)
+}
+
+// TestTrimToByteBudget_CountsToolCallArgumentsTowardTheBudget proves a tool
+// call's own Args count toward the byte budget, not just Content: an
+// assistant message that invoked a tool typically has empty Content (see
+// Message.ToolCalls' own doc comment), so a large write_file body or exec
+// command sitting only in Args must still be able to push an old turn over
+// budget and get dropped - otherwise it occupies real space in the request
+// sent to the model while going completely unbudgeted.
+func TestTrimToByteBudget_CountsToolCallArgumentsTowardTheBudget(t *testing.T) {
+	bigArgs := []byte(strings.Repeat("x", 200))
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: "old"},
+		{Role: provider.RoleAssistant, ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "write_file", Args: bigArgs}}},
+		{Role: provider.RoleTool, ToolCallID: "call_1", Content: "ok"},
+		{Role: provider.RoleUser, Content: "recent"},
+		{Role: provider.RoleAssistant, Content: "reply"},
+	}
+
+	out := TrimToByteBudget(msgs, 100)
+
+	require.Len(t, out, 2, "the tool-call turn's large Args must count toward the budget and get it dropped, leaving only the last turn")
+	assert.Equal(t, "recent", out[0].Content)
+	assert.Equal(t, "reply", out[1].Content)
+}
+
+func TestTrimToByteBudget_NoOpWhenUnderBudgetOrDisabled(t *testing.T) {
+	msgs := []provider.Message{
+		{Role: provider.RoleUser, Content: "1"},
+		{Role: provider.RoleAssistant, Content: "2"},
+	}
+	assert.Equal(t, msgs, TrimToByteBudget(msgs, 1_000_000))
+	assert.Equal(t, msgs, TrimToByteBudget(msgs, 0))
+	assert.Equal(t, msgs, TrimToByteBudget(msgs, -1))
+}
+
+// TestTrimToByteBudget_NeverOrphansGeneratedHistories runs the same
+// generated-history property test HardTrim's invariant tests use, but
+// through TrimToByteBudget alone: since it only ever drops whole turns from
+// output HardTrim already produced, it must never reintroduce an orphaned
+// tool_calls id or a leading non-user message.
+func TestTrimToByteBudget_NeverOrphansGeneratedHistories(t *testing.T) {
+	rng := rand.New(rand.NewSource(4))
+
+	for i := 0; i < 200; i++ {
+		turnCount := rng.Intn(15) + 1
+		history := HardTrim(genHistory(rng, turnCount), 0)
+
+		maxBytes := rng.Intn(400) // includes 0 (disables the trim)
+		out := TrimToByteBudget(history, maxBytes)
+
+		assertNoOrphans(t, out)
+		assertSequentialPairing(t, out)
+	}
+}
+
+// TestHardTrim_InvariantsHoldOverGeneratedHistories is a property-style
+// test: trimming a randomly generated, but structurally valid, history to
+// any maxTurns must never start the result with a tool message and must
+// never leave an assistant tool_calls id
 // without its matching tool row.
 func TestHardTrim_InvariantsHoldOverGeneratedHistories(t *testing.T) {
 	rng := rand.New(rand.NewSource(1))

@@ -7,15 +7,16 @@ import "time"
 // its value here.
 //
 // agent.model is deliberately left empty: there is no hardcoded default
-// model, so validate.go requires the user (or `onboard`, in a later phase)
-// to set one explicitly rather than silently picking a model that may
-// change or go away.
+// model, so validate.go requires the user (directly, or via `mtclaw
+// onboard`) to set one explicitly rather than silently picking a model that
+// may change or go away.
 func Default() *Config {
 	return &Config{
 		Version: 1,
 		Agent: AgentConfig{
-			Name:            "MTClaw",
-			Temperature:     0.7,
+			Name: "MTClaw",
+			// Temperature is left nil: no built-in default is sent unless
+			// the user sets one (see AgentConfig.Temperature's comment).
 			MaxIterations:   20,
 			MaxHistoryTurns: 40,
 			Workspace:       "~/mtclaw-workspace",
@@ -31,7 +32,7 @@ func Default() *Config {
 				Enabled:  true,
 				TokenEnv: "TELEGRAM_BOT_TOKEN",
 				Groups: map[string]TelegramGroupConfig{
-					"*": {RequireMention: true},
+					"*": {RequireMention: Bool(true)},
 				},
 			},
 		},

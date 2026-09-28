@@ -24,7 +24,7 @@ func (c *Client) Complete(ctx context.Context, req provider.Request) (*provider.
 
 	completion, err := c.sdk.Chat.Completions.New(ctx, params)
 	if err != nil {
-		return nil, classify(err)
+		return nil, classify(ctx, err)
 	}
 
 	return fromSDK(completion)
@@ -32,9 +32,8 @@ func (c *Client) Complete(ctx context.Context, req provider.Request) (*provider.
 
 // ProbeResult reports the outcome of a minimal reachability check against
 // the configured OpenAI endpoint. It never carries the API key: only the
-// base URL, model, latency, and a possible error are exposed. `doctor`
-// (phase 9) is the intended caller; wiring it up is deliberately out of
-// scope for this phase.
+// base URL, model, latency, and a possible error are exposed. `doctor` is
+// the intended caller.
 type ProbeResult struct {
 	BaseURL string
 	Model   string
@@ -42,14 +41,17 @@ type ProbeResult struct {
 	Err     error
 }
 
-// Probe issues one minimal completion (max_tokens capped low) against model
-// to confirm the configured endpoint and credentials are reachable.
+// Probe issues one minimal completion (output capped low, via
+// max_completion_tokens) against model to confirm the configured endpoint and
+// credentials are reachable. max_completion_tokens, not the deprecated
+// max_tokens, since gpt-5 and the o-series reject max_tokens outright - a
+// probe that used it would report a working endpoint as unreachable.
 func (c *Client) Probe(ctx context.Context, model string) ProbeResult {
 	start := time.Now()
 	_, err := c.sdk.Chat.Completions.New(ctx, openaisdk.ChatCompletionNewParams{
-		Model:     model,
-		Messages:  []openaisdk.ChatCompletionMessageParamUnion{openaisdk.UserMessage("ping")},
-		MaxTokens: param.NewOpt(int64(1)),
+		Model:               model,
+		Messages:            []openaisdk.ChatCompletionMessageParamUnion{openaisdk.UserMessage("ping")},
+		MaxCompletionTokens: param.NewOpt(int64(1)),
 	})
 
 	result := ProbeResult{
@@ -58,7 +60,7 @@ func (c *Client) Probe(ctx context.Context, model string) ProbeResult {
 		Latency: time.Since(start),
 	}
 	if err != nil {
-		result.Err = classify(err)
+		result.Err = classify(ctx, err)
 	}
 	return result
 }

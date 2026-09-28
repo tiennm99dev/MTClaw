@@ -42,7 +42,6 @@ type SessionStore interface {
 	// Delete removes the session and, via ON DELETE CASCADE, its messages
 	// and approvals. exec_audit rows referencing it are preserved.
 	Delete(ctx context.Context, id string) error
-	SetSummary(ctx context.Context, id, summary string) error
 	AddUsage(ctx context.Context, id string, prompt, completion int) error
 }
 
@@ -82,9 +81,13 @@ type ApprovalStore interface {
 	// approval was already decided or expired, and ErrNotFound if id does
 	// not exist.
 	Decide(ctx context.Context, id, state, by string) error
-	// ExpirePending moves every pending approval whose expiry is before now
-	// to state=expired, returning the number expired.
-	ExpirePending(ctx context.Context, now time.Time) (int, error)
+	// ExpirePending moves every pending approval on channel whose expiry is
+	// before now to state=expired, returning the number expired. channel is
+	// the same value Approval.Channel was created with (e.g. "telegram"):
+	// scoping the sweep to the caller's own channel means a second channel
+	// writing pending rows into this same table in the future cannot have
+	// its still-live approvals swept by a sibling channel's startup sweep.
+	ExpirePending(ctx context.Context, now time.Time, channel string) (int, error)
 }
 
 // AuditStore is an append-only writer for the exec audit trail.
@@ -98,8 +101,6 @@ type AuditStore interface {
 
 // CronRunStore records cron run history. A row's status is one of ok,
 // error, skipped, or interrupted (see ExpireStarted for the last).
-// migrations/001_init.sql's own column comment predates "interrupted" and
-// still lists only ok|error|skipped; it needs the same update.
 type CronRunStore interface {
 	// Append inserts r, assigning ID and StartedAt when they are zero.
 	Append(ctx context.Context, r *CronRun) error

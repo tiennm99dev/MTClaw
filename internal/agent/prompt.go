@@ -13,9 +13,9 @@ import (
 	"github.com/tiennm99/MTClaw/internal/provider"
 )
 
-// Build assembles the system prompt fresh for one turn, in the fixed order
-// documented in phase 4: identity, workspace, tool guidance (generated from
-// tools, never hand-maintained), exec policy posture, the contents of every
+// Build assembles the system prompt fresh for one turn, in a fixed order:
+// identity, workspace, tool guidance (generated from tools, never
+// hand-maintained), exec policy posture, the contents of every
 // agent.system_prompt_files entry, then conventions. log may be nil.
 func Build(cfg config.Config, tools []provider.ToolSpec, now time.Time, log *slog.Logger) string {
 	if log == nil {
@@ -90,7 +90,7 @@ func writePromptFiles(b *strings.Builder, paths []string, log *slog.Logger) {
 	for _, p := range paths {
 		content, err := readPromptFile(p)
 		if err != nil {
-			log.Warn(err.Error(), "path", p)
+			log.Warn("system prompt file skipped", "path", p, "error", err)
 			continue
 		}
 		if content == nil {

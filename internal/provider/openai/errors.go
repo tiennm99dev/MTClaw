@@ -18,22 +18,23 @@ import (
 // empty (see that function's comment).
 const codeContextLengthExceeded = "context_length_exceeded"
 
-// classify maps an error returned by the SDK into provider.Error. Context
-// cancellation is checked first - it can occur independent of any HTTP
-// response - then the SDK's *openai.Error is inspected for HTTP status and
-// error code. Anything else (a raw network error, for instance) falls back
-// to provider.Classify.
+// classify maps an error returned by the SDK into provider.Error. ctx decides
+// cancellation (see provider.Classify's comment on why the error's shape
+// alone cannot: an http.Client.Timeout also produces a DeadlineExceeded-
+// shaped error with ctx still healthy). Once cancellation is ruled out, the
+// SDK's *openai.Error is inspected for HTTP status and error code. Anything
+// else (a raw network error, for instance) falls back to provider.Classify.
 //
 // Retries: the SDK already retried transient failures per
 // option.WithMaxRetries before returning; classify only runs once the SDK
 // has given up, so ErrTransient here means "still failing after retries",
 // not "retry again yourself".
-func classify(err error) *provider.Error {
+func classify(ctx context.Context, err error) *provider.Error {
 	if err == nil {
 		return nil
 	}
 
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+	if ctx != nil && ctx.Err() != nil {
 		return &provider.Error{Kind: provider.ErrCanceled, Msg: err.Error(), Err: err}
 	}
 
@@ -58,45 +59,44 @@ func classify(err error) *provider.Error {
 			// would permanently deny the loop's trim-and-retry recovery
 			// the exact backends base_url is meant to support.
 			return &provider.Error{Kind: provider.ErrContextLength, Status: status, Msg: msg, Err: err}
-		case status == 404, status == 422:
-			// A permanent fault in the request itself: 404 model_not_found
-			// (a typo'd or retired agent.model), 422 for a malformed
-			// payload. Retrying will not fix these.
+		case status == 400, status == 404, status == 422:
+			// A permanent fault in the request itself, not covered by the
+			// context-length case above: 400 for anything else, 404
+			// model_not_found (a typo'd or retired agent.model), 422 for a
+			// malformed payload. Retrying will not fix these.
 			return &provider.Error{Kind: provider.ErrBadRequest, Status: status, Msg: msg, Err: err}
-		case status == 400:
-			// Any other 400 not covered by the context-length case above.
-			return &provider.Error{Kind: provider.ErrBadRequest, Status: status, Msg: msg, Err: err}
-		case status == 408, status == 409, status == 425:
-			// Request timeout, conflict, and too-early: the caller may
-			// retry, same as a 5xx.
-			return &provider.Error{Kind: provider.ErrTransient, Status: status, Msg: msg, Err: err}
 		default:
-			// Any other 4xx and 5xx.
+			// 408/409/425 and every other 4xx/5xx: the caller may retry,
+			// same as a plain 5xx. Nothing downstream branches on Kind
+			// beyond ErrCanceled and ErrContextLength (see Error(), which
+			// folds Kind and Status into the message so the taxonomy still
+			// reaches a log even without a dedicated consumer), so a wider
+			// case list here would only be more branches to keep in sync.
 			return &provider.Error{Kind: provider.ErrTransient, Status: status, Msg: msg, Err: err}
 		}
 	}
 
-	return provider.Classify(err)
+	return provider.Classify(ctx, err)
 }
 
 // isContextLengthError reports whether apiErr represents a context-window
-// overflow. The stable error code is the primary signal, since it survives
-// OpenAI rewording the message. base_url is a documented config knob that
-// can point at any OpenAI-compatible endpoint (vLLM, llama.cpp, proxies,
-// ...), and those routinely return a 400 with an empty Code for the same
-// condition; when Code is empty, fall back to matching common overflow
-// phrasing in the message so the agent loop's trim-and-retry recovery still
-// fires against those backends instead of degrading to a permanent
-// ErrBadRequest on every such backend.
+// overflow. The stable error code is authoritative when OpenAI itself sets
+// it. base_url is a documented config knob that can point at any
+// OpenAI-compatible endpoint (vLLM, llama.cpp, proxies, ...), and those
+// routinely send a *numeric* "code": 400, which the SDK decodes into
+// apiErr.Code == "400" - a value that is present but not
+// codeContextLengthExceeded, so it must not short-circuit the message check
+// the way an empty Code used to. Whenever Code is anything other than the
+// OpenAI-defined value, the message is checked instead, so the agent loop's
+// trim-and-retry recovery still fires against those backends instead of
+// degrading to a permanent ErrBadRequest.
 func isContextLengthError(apiErr *openaisdk.Error) bool {
 	if apiErr.Code == codeContextLengthExceeded {
 		return true
 	}
-	if apiErr.Code != "" {
-		return false
-	}
 	msg := strings.ToLower(apiErr.Message)
 	return strings.Contains(msg, "context_length") ||
 		strings.Contains(msg, "context length") ||
-		strings.Contains(msg, "maximum context length")
+		strings.Contains(msg, "context size") ||
+		strings.Contains(msg, "context window")
 }

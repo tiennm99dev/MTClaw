@@ -105,8 +105,8 @@ func (a *approvalStore) Decide(ctx context.Context, id, state, by string) error 
 	return store.ErrAlreadyDecided
 }
 
-func (a *approvalStore) ExpirePending(ctx context.Context, now time.Time) (int, error) {
-	res, err := a.db.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE state = 'pending' AND expires_at < ?`, toMillis(now))
+func (a *approvalStore) ExpirePending(ctx context.Context, now time.Time, channel string) (int, error) {
+	res, err := a.db.ExecContext(ctx, `UPDATE approvals SET state = 'expired' WHERE state = 'pending' AND channel = ? AND expires_at < ?`, channel, toMillis(now))
 	if err != nil {
 		return 0, fmt.Errorf("expire pending approvals: %w", err)
 	}

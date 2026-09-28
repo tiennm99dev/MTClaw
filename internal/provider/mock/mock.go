@@ -1,6 +1,5 @@
 // Package mock provides a scripted provider.Provider for testing the agent
-// loop and everything downstream of it (phases 4-9) without any network
-// access.
+// loop and everything downstream of it without any network access.
 package mock
 
 import (
@@ -44,7 +43,7 @@ var _ provider.Provider = (*Provider)(nil)
 // reported as an error rather than a panic or a silently repeated step.
 func (p *Provider) Complete(ctx context.Context, req provider.Request) (*provider.Response, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, provider.Classify(err)
+		return nil, provider.Classify(ctx, err)
 	}
 
 	p.mu.Lock()

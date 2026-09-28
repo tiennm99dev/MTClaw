@@ -40,7 +40,7 @@ func (e *ValidationErrors) add(path, format string, args ...any) {
 }
 
 // Validate checks cfg against every structural and semantic rule in the
-// phase 1 schema, accumulating all failures instead of stopping at the
+// config schema, accumulating all failures instead of stopping at the
 // first one. It assumes paths have already been expanded (ExpandPath) and
 // secrets already resolved (resolveSecrets); it never writes to the
 // filesystem, and the only filesystem read is a stat walk up storage.path's
@@ -55,6 +55,7 @@ func Validate(cfg *Config) error {
 	validateTools(cfg, errs)
 	validateCron(cfg, errs)
 	validateStorage(cfg, errs)
+	validateLog(cfg, errs)
 
 	if errs.Len() == 0 {
 		return nil
@@ -79,8 +80,8 @@ func validateAgent(cfg *Config, errs *ValidationErrors) {
 	if a.MaxHistoryTurns < 2 {
 		errs.add("agent.max_history_turns", "must be at least 2, got %d", a.MaxHistoryTurns)
 	}
-	if a.Temperature < 0 || a.Temperature > 2 {
-		errs.add("agent.temperature", "must be between 0 and 2, got %v", a.Temperature)
+	if a.Temperature != nil && (*a.Temperature < 0 || *a.Temperature > 2) {
+		errs.add("agent.temperature", "must be between 0 and 2, got %v", *a.Temperature)
 	}
 }
 
@@ -194,6 +195,24 @@ func validateTools(cfg *Config, errs *ValidationErrors) {
 	}
 }
 
+// isValidCronSchedule requires expr to be exactly 5 whitespace-separated
+// fields (minute hour day month weekday), or one of gronx's built-in
+// @macros (@daily, @hourly, ...), before ever calling gronx.IsValid. gronx
+// itself also accepts a 6-field (seconds-first) or 7-field (year-suffixed)
+// expression, but internal/cron's scheduler only ticks once per minute, so
+// a seconds-first expression would pass validation and then never fire (or
+// fire years late) with no signal that anything is wrong.
+func isValidCronSchedule(expr string) bool {
+	trimmed := strings.TrimSpace(expr)
+	if strings.HasPrefix(trimmed, "@") {
+		return gronx.IsValid(trimmed)
+	}
+	if len(strings.Fields(trimmed)) != 5 {
+		return false
+	}
+	return gronx.IsValid(trimmed)
+}
+
 func validateCron(cfg *Config, errs *ValidationErrors) {
 	if _, err := time.LoadLocation(cfg.Cron.Timezone); err != nil {
 		errs.add("cron.timezone", "invalid IANA timezone or \"Local\": %v", err)
@@ -222,8 +241,8 @@ func validateCron(cfg *Config, errs *ValidationErrors) {
 
 		if strings.TrimSpace(job.Schedule) == "" {
 			errs.add(path+".schedule", "job %q: schedule must not be empty", ref)
-		} else if !gronx.IsValid(job.Schedule) {
-			errs.add(path+".schedule", "job %q: invalid cron expression %q", ref, job.Schedule)
+		} else if !isValidCronSchedule(job.Schedule) {
+			errs.add(path+".schedule", "job %q: invalid cron expression %q (must be exactly 5 fields, or an @macro)", ref, job.Schedule)
 		}
 
 		if strings.TrimSpace(job.Prompt) == "" {
@@ -238,14 +257,22 @@ func validateCron(cfg *Config, errs *ValidationErrors) {
 			errs.add(path+".timeout", "job %q: timeout must be greater than 0, got %s", ref, job.Timeout.Std())
 		}
 
-		validateCronDeliverTo(cfg, path, ref, job.DeliverTo, errs)
+		// A disabled job (or cron turned off entirely) never fires, so its
+		// deliver_to is never dereferenced; skipping the reachability check
+		// for it means toggling channels.telegram.enabled: false to pause
+		// Telegram temporarily does not also make an unrelated, currently-
+		// inert cron job's config unloadable.
+		if cfg.Cron.Enabled && job.Enabled {
+			validateCronDeliverTo(cfg, path, ref, job.DeliverTo, errs)
+		}
 	}
 }
 
 // validateCronDeliverTo checks that a job's deliver_to actually reaches
 // somewhere reachable: without this, a config typo (an unlisted chat id, a
 // disabled channel) becomes an outbound message to an arbitrary chat, or a
-// job that fails to deliver at every run without any load-time signal.
+// job that fails to deliver at every run without any load-time signal. Only
+// called for a job that can actually fire (see validateCron).
 func validateCronDeliverTo(cfg *Config, path, ref string, d CronDeliverTo, errs *ValidationErrors) {
 	if strings.TrimSpace(d.Channel) == "" || strings.TrimSpace(d.ChatID) == "" {
 		errs.add(path+".deliver_to", "job %q: must set both channel and chat_id", ref)
@@ -283,6 +310,37 @@ func cronChatIDReachable(tg TelegramConfig, chatID string) bool {
 		}
 	}
 	return false
+}
+
+// validateLog rejects an unrecognized log.level or log.format outright,
+// matching every other enum field in this schema (tools.exec.mode,
+// cron.jobs[].session, ...): without this, a typo like "debgu" or "jsn"
+// loaded silently as "info"/"text" in internal/logging, with no signal that
+// anything was misspelled. The check is applied to a trimmed, lowercased
+// copy of each value, with "warning" accepted as an alias of "warn" - the
+// same normalization internal/logging.parseLevel and logging.New already
+// apply when actually using these values, so this must not reject a
+// spelling ("WARN", "log.level: warning", "log.format: JSON") that always
+// worked before this validation existed; only a genuine typo is new to
+// this.
+func validateLog(cfg *Config, errs *ValidationErrors) {
+	switch normalizeLogWord(cfg.Log.Level) {
+	case "debug", "info", "warn", "warning", "error":
+	default:
+		errs.add("log.level", `must be one of "debug", "info", "warn", "error" (case-insensitive; "warning" also accepted), got %q`, cfg.Log.Level)
+	}
+	switch normalizeLogWord(cfg.Log.Format) {
+	case "text", "json":
+	default:
+		errs.add("log.format", `must be one of "text", "json" (case-insensitive), got %q`, cfg.Log.Format)
+	}
+}
+
+// normalizeLogWord trims whitespace and lowercases s, so log.level/log.format
+// validation and internal/logging's own parsing always agree on what counts
+// as a recognized spelling.
+func normalizeLogWord(s string) string {
+	return strings.ToLower(strings.TrimSpace(s))
 }
 
 func validateStorage(cfg *Config, errs *ValidationErrors) {
