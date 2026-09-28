@@ -56,7 +56,7 @@ func testChannel(api *fakeBotAPI, deps Deps) *Channel {
 		api:      api,
 		cfg:      cfg,
 		deps:     deps,
-		approver: NewApprover(api, newFakeApprovalStore(), cfg.Channels.Telegram, time.Minute, discardLog()),
+		approver: newApprover(api, newFakeApprovalStore(), cfg.Channels.Telegram, time.Minute, discardLog()),
 		log:      discardLog(),
 		username: testBotUsername,
 		botID:    testBotID,
@@ -93,6 +93,51 @@ func TestHandleMessage_KnownCommandIsInterceptedNotForwarded(t *testing.T) {
 	deps.mu.Unlock()
 	assert.Equal(t, 1, resetCalls, "/new must call Deps.Reset")
 	require.NotEmpty(t, api.sent, "/new must reply directly")
+}
+
+// TestHandleMessage_CommandAddressedToAnotherBot_DroppedSilently proves
+// that in a group with require_mention off (privacy mode off), where this
+// bot sees every command, one explicitly addressed to a different bot
+// ("/new@OtherBot") is dropped rather than run as this bot's own command -
+// running it would let any allowlisted member wipe this bot's session
+// history, cancel its turn, or trigger any other command by typing another
+// bot's handle.
+func TestHandleMessage_CommandAddressedToAnotherBot_DroppedSilently(t *testing.T) {
+	api := &fakeBotAPI{}
+	deps := &fakeDeps{}
+	c := testChannel(api, deps)
+
+	out := make(chan channel.Inbound, 1)
+	c.handleMessage(context.Background(), privateMsg(1, "/new@SomeOtherBot"), out)
+
+	select {
+	case in := <-out:
+		t.Fatalf("a command addressed to another bot must not be forwarded to the agent loop either, got %+v", in)
+	default:
+	}
+	deps.mu.Lock()
+	resetCalls := deps.resetCalls
+	deps.mu.Unlock()
+	assert.Equal(t, 0, resetCalls, "/new@SomeOtherBot must never call this bot's Reset")
+	assert.Empty(t, api.sent, "a command for another bot gets no reply from this bot")
+}
+
+// TestHandleMessage_CommandAddressedToThisBot_StillRuns proves the
+// "@thisbot" suffix (the common case in a group without require_mention)
+// still runs normally - dropping a command addressed to another bot must
+// not also reject one correctly addressed to this bot.
+func TestHandleMessage_CommandAddressedToThisBot_StillRuns(t *testing.T) {
+	api := &fakeBotAPI{}
+	deps := &fakeDeps{}
+	c := testChannel(api, deps)
+
+	out := make(chan channel.Inbound, 1)
+	c.handleMessage(context.Background(), privateMsg(1, "/new@"+testBotUsername), out)
+
+	deps.mu.Lock()
+	resetCalls := deps.resetCalls
+	deps.mu.Unlock()
+	assert.Equal(t, 1, resetCalls, "/new@<thisbot> must still call Reset")
 }
 
 func TestHandleMessage_StopCommandCallsCancel(t *testing.T) {
@@ -134,14 +179,14 @@ func TestHandleMessage_UnrecognizedTextIsForwarded(t *testing.T) {
 	assert.Empty(t, api.sent, "forwarding must not itself reply")
 }
 
-// --- empty-text drop (M2) ---------------------------------------------------
+// --- empty-text drop ---------------------------------------------------------
 
 func TestHandleMessage_EmptyTextAfterGating_Dropped(t *testing.T) {
 	api := &fakeBotAPI{}
 	c := testChannel(api, nil)
 
 	out := make(chan channel.Inbound, 1)
-	// A sticker/photo with no caption: Decide accepts it (allowlisted
+	// A sticker/photo with no caption: decide accepts it (allowlisted
 	// sender, private chat) but Text is empty - nothing for the agent loop
 	// to act on.
 	c.handleMessage(context.Background(), privateMsg(1, ""), out)
@@ -172,7 +217,7 @@ func TestHandleMessage_CaptionForwardedWhenTextEmpty(t *testing.T) {
 	}
 }
 
-// --- callback routing (M5) --------------------------------------------------
+// --- callback routing ---------------------------------------------------------
 
 // blockingApprovalStore wraps fakeApprovalStore so its Get call blocks on
 // unblock, standing in for a slow/rate-limited approval decision.
@@ -186,10 +231,10 @@ func (b *blockingApprovalStore) Get(ctx context.Context, id string) (*store.Appr
 	return b.fakeApprovalStore.Get(ctx, id)
 }
 
-// TestPumpUpdates_CallbackDoesNotBlockMessagePump is the M5 regression test:
-// a slow-to-resolve CallbackQuery must not stall a Message update queued
-// right behind it - pumpUpdates must hand the callback to its own goroutine
-// rather than processing it inline.
+// TestPumpUpdates_CallbackDoesNotBlockMessagePump proves a slow-to-resolve
+// CallbackQuery must not stall a Message update queued right behind it -
+// pumpUpdates must hand the callback to its own goroutine rather than
+// processing it inline.
 func TestPumpUpdates_CallbackDoesNotBlockMessagePump(t *testing.T) {
 	unblock := make(chan struct{})
 	approvals := &blockingApprovalStore{fakeApprovalStore: newFakeApprovalStore(), unblock: unblock}
@@ -198,7 +243,7 @@ func TestPumpUpdates_CallbackDoesNotBlockMessagePump(t *testing.T) {
 	c := &Channel{
 		api:      api,
 		cfg:      &config.Config{Channels: config.ChannelsConfig{Telegram: cfg}},
-		approver: NewApprover(api, approvals, cfg, time.Minute, discardLog()),
+		approver: newApprover(api, approvals, cfg, time.Minute, discardLog()),
 		log:      discardLog(),
 		username: testBotUsername,
 		botID:    testBotID,
@@ -236,8 +281,8 @@ func TestPumpUpdates_CallbackDoesNotBlockMessagePump(t *testing.T) {
 	}
 }
 
-// TestPumpUpdates_TracksCallbackGoroutinesForWaiting is the M2 regression
-// test: pumpUpdates must track every callback-handling goroutine it spawns
+// TestPumpUpdates_TracksCallbackGoroutinesForWaiting proves pumpUpdates
+// tracks every callback-handling goroutine it spawns
 // in c.cbWG, so Start can wait for it to actually finish (inside the
 // gateway's shutdown drain window) instead of returning while a callback is
 // still touching the store.
@@ -249,7 +294,7 @@ func TestPumpUpdates_TracksCallbackGoroutinesForWaiting(t *testing.T) {
 	c := &Channel{
 		api:      api,
 		cfg:      &config.Config{Channels: config.ChannelsConfig{Telegram: cfg}},
-		approver: NewApprover(api, approvals, cfg, time.Minute, discardLog()),
+		approver: newApprover(api, approvals, cfg, time.Minute, discardLog()),
 		log:      discardLog(),
 		username: testBotUsername,
 		botID:    testBotID,

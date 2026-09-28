@@ -6,20 +6,20 @@ import (
 )
 
 // DefaultChunkLimit is Telegram's message length ceiling (4096 characters).
-// Split treats it as a byte-length ceiling: since every UTF-8 rune is at
+// split treats it as a byte-length ceiling: since every UTF-8 rune is at
 // least one byte, a chunk within this many bytes is always within it in
 // characters too, which is the safe direction to round on a boundary
 // Telegram itself enforces server-side.
 const DefaultChunkLimit = 4096
 
-// Split breaks text into chunks no longer than limit, in order, preferring
+// split breaks text into chunks no longer than limit, in order, preferring
 // to break at a paragraph boundary (a blank line), then a line boundary,
 // then a sentence end, then a hard cut - but never inside a fenced code
 // block: a fence that would otherwise straddle a chunk boundary is closed
 // at the end of one chunk and reopened with the same language tag at the
 // start of the next. limit <= 0 uses DefaultChunkLimit. An empty text
 // yields no chunks at all.
-func Split(text string, limit int) []string {
+func split(text string, limit int) []string {
 	if text == "" {
 		return nil
 	}
@@ -135,16 +135,29 @@ func parseSegments(text string) []segment {
 	return segs
 }
 
+// maxFenceLang bounds a fence's info string: a real language tag ("go",
+// "python3") is always short. A model-generated line starting with ``` but
+// running to thousands of bytes with no whitespace is not a fence at all as
+// far as chunking is concerned - treating it as one would force splitFence's
+// per-chunk budget down to almost nothing (every byte of the body becomes
+// its own chunk).
+const maxFenceLang = 64
+
 // fenceOpenLang reports whether line opens a fenced code block (a line
-// consisting of ``` followed by an optional, space-free language tag) and,
-// if so, returns that tag.
+// consisting of ``` followed by an optional, space-free, length-bounded
+// language tag - see maxFenceLang) and, if so, returns that tag. CommonMark
+// forbids a backtick anywhere in a backtick fence's info string (a line
+// like "```ls```" is not a fence opener at all, backticks included), so
+// rest is rejected on that basis too - otherwise "```ls```" would open a
+// fence with the literal lang "ls```" and read the rest of the message as
+// its contents.
 func fenceOpenLang(line string) (lang string, ok bool) {
 	trimmed := strings.TrimRight(line, "\r")
 	if !strings.HasPrefix(trimmed, "```") {
 		return "", false
 	}
 	rest := trimmed[3:]
-	if strings.ContainsAny(rest, " \t") {
+	if strings.ContainsAny(rest, " \t`") || len(rest) > maxFenceLang {
 		return "", false
 	}
 	return rest, true
@@ -193,12 +206,20 @@ func splitPlain(text string, limit int) []string {
 	var out []string
 	remaining := text
 	for len(remaining) > limit {
-		cut := bestPlainCut(remaining, limit)
+		cut, hardCut := bestPlainCut(remaining, limit)
 		out = append(out, remaining[:cut])
-		// The separator itself (blank line, newline, or the space after a
-		// sentence end) is dropped rather than kept on either side, so
-		// neither piece carries the boundary's whitespace as noise.
-		remaining = strings.TrimLeft(remaining[cut:], " \t\n")
+		rest := remaining[cut:]
+		if !hardCut {
+			// The separator itself (blank line, newline, or the space
+			// after a sentence end) is dropped rather than kept on either
+			// side, so neither piece carries the boundary's whitespace as
+			// noise. A hard cut consumed no separator - it landed wherever
+			// limit happened to fall - so nothing here is safe to drop:
+			// doing so would silently delete a content character (e.g. a
+			// literal space) that happened to sit right after the cut.
+			rest = strings.TrimLeft(rest, " \t\n")
+		}
+		remaining = rest
 	}
 	if remaining != "" {
 		out = append(out, remaining)
@@ -210,20 +231,23 @@ func splitPlain(text string, limit int) []string {
 // s (len(s) > limit is assumed), preferring - in order - the last
 // paragraph break, the last line break, the last sentence end, then a hard
 // cut at a valid rune boundary. The returned index excludes the separator
-// itself (splitPlain trims it off the next piece instead).
-func bestPlainCut(s string, limit int) int {
+// itself (splitPlain trims it off the next piece instead) for every case
+// but a hard cut, which consumes no separator at all - hardCut reports
+// which case fired, so splitPlain never trims content a hard cut did not
+// actually skip past.
+func bestPlainCut(s string, limit int) (cut int, hardCut bool) {
 	window := s[:limit]
 
 	if i := strings.LastIndex(window, "\n\n"); i > 0 {
-		return i
+		return i, false
 	}
 	if i := strings.LastIndex(window, "\n"); i > 0 {
-		return i
+		return i, false
 	}
 	if i := lastSentenceEnd(window); i > 0 {
-		return i
+		return i, false
 	}
-	return safeRuneCut(s, limit)
+	return safeRuneCut(s, limit), true
 }
 
 // lastSentenceEnd returns the index just after the last ". ", "! ", or "? "
@@ -262,21 +286,48 @@ func splitByLineThenHardCut(s string, limit int) []string {
 		out = append(out, strings.TrimRight(remaining[:cut], "\n"))
 		remaining = remaining[cut:]
 	}
-	out = append(out, remaining)
+	if remaining != "" {
+		// A cut that lands exactly on the end of s (the common case when
+		// the content divides evenly into limit-sized, newline-terminated
+		// pieces) leaves remaining empty here; the s == "" case at the top
+		// of this function already handles "no content at all", so an
+		// empty remaining at this point means every byte of s is already
+		// accounted for in out, and appending it would add a spurious
+		// trailing "" piece - which, one layer up in fitHTML, recurses on
+		// an unchanged chunk forever (splitFence emitting an "open\n\n\close"
+		// segment whose own len(pieces) != 1 restarts the same split with
+		// no shorter input).
+		out = append(out, remaining)
+	}
 	return out
 }
 
-// safeRuneCut returns the largest index <= limit that lands on a UTF-8 rune
-// boundary in s, so a hard cut never splits a multi-byte character.
+// safeRuneCut returns an index <= limit (or, if the very first rune is
+// itself wider than limit, just past it) that lands on a UTF-8 rune
+// boundary in s, so a hard cut never splits a multi-byte character. Unlike
+// scanning backward from limit, which can walk all the way to 0 and then
+// fall back to an arbitrary limit=1 cut (itself capable of landing
+// mid-rune, since byte 1 of a multi-byte rune is never a rune-start byte),
+// this decodes forward from the start of s and stops at the last full rune
+// that still fits within limit bytes - always a valid boundary, and always
+// > 0 for a non-empty s.
 func safeRuneCut(s string, limit int) int {
 	if limit >= len(s) {
 		return len(s)
 	}
-	for limit > 0 && !utf8.RuneStart(s[limit]) {
-		limit--
+	i := 0
+	for i < len(s) {
+		_, size := utf8.DecodeRuneInString(s[i:])
+		if i+size > limit {
+			break
+		}
+		i += size
 	}
-	if limit == 0 {
-		limit = 1
+	if i == 0 {
+		// The first rune alone is wider than limit (an unreasonably small
+		// limit): emit it whole rather than truncating mid-rune.
+		_, size := utf8.DecodeRuneInString(s)
+		i = size
 	}
-	return limit
+	return i
 }

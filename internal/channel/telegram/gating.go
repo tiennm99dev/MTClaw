@@ -10,12 +10,12 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 )
 
-// Decide is the whole access-control matrix, evaluated as a pure function
+// decide is the whole access-control matrix, evaluated as a pure function
 // of (config, bot identity, message) so it is entirely table-testable with
 // no bot, no network, and no update loop. Every rejection is silent by
 // design: the caller must not reply, react, or otherwise confirm the bot
 // exists to a sender that failed gating.
-func Decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *telego.Message) (accept bool, cleanText string, reason string) {
+func decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *telego.Message) (accept bool, cleanText string, reason string) {
 	if msg == nil {
 		return false, "", "nil message"
 	}
@@ -54,7 +54,7 @@ func Decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *tel
 			return false, "", "sender not in group (or channel) allow_from"
 		}
 
-		if !group.RequireMention {
+		if !group.MentionRequired() {
 			return true, text, ""
 		}
 

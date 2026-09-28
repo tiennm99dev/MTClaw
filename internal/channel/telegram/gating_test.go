@@ -28,10 +28,10 @@ func TestDecide_Matrix(t *testing.T) {
 	cfgWithGroups := config.TelegramConfig{
 		AllowFrom: []int64{100},
 		Groups: map[string]config.TelegramGroupConfig{
-			"-1001": {RequireMention: false},
-			"-1002": {RequireMention: true},
-			"-1003": {RequireMention: false, AllowFrom: []int64{200}},
-			"*":     {RequireMention: true},
+			"-1001": {RequireMention: config.Bool(false)},
+			"-1002": {RequireMention: config.Bool(true)},
+			"-1003": {RequireMention: config.Bool(false), AllowFrom: []int64{200}},
+			"*":     {RequireMention: config.Bool(true)},
 		},
 	}
 
@@ -228,7 +228,7 @@ func TestDecide_Matrix(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			accept, text, reason := Decide(tc.cfg, testBotUsername, testBotID, tc.msg)
+			accept, text, reason := decide(tc.cfg, testBotUsername, testBotID, tc.msg)
 			assert.Equal(t, tc.wantAccept, accept)
 			if tc.wantAccept {
 				assert.Equal(t, tc.wantText, text)
@@ -240,9 +240,44 @@ func TestDecide_Matrix(t *testing.T) {
 	}
 }
 
+// TestDecide_GroupOmittingRequireMentionStillRequiresOne proves a listed
+// group entry that never sets require_mention at all (the Go zero value for
+// the old plain-bool field would have been "false") still defaults to
+// requiring a mention, matching "*"'s own documented default - a config
+// author who lists one group entry (say, to set its own allow_from) must
+// not silently turn mention-gating off for it.
+func TestDecide_GroupOmittingRequireMentionStillRequiresOne(t *testing.T) {
+	cfg := config.TelegramConfig{
+		AllowFrom: []int64{100},
+		Groups: map[string]config.TelegramGroupConfig{
+			"-1001": {AllowFrom: []int64{100}}, // require_mention deliberately omitted
+		},
+	}
+
+	noMention := &telego.Message{
+		Chat: telego.Chat{ID: -1001, Type: "supergroup"},
+		From: &telego.User{ID: 100},
+		Text: "hello",
+	}
+	accept, _, reason := decide(cfg, testBotUsername, testBotID, noMention)
+	assert.False(t, accept, "an omitted require_mention key must still gate on mention, not default to false")
+	assert.NotEmpty(t, reason)
+
+	withMention := &telego.Message{
+		Chat:     telego.Chat{ID: -1001, Type: "supergroup"},
+		From:     &telego.User{ID: 100},
+		Text:     "@mtclawbot hello",
+		Entities: []telego.MessageEntity{mentionEntity(0, 10)},
+	}
+	accept, text, reason := decide(cfg, testBotUsername, testBotID, withMention)
+	assert.True(t, accept)
+	assert.Equal(t, "hello", text)
+	assert.Empty(t, reason)
+}
+
 func TestDecide_PositiveGroupIDConfigIsSimplyAnUnmatchedKey(t *testing.T) {
-	// Phase 1 validation is responsible for rejecting a positive-ID group
-	// key at config load time; Decide itself just treats it as any other
+	// config.Validate is responsible for rejecting a positive-ID group key
+	// at config load time; decide itself just treats it as any other
 	// string key that will not match a real (negative) supergroup id, so
 	// gating itself never has to special-case it.
 	cfg := config.TelegramConfig{
@@ -255,14 +290,14 @@ func TestDecide_PositiveGroupIDConfigIsSimplyAnUnmatchedKey(t *testing.T) {
 		From: &telego.User{ID: 100},
 		Text: "hello",
 	}
-	accept, _, reason := Decide(cfg, testBotUsername, testBotID, msg)
+	accept, _, reason := decide(cfg, testBotUsername, testBotID, msg)
 	assert.False(t, accept)
 	assert.NotEmpty(t, reason)
 }
 
-// TestDecide_CaptionUsedWhenTextIsEmpty is the M2 regression test: a
+// TestDecide_CaptionUsedWhenTextIsEmpty proves a
 // captioned photo (Text is always empty on media messages; the caption
-// lives in a separate field) must not gate through as blank text - Decide
+// lives in a separate field) must not gate through as blank text - decide
 // falls back to Caption so a captioned photo addressed to the bot is not
 // silently treated as having nothing to say.
 func TestDecide_CaptionUsedWhenTextIsEmpty(t *testing.T) {
@@ -272,7 +307,7 @@ func TestDecide_CaptionUsedWhenTextIsEmpty(t *testing.T) {
 		From:    &telego.User{ID: 100},
 		Caption: "what is this?",
 	}
-	accept, text, reason := Decide(cfg, testBotUsername, testBotID, msg)
+	accept, text, reason := decide(cfg, testBotUsername, testBotID, msg)
 	assert.True(t, accept)
 	assert.Equal(t, "what is this?", text)
 	assert.Empty(t, reason)
@@ -284,7 +319,7 @@ func TestDecide_CaptionUsedWhenTextIsEmpty(t *testing.T) {
 func TestDecide_CaptionEntitiesUsedForMentionDetection(t *testing.T) {
 	cfg := config.TelegramConfig{
 		Groups: map[string]config.TelegramGroupConfig{
-			"-1001": {RequireMention: true, AllowFrom: []int64{100}},
+			"-1001": {RequireMention: config.Bool(true), AllowFrom: []int64{100}},
 		},
 	}
 	msg := &telego.Message{
@@ -293,7 +328,7 @@ func TestDecide_CaptionEntitiesUsedForMentionDetection(t *testing.T) {
 		Caption:         "@mtclawbot look at this",
 		CaptionEntities: []telego.MessageEntity{mentionEntity(0, len("@mtclawbot"))},
 	}
-	accept, text, reason := Decide(cfg, testBotUsername, testBotID, msg)
+	accept, text, reason := decide(cfg, testBotUsername, testBotID, msg)
 	assert.True(t, accept)
 	assert.Equal(t, "look at this", text)
 	assert.Empty(t, reason)
@@ -308,7 +343,7 @@ func TestDecide_TextTakesPriorityOverCaption(t *testing.T) {
 		From: &telego.User{ID: 100},
 		Text: "hello there",
 	}
-	accept, text, _ := Decide(cfg, testBotUsername, testBotID, msg)
+	accept, text, _ := decide(cfg, testBotUsername, testBotID, msg)
 	assert.True(t, accept)
 	assert.Equal(t, "hello there", text)
 }

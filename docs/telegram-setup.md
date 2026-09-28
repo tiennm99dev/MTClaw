@@ -83,16 +83,23 @@ channels:
         allow_from: []   # empty inherits channels.telegram.allow_from
 ```
 
+Writing a `groups:` map of your own entirely replaces the built-in
+`{"*": {require_mention: true}}` default, `"*"` included - if you still want
+a fallback entry for any group not listed by chat ID, add your own `"*"` key
+alongside the ones above.
+
 Get a group's chat ID the same way as a user ID: send `/whoami` in that
 group once the bot is a member (privacy mode considerations from step 2
 apply to whether the bot even sees the command).
 
 ## 5. `require_mention` behavior
 
-`require_mention` (default `true`, applied via the `"*"` key that every
-group not otherwise listed inherits) controls whether the bot must be
-`@mentioned` or replied-to in a group chat before it treats a message as
-directed at it:
+`require_mention` defaults to `true` for **every** group entry that omits
+the key - not just the built-in `"*"` default a group not otherwise listed
+inherits, but also any group you list yourself (say, to set its own
+`allow_from`) without also writing `require_mention` for it. It controls
+whether the bot must be `@mentioned` or replied-to in a group chat before it
+treats a message as directed at it:
 
 - `true` (default): only messages that `@mention` the bot, or that reply
   directly to one of the bot's own messages, are forwarded to the agent
@@ -107,3 +114,29 @@ for a group message to reach the agent loop: the sender must be on the
 effective allowlist for that group (`channels.telegram.groups.<id>.allow_from`
 if non-empty, otherwise `channels.telegram.allow_from`), **and** the message
 must satisfy `require_mention` if it is set for that group.
+
+## 6. Bot commands
+
+The bot understands a fixed set of commands itself, handled directly by the
+channel rather than forwarded to the agent loop as ordinary text:
+
+| Command | Effect |
+|---|---|
+| `/start`, `/help` | Show what the bot can do. |
+| `/new` | Start a fresh conversation in this chat. If a turn is already running in this session, `/new` cancels it first, then resets - the canceled turn's own end-of-turn flush is guaranteed to finish before the reset runs, so the fresh conversation never starts with the canceled turn's messages still in its history. |
+| `/status` | Show this session's message count, tokens, and model. |
+| `/whoami` | Show your user id and this chat's id - the value `channels.telegram.allow_from` and `channels.telegram.groups` expect. |
+| `/stop` | Cancel the in-flight turn, if any, without starting a new session. |
+
+## 7. Messages in flight when the gateway restarts
+
+MTClaw keeps queued and in-progress messages in memory only, not in the
+database: a message the bot has already acknowledged to Telegram but not
+yet answered (waiting in the inbound queue, or waiting behind another
+message in the same chat's turn) is lost if the gateway process restarts
+before it is processed - a deploy, an update, a crash. Telegram itself has
+already marked that update delivered, so the bot never asks for it again,
+and the sender gets no reply and no error. If this happens, just send the
+message again once the gateway is back up. A future release may add a
+"restarting, resend your last message" notice for messages dropped this
+way; today there is none.

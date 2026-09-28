@@ -50,9 +50,9 @@ type Channel struct {
 
 // New constructs a Channel from a resolved token (cfg.Channels.Telegram.Token()
 // must already be non-empty; Load's secret resolution is what fills it in).
-// deps may be nil - the gateway (phase 7) supplies it once a session
-// backend and cancel registry exist; until then, bot commands that need it
-// degrade to an explanatory reply instead of panicking.
+// deps is the gateway's session backend and cancel registry for bot
+// commands ("/new", "/status", "/stop"); the gateway always supplies a real
+// one, and a test exercising those commands supplies its own fake.
 //
 // It never passes telego.WithDefaultDebugLogger (that option's own docs warn
 // it can log the bot token) and instead wires botLogger: Debugf is a no-op,
@@ -81,37 +81,42 @@ func New(cfg *config.Config, approvals store.ApprovalStore, deps Deps, log *slog
 		deps: deps,
 		log:  log,
 	}
-	ch.approver = NewApprover(bot, approvals, cfg.Channels.Telegram, cfg.Tools.Exec.ApprovalTimeout.Std(), log)
+	ch.approver = newApprover(bot, approvals, cfg.Channels.Telegram, cfg.Tools.Exec.ApprovalTimeout.Std(), log)
 	return ch, nil
 }
 
-// SendOnce constructs a bot directly from token and sends one message,
-// without building a full Channel (no approver, no store involved at all).
-// This is what `mtclaw send` (a one-shot outbound message, useful for
-// scripts and for verifying a token before running the gateway) uses
-// instead of standing up a Channel.
-func SendOnce(ctx context.Context, token, chatID, threadID, text string) error {
+// oneShotBot constructs a *telego.Bot directly from token, with no channel,
+// approver, or store involved at all - the shared shape behind SendOnce,
+// GetMe, and CaptureSenders, none of which stand up a full Channel.
+func oneShotBot(token string) (*telego.Bot, error) {
 	if token == "" {
-		return fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
+		return nil, fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
 	}
 	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
 	if err != nil {
-		return fmt.Errorf("telegram: construct bot: %w", err)
+		return nil, fmt.Errorf("telegram: construct bot: %w", err)
+	}
+	return bot, nil
+}
+
+// SendOnce sends one message via a one-shot bot. This is what `mtclaw send`
+// (a one-shot outbound message, useful for scripts and for verifying a
+// token before running the gateway) uses instead of standing up a Channel.
+func SendOnce(ctx context.Context, token, chatID, threadID, text string) error {
+	bot, err := oneShotBot(token)
+	if err != nil {
+		return err
 	}
 	return sendText(ctx, bot, chatID, threadID, text, "")
 }
 
-// GetMe constructs a bot directly from token and returns its username,
-// without building a full Channel - the same one-shot shape as SendOnce,
-// used by `mtclaw doctor`'s Telegram getMe check and `onboard`'s bot-identity
-// confirmation (phase 9) instead of standing up a Channel.
+// GetMe returns a one-shot bot's username, used by `mtclaw doctor`'s
+// Telegram getMe check and `mtclaw onboard`'s bot-identity confirmation
+// instead of standing up a Channel.
 func GetMe(ctx context.Context, token string) (username string, err error) {
-	if token == "" {
-		return "", fmt.Errorf("telegram: no bot token resolved; set channels.telegram.token_env or token_file")
-	}
-	bot, err := telego.NewBot(token, telego.WithDiscardLogger())
+	bot, err := oneShotBot(token)
 	if err != nil {
-		return "", fmt.Errorf("telegram: construct bot: %w", err)
+		return "", err
 	}
 	me, err := bot.GetMe(ctx)
 	if err != nil {
@@ -124,11 +129,11 @@ func GetMe(ctx context.Context, token string) (username string, err error) {
 func (c *Channel) Name() string { return "telegram" }
 
 // Approver exposes the Telegram inline-button tools.Approver this channel
-// built, for the gateway (phase 7) to wire into the tool registry.
+// built, for the gateway to wire into the tool registry.
 func (c *Channel) Approver() tools.Approver { return c.approver }
 
-// Send delivers text to chatID, chunked and MarkdownV2-formatted with a
-// plain-text fallback; see send.go.
+// Send delivers text to chatID, chunked and rendered as Telegram HTML with
+// a plain-text fallback on a parse-mode rejection; see send.go.
 func (c *Channel) Send(ctx context.Context, chatID, threadID, text, replyTo string) error {
 	return sendText(ctx, c.api, chatID, threadID, text, replyTo)
 }
@@ -187,8 +192,8 @@ func (c *Channel) Start(ctx context.Context, out chan<- channel.Inbound) error {
 // leaving a revoked token or a sustained network failure silently retried
 // forever with zero log output. Errorf routes to slog's Warn level, not
 // Error: telego calls it for every failed API call, not just polling, so
-// cases this package already recovers from on its own (a MarkdownV2 400
-// that triggers the plain-text fallback, a 429 that gets retried,
+// cases this package already recovers from on its own (an HTML parse-mode
+// 400 that triggers the plain-text fallback, a 429 that gets retried,
 // editMessageText's harmless "message is not modified") would otherwise
 // each log an ERROR line for a request that ultimately succeeded.
 type botLogger struct {

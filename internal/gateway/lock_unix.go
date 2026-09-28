@@ -28,9 +28,16 @@ func Acquire(path string) (release func() error, err error) {
 		pid, _ := readLockPID(path)
 		f.Close()
 		if pid > 0 {
-			return nil, fmt.Errorf("gateway: another instance is already running (pid %d); remove %s if this is wrong", pid, path)
+			// flock is kernel-enforced and self-releasing: the only way this
+			// lock is held is a live process holding an open fd on it, so
+			// removing the file (advice that fits Windows' PID-file scheme,
+			// not this one) would just let a second gateway flock a fresh
+			// inode - two pollers double-firing cron and racing Telegram's
+			// getUpdates against each other. Stopping the real holder is the
+			// only way to actually clear this.
+			return nil, fmt.Errorf("gateway: another instance is already running (pid %d); stop pid %d first", pid, pid)
 		}
-		return nil, fmt.Errorf("gateway: another instance is already running; remove %s if this is wrong", path)
+		return nil, fmt.Errorf("gateway: another instance is already running; find and stop it first (its pid could not be read from %s)", path)
 	}
 
 	if err := writeLockPID(f); err != nil {

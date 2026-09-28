@@ -29,20 +29,23 @@ const maxSendAttempts = 5
 // retrying a 5xx response once.
 const transientRetryDelay = 1 * time.Second
 
-// escapedPart is one already-escaped piece ready to send, paired with the
-// plain (unescaped) text sendOne falls back to on a parse-mode rejection.
-type escapedPart struct {
-	escaped string
-	plain   string
+// htmlPart is one Telegram HTML string guaranteed to fit within the caller's
+// byte limit, paired with the plain-text source it was rendered from -
+// sendOne falls back to plain on an HTML parse-mode rejection instead of
+// dropping the reply.
+type htmlPart struct {
+	html  string
+	plain string
 }
 
-// sendText chunks text (see Split), escapes each chunk for MarkdownV2, and
-// sends the result serially, falling back to no parse_mode on an HTTP 400
-// that names parsing (or the message being too long) as the problem. Only
-// the first part carries replyTo, since a multi-part reply is one logical
-// message split across several Telegram messages, not a chain of
-// independent quotes. threadID, when non-empty, is applied to every part so
-// a forum-topic reply stays entirely inside its topic.
+// sendText chunks text (see split), renders each chunk to Telegram HTML
+// (see renderHTML), and sends the result serially, falling back to no
+// parse_mode on an HTTP 400 that names parsing (or the message being too
+// long) as the problem. Only the first part carries replyTo, since a
+// multi-part reply is one logical message split across several Telegram
+// messages, not a chain of independent quotes. threadID, when non-empty, is
+// applied to every part so a forum-topic reply stays entirely inside its
+// topic.
 func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo string) error {
 	if text == "" {
 		return nil
@@ -53,19 +56,19 @@ func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo s
 	}
 	tid := parseThreadID(threadID)
 
-	var parts []escapedPart
-	for _, chunk := range Split(text, DefaultChunkLimit) {
-		parts = append(parts, escapeChunk(chunk, DefaultChunkLimit)...)
-	}
+	parts := renderChunks(text, DefaultChunkLimit)
 
 	for i, part := range parts {
-		params := tu.Message(tu.ID(id), part.escaped).WithParseMode(telego.ModeMarkdownV2)
+		params := tu.Message(tu.ID(id), part.html).WithParseMode(telego.ModeHTML)
 		if tid != 0 {
 			params = params.WithMessageThreadID(tid)
 		}
 		if i == 0 && replyTo != "" {
 			if mid, err := strconv.Atoi(replyTo); err == nil {
-				params = params.WithReplyParameters(&telego.ReplyParameters{MessageID: mid})
+				params = params.WithReplyParameters(&telego.ReplyParameters{
+					MessageID:                mid,
+					AllowSendingWithoutReply: true,
+				})
 			}
 		}
 
@@ -82,31 +85,72 @@ func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo s
 	return nil
 }
 
-// escapeChunk escapes chunk (a piece Split already bounded to limit bytes
-// *before* escaping) for MarkdownV2 and, if the escaped result still
-// exceeds limit, re-splits the plain chunk at a reduced limit and recurses -
-// EscapeMarkdownV2 can insert a backslash before every character, so a
-// chunk within Split's own bound can still cross the wire limit only after
-// escaping. The reduced limit is sized to the inflation ratio actually
-// observed, with a guaranteed-safe floor (limit/2) for a pathological chunk
-// whose escaped length is close to double: no character escapes to more
-// than two bytes, so halving the plain-text budget always fits.
-//
-// Termination is not automatic: Split(chunk, reduced) is only guaranteed to
-// shrink the input for ordinary text and ordinary fences. A fence whose
-// opening line's info string alone is longer than limit makes splitFence
-// clamp its budget to 1 byte, so every piece it emits is
-// overhead-dominated and, for a short enough inner body, comes back
-// identical to chunk - recursing on that would never terminate. The
-// len(pieces) == 1 && no-shorter guard below detects exactly that case and
-// falls back to a raw hard cut instead of recursing again.
-func escapeChunk(chunk string, limit int) []escapedPart {
-	escaped := EscapeMarkdownV2(chunk)
-	if len(escaped) <= limit {
-		return []escapedPart{{escaped: escaped, plain: chunk}}
+// renderChunks splits text into markdown-source chunks (split) and renders
+// each to HTML, verifying every rendered chunk actually fits limit bytes -
+// HTML tag overhead (especially a fenced code block's <pre><code
+// class="language-x">) can inflate a chunk that fit as raw Markdown past
+// the limit, so split's boundary is a starting point, not a guarantee. A
+// part with no visible content once its tags are stripped (an empty fence
+// "```\n```", or a hard-cut piece that landed on whitespace) is dropped
+// instead of sent: Telegram rejects it with a 400 "message text is empty",
+// whose description names neither "parse" nor "too long", so nothing in
+// sendOne would otherwise recover from it, and every chunk after it in the
+// reply would be silently dropped along with it.
+func renderChunks(text string, limit int) []htmlPart {
+	var out []htmlPart
+	for _, chunk := range split(text, limit) {
+		for _, part := range fitHTML(chunk, limit) {
+			if isVisiblyEmpty(part.html) {
+				continue
+			}
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+// stripHTMLTags removes every "<...>" span from html, leaving only its text
+// content. This is safe specifically for this package's own output (not a
+// general HTML sanitizer): renderHTML always escapes a literal '<' or '>'
+// found in real content to "&lt;"/"&gt;" before it ever reaches here, so
+// every unescaped '<' or '>' still present is one of the tags - <b>, <i>,
+// <code>, <pre>, <a href="...">, and their closes - this renderer itself
+// emitted.
+func stripHTMLTags(html string) string {
+	var b strings.Builder
+	inTag := false
+	for _, r := range html {
+		switch {
+		case r == '<':
+			inTag = true
+		case r == '>':
+			inTag = false
+		case !inTag:
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// isVisiblyEmpty reports whether html has no visible content once its tags
+// are stripped - see renderChunks for why such a part must never be sent.
+func isVisiblyEmpty(html string) bool {
+	return strings.TrimSpace(stripHTMLTags(html)) == ""
+}
+
+// fitHTML renders chunk and, if the result exceeds limit, re-splits chunk
+// (at a budget scaled to the inflation ratio just observed) and recurses -
+// preferring split's markdown-aware boundaries for as long as they keep
+// shrinking the input, and falling back to hardCutHTMLParts only once they
+// stop making progress (a single token whose rendered form cannot be
+// shortened by cutting elsewhere in the surrounding text).
+func fitHTML(chunk string, limit int) []htmlPart {
+	html := renderHTML(chunk)
+	if len(html) <= limit {
+		return []htmlPart{{html: html, plain: chunk}}
 	}
 
-	reduced := limit * len(chunk) / len(escaped)
+	reduced := limit * len(chunk) / len(html)
 	if reduced <= 0 || reduced >= limit {
 		reduced = limit / 2
 	}
@@ -114,46 +158,88 @@ func escapeChunk(chunk string, limit int) []escapedPart {
 		reduced = 1
 	}
 
-	pieces := Split(chunk, reduced)
-	if len(pieces) == 1 && len(pieces[0]) >= len(chunk) {
-		return hardCutParts(chunk, limit)
+	pieces := split(chunk, reduced)
+	if !allPiecesShrink(pieces, chunk) {
+		return hardCutHTMLParts(chunk, limit)
 	}
 
-	var out []escapedPart
+	var out []htmlPart
 	for _, piece := range pieces {
-		out = append(out, escapeChunk(piece, limit)...)
+		out = append(out, fitHTML(piece, limit)...)
 	}
 	return out
 }
 
-// hardCutParts splits chunk into limit-byte, rune-safe pieces without any
-// regard for fence or paragraph structure, and returns each as an
-// unescaped escapedPart (escaped == plain): escapeChunk's last resort when
-// Split itself cannot make the input any shorter, so recursion is
-// guaranteed to make progress instead of looping forever. Sending an
-// unescaped piece under MarkdownV2 risks one extra parse-error round trip -
-// sendOne already falls back to plain text on that - which is a small price
-// for a chunk that is otherwise unsendable at all.
-func hardCutParts(chunk string, limit int) []escapedPart {
-	var out []escapedPart
-	remaining := chunk
-	for len(remaining) > limit {
-		cut := safeRuneCut(remaining, limit)
-		out = append(out, escapedPart{escaped: remaining[:cut], plain: remaining[:cut]})
-		remaining = remaining[cut:]
+// allPiecesShrink reports whether split actually made progress: every piece
+// must be strictly shorter than chunk, or fitHTML's recursion above has no
+// guarantee of terminating - a piece at least as long as chunk (split
+// finding no boundary to cut at, or returning chunk unchanged alongside a
+// spurious empty piece) would recurse on the same input forever, ending in
+// a stack overflow no recover() can catch. len(pieces) == 0 can only happen
+// for chunk == "" and reports false too, since fitHTML above already
+// returns before ever reaching here in that case (rendering "" fits any
+// positive limit).
+func allPiecesShrink(pieces []string, chunk string) bool {
+	if len(pieces) == 0 {
+		return false
 	}
-	if remaining != "" {
-		out = append(out, escapedPart{escaped: remaining, plain: remaining})
+	for _, p := range pieces {
+		if len(p) >= len(chunk) {
+			return false
+		}
+	}
+	return true
+}
+
+// hardCutHTMLParts is fitHTML's last resort: it cuts chunk into rune-safe
+// pieces with no markdown awareness at all, escaping each as plain text (no
+// tags, so escaping is the only thing that can inflate it) and shrinking
+// the cut point whenever escaping still pushes a piece over limit - e.g. a
+// run of bare "&" characters, which each expand to "&amp;" (5 bytes) - so
+// every emitted piece is verified to fit, not assumed to.
+func hardCutHTMLParts(chunk string, limit int) []htmlPart {
+	var out []htmlPart
+	remaining := chunk
+	for len(remaining) > 0 {
+		cut := safeRuneCut(remaining, limit)
+		for cut > 0 {
+			piece := remaining[:cut]
+			html := escapeHTMLText(piece)
+			if len(html) <= limit {
+				out = append(out, htmlPart{html: html, plain: piece})
+				remaining = remaining[cut:]
+				break
+			}
+			next := safeRuneCut(remaining, cut-1)
+			if next >= cut {
+				// A single rune's escaped form alone exceeds limit (an
+				// unreasonably small limit): emit it anyway instead of
+				// looping forever: Telegram will reject a limit this small
+				// regardless of what this function does.
+				out = append(out, htmlPart{html: html, plain: piece})
+				remaining = remaining[cut:]
+				break
+			}
+			cut = next
+		}
 	}
 	return out
 }
 
 // sendOne sends one already-built SendMessageParams, retrying on a 429 by
 // honoring retry_after, retrying once on a 5xx API error, and falling back
-// to plain (unescaped, no parse_mode) text on an HTTP 400 whose description
-// names parsing or message length as the problem - the model's output is
-// not reliably valid (or short enough) MarkdownV2, and the message must
-// still be delivered even when it is not.
+// to plain (unescaped, no parse_mode) text on any HTTP 400 while parse_mode
+// is set - the model's output is not reliably valid HTML (an unbalanced or
+// unsupported tag nesting, an href Telegram's parser happens to reject),
+// and the message must still be delivered even when it is not. This used to
+// require the error's description to mention "parse" or "too long", but
+// Telegram's exact wording is not a documented, stable contract, and a 400
+// that names neither (e.g. "message text is empty") would otherwise never
+// retry and would drop every later chunk of the reply. Falling back
+// unconditionally on 400 is safe: the retried attempt clears ParseMode, so
+// this same branch cannot fire on it again, and a 400 caused by something
+// parse_mode cannot fix (an invalid chat id) simply reproduces the same
+// error with ParseMode already empty, returned to the caller as normal.
 //
 // A non-API (network-level) error is deliberately not retried: unlike a
 // 5xx, Telegram may have already accepted and delivered the message before
@@ -177,8 +263,7 @@ func sendOne(ctx context.Context, api botAPI, params *telego.SendMessageParams, 
 				}
 				continue
 			}
-			if apiErr.ErrorCode == http.StatusBadRequest && params.ParseMode != "" &&
-				(strings.Contains(strings.ToLower(apiErr.Description), "parse") || strings.Contains(strings.ToLower(apiErr.Description), "too long")) {
+			if apiErr.ErrorCode == http.StatusBadRequest && params.ParseMode != "" {
 				fallback := *params
 				fallback.ParseMode = ""
 				fallback.Text = plain
@@ -227,8 +312,7 @@ func parseThreadID(threadID string) int {
 
 // sendTyping issues one sendChatAction: typing call. Telegram's typing
 // indicator expires after ~5s; callers that want it to persist for a long
-// turn are responsible for calling this again every ~4s (see the phase 6
-// plan's send.go step) - this function only issues one occurrence.
+// turn are responsible for calling this again every ~4s.
 func sendTyping(ctx context.Context, api botAPI, chatID, threadID string) error {
 	id, err := strconv.ParseInt(chatID, 10, 64)
 	if err != nil {

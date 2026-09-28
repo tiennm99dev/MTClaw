@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/adhocore/gronx"
@@ -50,8 +49,7 @@ type Scheduler struct {
 
 	mu        sync.Mutex
 	lastFired map[string]string // job name -> wallClockMinuteLayout key
-
-	running map[string]*atomic.Bool // job name -> in-flight flag; fixed set, built once at construction
+	running   map[string]bool   // job name -> in-flight overlap-guard flag
 }
 
 // New builds a Scheduler over jobs, evaluated against loc. enqueue is
@@ -66,10 +64,6 @@ func New(jobs []Job, loc *time.Location, runs store.CronRunStore, sessions store
 	if now == nil {
 		now = time.Now
 	}
-	running := make(map[string]*atomic.Bool, len(jobs))
-	for _, j := range jobs {
-		running[j.Name] = &atomic.Bool{}
-	}
 	return &Scheduler{
 		jobs:      jobs,
 		loc:       loc,
@@ -80,7 +74,7 @@ func New(jobs []Job, loc *time.Location, runs store.CronRunStore, sessions store
 		gron:      gronx.New(),
 		now:       now,
 		lastFired: make(map[string]string, len(jobs)),
-		running:   running,
+		running:   make(map[string]bool, len(jobs)),
 	}
 }
 
@@ -157,7 +151,15 @@ func (s *Scheduler) Start(ctx context.Context) {
 // minutes right after lastTick - now two hours stale - while the job due
 // just before now is never evaluated at all. Returns now, the new lastTick.
 func (s *Scheduler) tickWithCatchUp(now, lastTick time.Time) time.Time {
-	if gap := now.Sub(lastTick); gap > missedTickThreshold {
+	// Round(0) strips each Time's monotonic reading before Sub compares
+	// them: with both readings present, Sub uses the monotonic clock only
+	// (per the time package's own docs), and the monotonic clock does not
+	// advance during host suspend (Linux CLOCK_MONOTONIC, macOS, Windows
+	// alike). A gap computed on wall-clock time is what actually reflects a
+	// multi-hour suspend or an NTP step; comparing monotonic readings would
+	// report only the wall-clock-suspended duration as the gap and this
+	// catch-up path would never trigger for the one case it exists for.
+	if gap := now.Round(0).Sub(lastTick.Round(0)); gap > missedTickThreshold {
 		s.log.Warn("cron: missed tick detected; catching up skipped minutes", "gap", gap.String())
 		start := lastTick.Truncate(time.Minute).Add(time.Minute)
 		earliest := now.Truncate(time.Minute).Add(-maxCatchUpMinutes * time.Minute)
@@ -198,7 +200,7 @@ func (s *Scheduler) tick(now time.Time) {
 			// do not fire - never silently treat an evaluation error as
 			// "not due".
 			s.log.Error("cron: evaluate schedule failed; not firing", "job", job.Name, "schedule", job.Schedule, "error", err)
-			s.recordRun(job.Name, "", "error", err.Error(), local, local)
+			s.recordRun(job.Name, "", "error", err.Error(), local)
 			continue
 		}
 		if !due {
@@ -214,11 +216,15 @@ func (s *Scheduler) tick(now time.Time) {
 //  1. Minute de-dup: skip silently (no cron_runs row - this is not a new
 //     event, just the same due minute observed again) if job already fired
 //     for this wall-clock minute.
-//  2. Overlap: CAS the per-job running flag; if a prior fire is still in
-//     flight, record a "skipped" row and return.
+//  2. Overlap: check-and-set the per-job running flag under s.mu; if a
+//     prior fire is still in flight, record a "skipped" row and return.
 //
-// lastFired is set before enqueueing, per the phase spec, so a second tick
-// landing before the turn even starts still sees the minute as handled.
+// lastFired is set before enqueueing, so a second tick landing before the
+// turn even starts still sees the minute as handled. Both guards share one
+// mutex (not a mutex plus a separate atomic per job) since the minute
+// check and the running-flag claim must already be one critical section:
+// splitting them would let two ticks both pass the minute check before
+// either claims the flag.
 func (s *Scheduler) tryFire(job Job, local time.Time) {
 	key := local.Format(wallClockMinuteLayout)
 
@@ -227,24 +233,41 @@ func (s *Scheduler) tryFire(job Job, local time.Time) {
 		s.mu.Unlock()
 		return
 	}
-	running := s.running[job.Name]
-	if !running.CompareAndSwap(false, true) {
+	if s.running[job.Name] {
 		s.mu.Unlock()
-		s.recordRun(job.Name, "", "skipped", "", local, local)
+		s.recordRun(job.Name, "", "skipped", "", local)
 		return
 	}
+	s.running[job.Name] = true
 	s.lastFired[job.Name] = key
 	s.mu.Unlock()
 
 	s.fire(job, local)
 }
 
+// clearRunning releases job's overlap-guard flag under s.mu, letting a
+// later tick fire it again.
+func (s *Scheduler) clearRunning(jobName string) {
+	s.mu.Lock()
+	s.running[jobName] = false
+	s.mu.Unlock()
+}
+
+// cronStoreTimeout bounds every store call the scheduler makes outside a
+// dispatched turn (session resolution, cron_runs bookkeeping): these run on
+// the scheduler's own ticker goroutine, not a session worker, so an
+// unbounded context.Background() call would let a held write lock (a
+// manual `mtclaw cron run`, a backup holding the database's write lock)
+// wedge every future tick indefinitely instead of just this one failing.
+const cronStoreTimeout = 10 * time.Second
+
 // fire resolves the job's session, writes a "started" cron_runs row, and
 // enqueues the synthetic turn. Any failure resolving the session or writing
 // the row is logged and, in the session-resolution case, releases the
 // running flag immediately (there is nothing in flight to clear it later).
 func (s *Scheduler) fire(job Job, local time.Time) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), cronStoreTimeout)
+	defer cancel()
 
 	threadID := ""
 	if job.Ephemeral {
@@ -254,8 +277,8 @@ func (s *Scheduler) fire(job Job, local time.Time) {
 	sess, err := s.sessions.Ensure(ctx, "cron", job.chatID(), threadID)
 	if err != nil {
 		s.log.Error("cron: ensure session failed; not firing", "job", job.Name, "error", err)
-		s.recordRun(job.Name, "", "error", fmt.Sprintf("ensure session: %v", err), local, local)
-		s.running[job.Name].Store(false)
+		s.recordRun(job.Name, "", "error", fmt.Sprintf("ensure session: %v", err), local)
+		s.clearRunning(job.Name)
 		return
 	}
 
@@ -287,18 +310,21 @@ func (s *Scheduler) fire(job Job, local time.Time) {
 // result independent of the session row.
 func (s *Scheduler) onDone(job Job, runID int64, sessionID string) func(error) {
 	return func(turnErr error) {
-		defer s.running[job.Name].Store(false)
+		defer s.clearRunning(job.Name)
+
+		ctx, cancel := context.WithTimeout(context.Background(), cronStoreTimeout)
+		defer cancel()
 
 		status, errMsg := "ok", ""
 		if turnErr != nil {
 			status, errMsg = "error", turnErr.Error()
 		}
-		if err := s.runs.Finish(context.Background(), runID, status, errMsg, time.Now()); err != nil {
+		if err := s.runs.Finish(ctx, runID, status, errMsg, time.Now()); err != nil {
 			s.log.Error("cron: finish run row failed", "job", job.Name, "run_id", runID, "error", err)
 		}
 
 		if job.Ephemeral {
-			if err := s.sessions.Delete(context.Background(), sessionID); err != nil {
+			if err := s.sessions.Delete(ctx, sessionID); err != nil {
 				s.log.Error("cron: delete ephemeral session failed", "job", job.Name, "session_id", sessionID, "error", err)
 			}
 		}
@@ -307,12 +333,14 @@ func (s *Scheduler) onDone(job Job, runID int64, sessionID string) func(error) {
 
 // recordRun appends a cron_runs row for an event that never became an
 // in-flight turn (an evaluation error, or an overlap skip), so both started
-// and finished are the same instant. Store failures are logged, never
+// and finished are the same instant (at). Store failures are logged, never
 // propagated - losing a history row must never stop or crash the
 // scheduler.
-func (s *Scheduler) recordRun(jobName, sessionID, status, errMsg string, started, finished time.Time) {
-	run := &store.CronRun{JobName: jobName, SessionID: sessionID, Status: status, Error: errMsg, StartedAt: started, FinishedAt: &finished}
-	if err := s.runs.Append(context.Background(), run); err != nil {
+func (s *Scheduler) recordRun(jobName, sessionID, status, errMsg string, at time.Time) {
+	ctx, cancel := context.WithTimeout(context.Background(), cronStoreTimeout)
+	defer cancel()
+	run := &store.CronRun{JobName: jobName, SessionID: sessionID, Status: status, Error: errMsg, StartedAt: at, FinishedAt: &at}
+	if err := s.runs.Append(ctx, run); err != nil {
 		s.log.Error("cron: append run row failed", "job", jobName, "status", status, "error", err)
 	}
 }

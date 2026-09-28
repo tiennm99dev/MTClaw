@@ -11,10 +11,10 @@ import (
 	"github.com/tiennm99/MTClaw/internal/agent"
 )
 
-// TestProgressReporter_ReusedToolCallID_StopsPriorTimer is the L5 regression
-// test: a second EventToolStarted for a tool call id already tracked must
-// stop the earlier timer before replacing it, so a provider reusing an id
-// within one turn cannot leak a stray "running X..." notice.
+// TestProgressReporter_ReusedToolCallID_StopsPriorTimer proves a second
+// EventToolStarted for a tool call id already tracked stops the earlier
+// timer before replacing it, so a provider reusing an id within one turn
+// cannot leak a stray "running X..." notice.
 func TestProgressReporter_ReusedToolCallID_StopsPriorTimer(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()

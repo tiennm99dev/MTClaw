@@ -86,10 +86,10 @@ func testJob(name, schedule string) Job {
 // --- gronx contract ----------------------------------------------------------
 
 // TestGronxContract_IsDueIsInstanceMethodReturningError pins down the exact
-// API shape the phase plan got wrong once already: IsDue is a method on a
-// *gronx.Gronx instance (not a package function) and returns (bool, error);
-// a malformed expression must surface as a non-nil error, never a silently
-// false "not due".
+// API shape this package depends on: IsDue is a method on a *gronx.Gronx
+// instance (not a package function) and returns (bool, error); a malformed
+// expression must surface as a non-nil error, never a silently false "not
+// due".
 func TestGronxContract_IsDueIsInstanceMethodReturningError(t *testing.T) {
 	g := gronx.New()
 
@@ -227,12 +227,39 @@ func TestScheduler_TickWithCatchUp_LogsAWarningOnlyWhenCatchingUp(t *testing.T) 
 	assert.Contains(t, buf.String(), "missed tick")
 }
 
-// TestScheduler_TickWithCatchUp_ReplaysRecentMinutesNotOldestOnes is the M3
-// regression test: after a 2-hour gap, catch-up must evaluate the minutes
-// closest to now, not the ones right after the stale lastTick - a job due 3
-// minutes ago must fire, while a job that was only due right after
-// lastTick (now two hours in the past, outside the bounded window) must
-// not.
+// TestScheduler_TickWithCatchUp_MonotonicReadingsStillDetectTheGap proves
+// tickWithCatchUp still works when now/lastTick are the shape a real
+// ticker loop actually produces - time.Now() plus Add, which (unlike every
+// other test in this file, built from time.Date literals) carries a
+// monotonic reading. This cannot reproduce an actual host suspend inside a
+// hermetic unit test: Add shifts a Time's wall and monotonic readings by
+// the same amount, whereas a real suspend advances only the wall clock,
+// leaving the monotonic clock reading almost unchanged (Linux
+// CLOCK_MONOTONIC, macOS, and Windows all pause it) - Go's time package
+// exposes no public way to construct that mismatch outside of an actual
+// clock discontinuity. tick's own gap computation strips the monotonic
+// reading first (now.Round(0).Sub(lastTick.Round(0))) specifically so that
+// real suspend case is handled correctly in production, per Time.Sub's own
+// documented monotonic-vs-wall-clock behavior; this test is the coverage
+// guard that the fix does not regress the ordinary, non-suspended case.
+func TestScheduler_TickWithCatchUp_MonotonicReadingsStillDetectTheGap(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("every-minute", "* * * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	lastTick := time.Now()
+	now := lastTick.Add(2 * time.Hour) // still carries a monotonic reading, unlike a time.Date literal
+
+	s.tickWithCatchUp(now, lastTick)
+	assert.GreaterOrEqual(t, fe.count(), 2, "a 2-hour gap between monotonic-bearing times must still trigger catch-up, not just the arriving tick")
+}
+
+// TestScheduler_TickWithCatchUp_ReplaysRecentMinutesNotOldestOnes proves
+// that after a 2-hour gap, catch-up evaluates the minutes closest to now,
+// not the ones right after the stale lastTick - a job due 3 minutes ago
+// must fire, while a job that was only due right after lastTick (now two
+// hours in the past, outside the bounded window) must not.
 func TestScheduler_TickWithCatchUp_ReplaysRecentMinutesNotOldestOnes(t *testing.T) {
 	st := newTestStore(t)
 	fe := &fakeEnqueue{autoComplete: true}

@@ -1,10 +1,9 @@
 // Package gateway wires the long-running mtclaw gateway process: it takes
 // inbound messages off one channel, serializes them per chat session while
 // running different sessions concurrently, bounds total concurrent turns,
-// and drains cleanly on shutdown. See
-// plans/260731-2219-mtclaw-core-system/phase-07-gateway-orchestration.md for
-// the full design rationale, in particular the worker reap/enqueue race
-// this package's dispatch/runWorker pair is built to avoid.
+// and drains cleanly on shutdown. See dispatch's own doc comment for the
+// worker reap/enqueue race this package's dispatch/runWorker pair is built
+// to avoid.
 package gateway
 
 import (
@@ -33,10 +32,10 @@ const idleSessionTimeout = 5 * time.Minute
 // performance knob.
 const globalConcurrency = 4
 
-// sessionBusyReply is sent once, and the triggering message dropped, when a
-// session's own queue is already full: an honest "still working" answer
-// instead of silence, which would look indistinguishable from the bot being
-// broken.
+// sessionBusyReply is sent once per overflow burst, and the triggering
+// message dropped, when a session's own queue is already full: an honest
+// "still working" answer instead of silence, which would look
+// indistinguishable from the bot being broken.
 const sessionBusyReply = "still working on the previous message, try again shortly"
 
 // turnErrorReply is sent when a turn ends with an error that produced no
@@ -71,6 +70,11 @@ type Channel interface {
 type worker struct {
 	key   string
 	queue chan channel.Inbound
+	// control carries a func to run on this worker's own goroutine, between
+	// turns - see dispatcher.runOnWorker. Unbuffered: the sender blocks
+	// until runWorker actually picks it up, which is how the caller knows
+	// fn will not race a turn already in flight.
+	control chan func()
 
 	// closing is set, under dispatcher.mu, by the worker itself right
 	// before it deletes itself from dispatcher.workers and returns. The
@@ -81,12 +85,18 @@ type worker struct {
 	// cancel is the in-flight turn's CancelFunc, non-nil only while a turn
 	// is actually running. /stop reads and calls it under dispatcher.mu.
 	cancel context.CancelFunc
+	// busyNotified is set under dispatcher.mu the first time this worker's
+	// queue overflows, and cleared the next time it actually dequeues a
+	// message - so a burst of overflowing messages gets exactly one "still
+	// working" reply instead of one per dropped message, and a later,
+	// separate burst still gets its own notice.
+	busyNotified bool
 }
 
 // dispatcher owns the worker map, the cancellation registry (folded into
 // each worker's cancel field), and the global concurrency semaphore. It has
 // no idea a "gateway" or a "channel" concept beyond the small Channel
-// interface it depends on, and no idea cron (phase 8) exists - Inbound's
+// interface it depends on, and no idea cron exists - Inbound's
 // DeliverTo/Timeout/OnDone fields are honored generically.
 type dispatcher struct {
 	store   store.Store
@@ -109,10 +119,17 @@ type dispatcher struct {
 
 	wg sync.WaitGroup // tracks every worker goroutine, for shutdown drain
 
-	// rootCtx is the context every turn's own context is derived from,
-	// so canceling it (shutdown) cancels every in-flight turn too. It
-	// defaults to context.Background() so a dispatcher built directly in
-	// tests works without a Gateway.Run wrapping it.
+	// replyWG tracks every detached reply goroutine runTurn spawns (see
+	// reply below), separately from wg: a reply is intentionally not part
+	// of wg (so a slow multi-chunk send never looks like a drain-deadline
+	// breach), but shutdown must still give it a bounded chance to finish
+	// before the process exits - see drainReplies in shutdown.go.
+	replyWG sync.WaitGroup
+
+	// rootCtx is the context every turn's own context is derived from, so
+	// canceling it (shutdown) cancels every in-flight turn too. It defaults
+	// to context.Background() so a dispatcher built directly in tests works
+	// without start (below) wrapping it.
 	rootCtx context.Context
 }
 
@@ -143,6 +160,15 @@ func newDispatcher(st store.Store, ch Channel, runner turnRunner, log *slog.Logg
 	}
 }
 
+// start gives the dispatcher's shutdown transition a single entry point:
+// it sets rootCtx and arranges for closeForShutdown to run exactly once
+// rootCtx ends, so a caller (Gateway.Run) never has to hand-write that
+// goroutine itself.
+func (d *dispatcher) start(ctx context.Context) {
+	d.rootCtx = ctx
+	context.AfterFunc(ctx, d.closeForShutdown)
+}
+
 // sessionKey identifies the one worker/queue an inbound message serializes
 // against: two concurrent turns in the same chat interleave tool side
 // effects and produce conflicting history writes, so channel+chat+thread is
@@ -153,7 +179,7 @@ func sessionKey(channelName, chatID, threadID string) string {
 }
 
 // pump reads every message off in and dispatches it until in closes or ctx
-// is done. It is the dispatcher's only reader of the global inbound queue.
+// is done. It is the dispatcher's only reader of the inbound queue.
 func (d *dispatcher) pump(ctx context.Context, in <-chan channel.Inbound) {
 	for {
 		select {
@@ -189,21 +215,10 @@ func (d *dispatcher) pump(ctx context.Context, in <-chan channel.Inbound) {
 // as a miss and a fresh worker is spawned instead.
 func (d *dispatcher) dispatch(in channel.Inbound) {
 	in = wrapOnDone(in)
-	if err := d.rootCtx.Err(); err != nil {
-		// Fast path: shutdown already canceled rootCtx by the time this
-		// unsynchronized read happened, so there is nothing to gain by
-		// spawning a worker just to drop it - fail the message now. This
-		// check alone is not the correctness guarantee against spawning
-		// after drain's wg.Wait() has begun unblocking (it races
-		// closeForShutdown); the d.closed check below, taken under the same
-		// lock as the spawn decision, is.
-		callOnDone(in, err)
-		return
-	}
 	key := sessionKey(in.Channel, in.ChatID, in.ThreadID)
 
 	d.mu.Lock()
-	if d.closed {
+	if d.closed || d.rootCtx.Err() != nil {
 		d.mu.Unlock()
 		callOnDone(in, d.rootCtx.Err())
 		return
@@ -213,18 +228,25 @@ func (d *dispatcher) dispatch(in channel.Inbound) {
 		w = d.spawnWorkerLocked(key)
 	}
 	sent := trySend(w.queue, in)
+	notify := false
+	if !sent && !w.busyNotified {
+		w.busyNotified = true
+		notify = true
+	}
 	d.mu.Unlock()
 
 	if !sent {
 		callOnDone(in, errSessionQueueFull)
-		d.replySessionBusy(in)
+		if notify {
+			d.replySessionBusyAsync(in)
+		}
 	}
 }
 
-// closeForShutdown marks the dispatcher closed under d.mu. Callers must
-// invoke this once, as soon as rootCtx ends and before waiting on d.wg (see
-// Gateway.Run), so dispatch's spawn decision can observe it in time to
-// close the wg.Add/wg.Wait race described on the closed field itself.
+// closeForShutdown marks the dispatcher closed under d.mu. Called
+// automatically once rootCtx ends (see start); dispatch's spawn decision
+// checks this under the same lock so a message arriving after shutdown has
+// begun can never spawn a worker doomed to be dropped.
 func (d *dispatcher) closeForShutdown() {
 	d.mu.Lock()
 	d.closed = true
@@ -263,7 +285,7 @@ func callOnDone(in channel.Inbound, err error) {
 // spawnWorkerLocked creates and starts a new worker for key. Callers must
 // already hold d.mu.
 func (d *dispatcher) spawnWorkerLocked(key string) *worker {
-	w := &worker{key: key, queue: make(chan channel.Inbound, sessionQueueSize)}
+	w := &worker{key: key, queue: make(chan channel.Inbound, sessionQueueSize), control: make(chan func())}
 	d.workers[key] = w
 	d.wg.Add(1)
 	go d.runWorker(w)
@@ -279,14 +301,51 @@ func (d *dispatcher) runWorker(w *worker) {
 	defer timer.Stop()
 
 	for {
+		// A pending control func (runOnWorker - today, only /new's Reset)
+		// must win over an already-queued message: Go's select picks
+		// pseudo-randomly among every ready case below, and a queued
+		// message winning that pick would run a whole turn - including a
+		// full approval wait - against history /new is about to delete,
+		// while also blocking the update pump's synchronous Reset call for
+		// as long as that turn takes. Checking control first, non-blocking,
+		// makes that pick deterministic instead of a coin flip.
+		select {
+		case fn := <-w.control:
+			fn()
+			continue
+		default:
+		}
+
 		select {
 		case in, ok := <-w.queue:
 			if !ok {
 				return
 			}
+			d.mu.Lock()
+			w.busyNotified = false
+			d.mu.Unlock()
+
+			if err := d.rootCtx.Err(); err != nil {
+				// select can pick a ready queue receive over a ready
+				// rootCtx.Done() case at random (Go's own select semantics),
+				// so a message already queued when shutdown begins can reach
+				// here even though the gateway is already shutting down.
+				// Running it would only produce a canceled-context error out
+				// of Ensure; report the same terminal signal
+				// drainQueueOnDone gives a never-dequeued message, with no
+				// log noise for what is normal shutdown behavior, and keep
+				// draining the rest of the queue instead of returning
+				// immediately.
+				callOnDone(in, err)
+				continue
+			}
+
 			drainTimer(timer)
 			d.runTurn(w, in)
 			timer.Reset(d.idleTimeout)
+
+		case fn := <-w.control:
+			fn()
 
 		case <-timer.C:
 			d.mu.Lock()
@@ -318,21 +377,26 @@ func (d *dispatcher) runWorker(w *worker) {
 			w.closing = true
 			delete(d.workers, w.key)
 			d.mu.Unlock()
-			d.drainQueueOnDone(w)
+			d.drainQueueOnDone(w, d.rootCtx.Err())
 			return
 		}
 	}
 }
 
-// drainQueueOnDone fires OnDone (if set) for every message still sitting in
-// w.queue when the worker exits at shutdown without ever processing them -
-// otherwise those Inbounds vanish silently with their caller's OnDone never
-// invoked, which for a cron job means its overlap-guard flag never clears.
-func (d *dispatcher) drainQueueOnDone(w *worker) {
+// drainQueueOnDone fires OnDone (if set, with err) for every message still
+// sitting in w.queue, without ever processing them - otherwise those
+// Inbounds vanish silently with their caller's OnDone never invoked, which
+// for a cron job means its overlap-guard flag never clears. Used both when
+// a worker exits at shutdown (err is d.rootCtx.Err()) and by runOnWorker
+// (err is context.Canceled), which drops anything queued behind the turn
+// it just canceled before running its own fn - a queued message the worker
+// had not started yet is otherwise left to run against history /new is
+// about to delete.
+func (d *dispatcher) drainQueueOnDone(w *worker, err error) {
 	for {
 		select {
 		case in := <-w.queue:
-			callOnDone(in, d.rootCtx.Err())
+			callOnDone(in, err)
 		default:
 			return
 		}
@@ -368,33 +432,58 @@ func (d *dispatcher) cancelSession(key string) bool {
 	return true
 }
 
-// runTurn acquires the global concurrency slot, runs one turn end to end,
-// and delivers the reply. It never returns an error itself: every failure
-// mode (session lookup, the turn, the send) is logged and, where it affects
-// the user, turned into a chat reply instead.
-func (d *dispatcher) runTurn(w *worker, in channel.Inbound) {
+// runOnWorker cancels key's in-flight turn, if any, drops any message
+// already queued behind it, then runs fn on key's own worker goroutine and
+// blocks until fn returns (or ctx ends) - spawning a worker for key if none
+// exists yet. Because fn runs on the same goroutine runTurn does, and only
+// after any turn already in flight has actually returned (runWorker's
+// select loop always checks its control case before its message case - see
+// runWorker), fn is guaranteed to run strictly after that turn's own
+// end-of-turn history flush, and before any message that had been waiting
+// behind it - not racing either one. /new uses this to delete a session's
+// history only once a turn cancellation has actually taken effect, and
+// without a queued message it dropped in the meantime going on to run
+// against the history it just deleted.
+func (d *dispatcher) runOnWorker(ctx context.Context, key string, fn func()) error {
+	d.cancelSession(key)
+
+	d.mu.Lock()
+	if d.closed || d.rootCtx.Err() != nil {
+		d.mu.Unlock()
+		return d.rootCtx.Err()
+	}
+	w, ok := d.workers[key]
+	if !ok || w.closing {
+		w = d.spawnWorkerLocked(key)
+	}
+	d.mu.Unlock()
+
+	done := make(chan struct{})
+	wrapped := func() {
+		defer close(done)
+		d.drainQueueOnDone(w, context.Canceled)
+		fn()
+	}
 	select {
-	case d.sem <- struct{}{}:
+	case w.control <- wrapped:
+	case <-ctx.Done():
+		return ctx.Err()
 	case <-d.rootCtx.Done():
-		callOnDone(in, d.rootCtx.Err())
-		return
+		return d.rootCtx.Err()
 	}
-	defer func() { <-d.sem }()
-
-	// Bounded, not context.Background(): this runs after the semaphore is
-	// already taken and before any cancelable turn context exists, so an
-	// unbounded call here would pin a global concurrency slot indefinitely
-	// (and ignore /stop) if a write ever blocks - a manual `mtclaw cron
-	// run`, a backup holding the database's write lock.
-	ensureCtx, ensureCancel := context.WithTimeout(d.rootCtx, 10*time.Second)
-	sess, err := d.store.Sessions().Ensure(ensureCtx, in.Channel, in.ChatID, in.ThreadID)
-	ensureCancel()
-	if err != nil {
-		d.log.Error("gateway: ensure session failed", "channel", in.Channel, "chat_id", in.ChatID, "error", err)
-		callOnDone(in, fmt.Errorf("gateway: ensure session: %w", err))
-		return
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
 	}
+}
 
+// runTurn runs one turn end to end and delivers the reply. It never returns
+// an error itself: every failure mode (session lookup, the turn, the send)
+// is logged and, where it affects the user, turned into a chat reply
+// instead.
+func (d *dispatcher) runTurn(w *worker, in channel.Inbound) {
 	var turnCtx context.Context
 	var cancel context.CancelFunc
 	if in.Timeout > 0 {
@@ -402,10 +491,42 @@ func (d *dispatcher) runTurn(w *worker, in channel.Inbound) {
 	} else {
 		turnCtx, cancel = context.WithCancel(d.rootCtx)
 	}
-
+	// w.cancel must be registered before the semaphore wait below: /stop can
+	// arrive while this turn is still queued behind the global concurrency
+	// cap, and w.cancel has to be set by then, or /stop finds it nil,
+	// reports "nothing running", and the turn still goes on to run once a
+	// slot frees up.
 	d.mu.Lock()
 	w.cancel = cancel
 	d.mu.Unlock()
+	defer func() {
+		cancel()
+		d.mu.Lock()
+		w.cancel = nil
+		d.mu.Unlock()
+	}()
+
+	select {
+	case d.sem <- struct{}{}:
+	case <-turnCtx.Done():
+		callOnDone(in, turnCtx.Err())
+		return
+	}
+	defer func() { <-d.sem }()
+
+	// Bounded, not context.Background() or d.rootCtx directly: an unbounded
+	// call here would pin a global concurrency slot indefinitely (and
+	// ignore /stop, since turnCtx already covers that) if a write ever
+	// blocks - a manual `mtclaw cron run`, a backup holding the database's
+	// write lock.
+	ensureCtx, ensureCancel := context.WithTimeout(turnCtx, 10*time.Second)
+	sess, err := d.store.Sessions().Ensure(ensureCtx, in.Channel, in.ChatID, in.ThreadID)
+	ensureCancel()
+	if err != nil {
+		d.log.Error("gateway: ensure session failed", "channel", in.Channel, "chat_id", in.ChatID, "error", err)
+		callOnDone(in, fmt.Errorf("gateway: ensure session: %w", err))
+		return
+	}
 
 	deliverChatID, deliverThreadID := in.ChatID, in.ThreadID
 	if in.DeliverTo.ChatID != "" {
@@ -425,21 +546,26 @@ func (d *dispatcher) runTurn(w *worker, in channel.Inbound) {
 	if progress != nil {
 		progress.stop()
 	}
-	cancel()
-
-	d.mu.Lock()
-	w.cancel = nil
-	d.mu.Unlock()
 
 	callOnDone(in, result.Err)
 
-	d.reply(in, deliverChatID, deliverThreadID, result)
+	// Detached from this call (and so from d.wg, which drain waits on):
+	// delivery touches no store, only the channel, so a slow multi-chunk
+	// send must never make an otherwise-clean shutdown look like a
+	// drain-deadline breach just because Telegram is still receiving the
+	// last chunk of a long reply. Tracked on d.replyWG instead, which
+	// drainReplies gives its own bounded wait after wg itself has drained -
+	// otherwise a reply produced right at shutdown is dropped the instant
+	// Run returns, not merely delayed past the drain deadline.
+	d.replyWG.Add(1)
+	go d.reply(in, deliverChatID, deliverThreadID, result)
 }
 
 // reply delivers a turn's result, applying the same NoReply/error rules
 // regardless of whether the turn's origin (in) and its delivery target
 // (chatID/threadID, possibly overridden by in.DeliverTo) are the same chat.
 func (d *dispatcher) reply(in channel.Inbound, chatID, threadID string, result agent.Result) {
+	defer d.replyWG.Done()
 	if d.channel == nil || result.NoReply {
 		return
 	}
@@ -511,19 +637,23 @@ func replyTimeout(text string) time.Duration {
 	return baseReplyTimeout + time.Duration(chunks-1)*perChunkReplyTimeout
 }
 
-// replySessionBusy sends the one-time overflow reply when a session's queue
-// is already full, on a short bounded context so a slow or dead channel
-// cannot stall the dispatcher itself.
-func (d *dispatcher) replySessionBusy(in channel.Inbound) {
+// replySessionBusyAsync sends the overflow-burst reply on its own goroutine
+// (not the pump goroutine dispatch runs on, and not tracked by d.wg) so a
+// slow or dead channel cannot stall dispatch itself; dispatch's own
+// busyNotified bookkeeping is what keeps this to one send per overflow
+// burst rather than one per dropped message.
+func (d *dispatcher) replySessionBusyAsync(in channel.Inbound) {
 	if d.channel == nil || in.Channel == "cron" {
 		// A cron inbound's ChatID is a synthetic job key ("job:<name>"), not
 		// a real chat - there is nothing to send to; callOnDone above is the
 		// only signal a dropped cron fire needs to give the scheduler.
 		return
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(d.rootCtx), 10*time.Second)
-	defer cancel()
-	if err := d.channel.Send(ctx, in.ChatID, in.ThreadID, sessionBusyReply, in.MessageID); err != nil {
-		d.log.Error("gateway: send session-busy reply failed", "chat_id", in.ChatID, "error", err)
-	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(d.rootCtx), 10*time.Second)
+		defer cancel()
+		if err := d.channel.Send(ctx, in.ChatID, in.ThreadID, sessionBusyReply, in.MessageID); err != nil {
+			d.log.Error("gateway: send session-busy reply failed", "chat_id", in.ChatID, "error", err)
+		}
+	}()
 }

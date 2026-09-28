@@ -8,7 +8,21 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/tiennm99/MTClaw/internal/config"
 )
+
+// TestLockPath_IsNextToTheDatabase pins the instance lock's location: one
+// gateway per database, derived from storage.path, not a fixed path under
+// internal/config.StateDir - two configs pointing at two different
+// databases must never collide on the same lock file.
+func TestLockPath_IsNextToTheDatabase(t *testing.T) {
+	cfg := config.Config{Storage: config.StorageConfig{Path: "/var/lib/mtclaw/mtclaw.db"}}
+	assert.Equal(t, "/var/lib/mtclaw/mtclaw.db.lock", LockPath(cfg))
+
+	other := config.Config{Storage: config.StorageConfig{Path: "/home/alice/.mtclaw/mtclaw.db"}}
+	assert.NotEqual(t, LockPath(cfg), LockPath(other), "two different databases must never share a lock path")
+}
 
 func TestAcquire_SecondCallFailsWhileHeld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
@@ -22,10 +36,10 @@ func TestAcquire_SecondCallFailsWhileHeld(t *testing.T) {
 	assert.Contains(t, err2.Error(), strconv.Itoa(os.Getpid()))
 }
 
-// TestAcquire_ExistingFileContentIsIrrelevant is the L1 regression test: the
-// kernel lock, not the file's bytes, is what gates acquisition now, so a
-// pre-existing file - whatever it contains, stale pid or garbage - must
-// never block startup or need a "stale lock" heuristic to remove it first.
+// TestAcquire_ExistingFileContentIsIrrelevant proves the kernel lock, not
+// the file's bytes, is what gates acquisition: a pre-existing file -
+// whatever it contains, stale pid or garbage - must never block startup or
+// need a "stale lock" heuristic to remove it first.
 func TestAcquire_ExistingFileContentIsIrrelevant(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 	require.NoError(t, os.WriteFile(path, []byte("not-a-pid, definitely not json either"), 0o644))
@@ -94,11 +108,11 @@ func TestHeld_UnlockedFileWithStalePIDContent_ReportsNotHeld(t *testing.T) {
 	assert.Equal(t, stalePID, pid, "the recorded pid is still surfaced for the caller's message, just not trusted for liveness")
 }
 
-// TestHeld_ReadOnlyLockFile_StillReportsHeld is the L7 regression test:
-// Held must open the lock file read-only, not read-write, so a caller that
-// lacks write permission on it (e.g. `mtclaw doctor` run as a different
-// user) still gets an accurate answer - flock works fine on a read-only fd -
-// instead of failing to open the file at all.
+// TestHeld_ReadOnlyLockFile_StillReportsHeld proves Held opens the lock
+// file read-only, not read-write, so a caller that lacks write permission
+// on it (e.g. `mtclaw doctor` run as a different user) still gets an
+// accurate answer - flock works fine on a read-only fd - instead of failing
+// to open the file at all.
 func TestHeld_ReadOnlyLockFile_StillReportsHeld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 	release, err := Acquire(path)

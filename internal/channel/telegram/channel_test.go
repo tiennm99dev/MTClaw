@@ -8,10 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestBotLogger_ErrorfRedactsTokenFromMessage is the H2 regression test: the
-// bot token must never reach a log line, even when it happens to appear
-// inside whatever text telego's Errorf formats (a defensive redaction, not a
-// case telego's own error strings are known to trigger today).
+// TestBotLogger_ErrorfRedactsTokenFromMessage proves the bot token never
+// reaches a log line, even when it happens to appear inside whatever text
+// telego's Errorf formats (a defensive redaction, not a case telego's own
+// error strings are known to trigger today).
 func TestBotLogger_ErrorfRedactsTokenFromMessage(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))
@@ -38,11 +38,11 @@ func TestBotLogger_ErrorfLogsWithoutToken(t *testing.T) {
 	assert.Contains(t, buf.String(), "409 Conflict")
 }
 
-// TestBotLogger_ErrorfLogsAtWarnNotError is the M4 regression test: telego
-// calls Errorf for every failed API call, not just polling failures, so
-// cases this package already recovers from on its own (a MarkdownV2 400
-// that triggers the plain-text fallback, a 429 that gets retried) must not
-// each surface as an ERROR line for a request that ultimately succeeded.
+// TestBotLogger_ErrorfLogsAtWarnNotError proves telego calling Errorf for
+// every failed API call, not just polling failures, does not surface as an
+// ERROR line for a request this package already recovers from on its own
+// (an HTML parse-mode 400 that triggers the plain-text fallback, a 429
+// that gets retried).
 func TestBotLogger_ErrorfLogsAtWarnNotError(t *testing.T) {
 	var buf bytes.Buffer
 	log := slog.New(slog.NewTextHandler(&buf, nil))

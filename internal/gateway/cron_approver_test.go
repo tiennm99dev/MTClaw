@@ -22,19 +22,12 @@ import (
 
 // TestApproverMux_UnrecognizedOrCronChannel_FallsBackToDenyAll pins down
 // the routing every cron turn depends on: only req.Channel == "telegram"
-// reaches a wired interactive approver; "cron" (and anything else) always
-// gets tools.DenyAllApprover, whether or not a Telegram approver has been
-// set.
+// reaches the wired interactive approver; "cron" (and anything else)
+// always gets tools.DenyAllApprover, even with a Telegram approver wired.
 func TestApproverMux_UnrecognizedOrCronChannel_FallsBackToDenyAll(t *testing.T) {
-	mux := newApproverMux()
+	mux := newApproverMux(alwaysApprove{})
 
 	approved, err := mux.Ask(context.Background(), tools.Request{Channel: "cron", Tool: "exec", Command: "ls"})
-	assert.False(t, approved)
-	assert.ErrorIs(t, err, tools.ErrNoApprover)
-
-	// Wiring a Telegram approver must not change cron's outcome.
-	mux.setTelegram(alwaysApprove{})
-	approved, err = mux.Ask(context.Background(), tools.Request{Channel: "cron", Tool: "exec", Command: "ls"})
 	assert.False(t, approved)
 	assert.ErrorIs(t, err, tools.ErrNoApprover)
 
@@ -86,7 +79,7 @@ func TestCronTurn_ExecApprover_UnmatchedRefused_AllowListedRuns(t *testing.T) {
 		},
 	}
 
-	mux := newApproverMux() // no Telegram wired: exactly a real cron-only gateway's state
+	mux := newApproverMux(nil) // no Telegram approver: a cron turn never reaches one regardless
 	registry, err := tools.New(cfg, st, mux, discardLogger())
 	require.NoError(t, err)
 

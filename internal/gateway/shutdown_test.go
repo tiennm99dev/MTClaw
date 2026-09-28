@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -65,18 +66,35 @@ func TestDrain_WaitsForCtxBeforeChecking(t *testing.T) {
 	}
 }
 
-func testLog() *slog.Logger {
-	return slog.New(slog.NewTextHandler(discardWriter{}, nil))
+func TestDrainReplies_ReturnsAtItsOwnDeadlineWhenRepliesOutlastIt(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		time.Sleep(500 * time.Millisecond) // longer than the deadline below
+	}()
+
+	start := time.Now()
+	drainReplies(&wg, testLog(), 50*time.Millisecond)
+	elapsed := time.Since(start)
+
+	assert.Less(t, elapsed, 200*time.Millisecond, "drainReplies must return at its own deadline, not wait for the goroutine")
 }
 
-// TestWaitForShutdown_PropagatesDrainResult is the M1 regression test:
-// waitForShutdown must forward drain's bool, not discard it - Run uses this
-// to decide whether closing the store is safe.
-func TestWaitForShutdown_PropagatesDrainResult(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	var wg sync.WaitGroup // nothing added: wg.Wait() returns immediately
-	cancel()
+func TestDrainReplies_CompletesWhenRepliesFinishBeforeDeadline(t *testing.T) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var sent int32
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond)
+		atomic.StoreInt32(&sent, 1)
+	}()
 
-	completed := waitForShutdown(ctx, &wg, testLog())
-	assert.True(t, completed, "waitForShutdown must report the drain outcome, not swallow it")
+	drainReplies(&wg, testLog(), 500*time.Millisecond)
+	assert.Equal(t, int32(1), atomic.LoadInt32(&sent), "drainReplies must actually wait for the reply, not return immediately")
+}
+
+func testLog() *slog.Logger {
+	return slog.New(slog.NewTextHandler(discardWriter{}, nil))
 }

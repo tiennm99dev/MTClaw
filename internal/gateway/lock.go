@@ -5,13 +5,23 @@ import (
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/tiennm99/MTClaw/internal/config"
 )
 
-// lockFileName is the instance lock's file name inside the state directory
-// (see internal/config.StateDir). Acquire and Held (platform-specific: see
-// lock_unix.go and lock_windows.go) are what actually decide whether the
-// lock is held.
-const lockFileName = "gateway.lock"
+// LockPath returns the instance lock file's path for cfg: one process per
+// database, not one per OS user or per machine. It lives next to
+// storage.path (storage.path + ".lock") rather than in a fixed,
+// machine-wide location under internal/config.StateDir, so two independent
+// installs (two configs, two databases) under the same OS user can each run
+// their own gateway, and a `cron run`/`doctor` pointed at a --config whose
+// storage.path differs from the default checks the lock that actually
+// protects that database instead of always the default one. Acquire and
+// Held (platform-specific: see lock_unix.go and lock_windows.go) are what
+// actually decide whether the lock named here is held.
+func LockPath(cfg config.Config) string {
+	return cfg.Storage.Path + ".lock"
+}
 
 // readLockPID reads and parses the PID recorded in a lock file at path, for
 // naming the holder in an error message only. On unix, the kernel lock

@@ -43,9 +43,9 @@ type Approver struct {
 
 var _ tools.Approver = (*Approver)(nil)
 
-// NewApprover builds an Approver sending prompts via api and persisting
+// newApprover builds an Approver sending prompts via api and persisting
 // state through approvals. timeout <= 0 uses defaultApprovalTimeout.
-func NewApprover(api botAPI, approvals store.ApprovalStore, cfg config.TelegramConfig, timeout time.Duration, log *slog.Logger) *Approver {
+func newApprover(api botAPI, approvals store.ApprovalStore, cfg config.TelegramConfig, timeout time.Duration, log *slog.Logger) *Approver {
 	if log == nil {
 		log = slog.Default()
 	}
@@ -62,11 +62,26 @@ func NewApprover(api botAPI, approvals store.ApprovalStore, cfg config.TelegramC
 	}
 }
 
+// expireAllPendingHorizon is passed as ExpirePending's "now" argument at
+// startup instead of the real time.Now(), so the sweep catches every
+// pending row regardless of how much of its approval_timeout was left
+// when the prior process died - not just the ones whose expiry already
+// passed. A pending row's only waiter is a goroutine in the process that
+// created it; once this process starts, that goroutine is gone no matter
+// how much time was left on the clock, so a row a fresh few seconds old at
+// crash time would otherwise sit "pending" - with live-looking buttons
+// nothing can ever answer - until its own expires_at eventually passes.
+// This channel filter (see store.ApprovalStore.ExpirePending) is what keeps
+// this sweep scoped to rows this approver itself could have created, so a
+// future writer of differently-scoped pending rows into the same table
+// cannot have its own still-live approvals swept by this one.
+const expireAllPendingHorizon = 100 * 365 * 24 * time.Hour
+
 // ExpirePending runs once at gateway startup: pending waiters are
 // process-local goroutines, so a restart abandons whatever was pending and
 // this sweep is what stops those rows from sitting "pending" forever.
 func (a *Approver) ExpirePending(ctx context.Context) error {
-	n, err := a.approvals.ExpirePending(ctx, time.Now())
+	n, err := a.approvals.ExpirePending(ctx, time.Now().Add(expireAllPendingHorizon), "telegram")
 	if err != nil {
 		return fmt.Errorf("telegram: expire pending approvals at startup: %w", err)
 	}
@@ -124,21 +139,26 @@ func (a *Approver) Ask(ctx context.Context, req tools.Request) (bool, error) {
 		tu.InlineKeyboardButton("\u2705 Approve").WithCallbackData("ok:"+id),
 		tu.InlineKeyboardButton("\U0001F6AB Deny").WithCallbackData("no:"+id),
 	))
-	text := formatApprovalPrompt(req)
-	params := tu.Message(tu.ID(chatIDNum), EscapeMarkdownV2(text)).
-		WithParseMode(telego.ModeMarkdownV2).
+	html, plain := formatApprovalPrompt(req)
+	params := tu.Message(tu.ID(chatIDNum), html).
+		WithParseMode(telego.ModeHTML).
 		WithReplyMarkup(kb)
 	if tid := parseThreadID(req.ThreadID); tid != 0 {
 		params = params.WithMessageThreadID(tid)
 	}
 	if mid, err := strconv.Atoi(req.MessageID); err == nil && mid != 0 {
 		// Quote the message that triggered this approval so it is never an
-		// unanchored prompt in a busy chat - the phase 6 spec's own
-		// requirement, unblocked once Request carries a message id (phase 7).
-		params = params.WithReplyParameters(&telego.ReplyParameters{MessageID: mid})
+		// unanchored prompt in a busy chat. AllowSendingWithoutReply covers
+		// the message having been deleted (by the user, or by Telegram)
+		// between being sent and the approval prompt going out - the prompt
+		// must still reach the user instead of silently failing to send.
+		params = params.WithReplyParameters(&telego.ReplyParameters{
+			MessageID:                mid,
+			AllowSendingWithoutReply: true,
+		})
 	}
 
-	msg, err := sendOne(ctx, a.api, params, text)
+	msg, err := sendOne(ctx, a.api, params, plain)
 	if err != nil {
 		// The row already exists with nothing to edit; mark it decided now
 		// instead of leaving it pending with no message that could ever
@@ -161,7 +181,7 @@ func (a *Approver) Ask(ctx context.Context, req tools.Request) (bool, error) {
 
 // awaitDecision blocks until wait delivers a decision, timer fires, or ctx
 // ends - whichever comes first - and is the exact select Ask's own doc
-// comment describes. Split out from Ask so the timer/wait race (a callback
+// comment describes. split out from Ask so the timer/wait race (a callback
 // landing at the same instant the timer fires) can be driven directly in
 // tests with a synthetic wait/timer pair instead of racing real goroutines
 // against real time.
@@ -171,7 +191,7 @@ func (a *Approver) awaitDecision(ctx context.Context, wait <-chan bool, timer *t
 		return approved, nil
 
 	case <-timer.C:
-		// A callback's Decide can land at the exact instant the timer
+		// A callback's decide can land at the exact instant the timer
 		// fires (Go's select picks randomly between two ready cases) or in
 		// the small window between the timer firing and this goroutine
 		// winning the scheduler - drain wait non-blocking before accepting
@@ -189,8 +209,9 @@ func (a *Approver) awaitDecision(ctx context.Context, wait <-chan bool, timer *t
 
 	case <-ctx.Done():
 		// A SIGTERM or turn cancellation while buttons sit unanswered must
-		// not block phase 7's shutdown drain for the full approval_timeout:
-		// this case is why ctx is a select arm here, not garnish.
+		// not block the gateway's shutdown drain for the full
+		// approval_timeout: this case is why ctx is a select arm here, not
+		// garnish.
 		if raced, approved := a.finishExpiredOrRace(context.WithoutCancel(ctx), id, chatID, messageID, "the gateway is shutting down"); raced {
 			return approved, nil
 		}
@@ -201,7 +222,7 @@ func (a *Approver) awaitDecision(ctx context.Context, wait <-chan bool, timer *t
 // finishExpiredOrRace marks id expired (see finishExpired) and, if it lost
 // the race to a decision a callback had already committed, reads the
 // approvals row back and reports the actual verdict instead - so a timer or
-// ctx.Done() firing in the narrow window between Decide committing and the
+// ctx.Done() firing in the narrow window between decide committing and the
 // callback's own push to wait does not report a contradictory timeout (or
 // cancellation) while the DB, and the message the user already sees, say
 // "approved"/"denied". raced is false - meaning the caller should report
@@ -222,8 +243,8 @@ func (a *Approver) finishExpiredOrRace(ctx context.Context, id, chatID string, m
 
 // finishExpired marks id expired and edits its message to explain why,
 // removing the keyboard, reporting whether it lost the race to a callback
-// that had already committed a decision (Decide returns ErrAlreadyDecided).
-// Both the Decide call and the edit are otherwise best-effort: a failure
+// that had already committed a decision (decide returns ErrAlreadyDecided).
+// Both the decide call and the edit are otherwise best-effort: a failure
 // here must not itself change the (already decided) outcome Ask returns. If
 // the approval was already decided by a callback that won the race, the
 // message already shows that outcome - overwriting it with "timed out"
@@ -314,7 +335,7 @@ func (a *Approver) HandleCallback(ctx context.Context, cb *telego.CallbackQuery)
 	a.mu.Unlock()
 
 	if !ok {
-		// Decide committed the verdict, but nobody in this process is
+		// decide committed the verdict, but nobody in this process is
 		// blocked on it - typically a pending row surviving a restart,
 		// tapped before the startup ExpirePending sweep caught it, or Ask
 		// having already returned for some other reason. Whatever tool call
@@ -374,8 +395,8 @@ func (a *Approver) editOutcome(ctx context.Context, chatID string, messageID int
 	params := &telego.EditMessageTextParams{
 		ChatID:      tu.ID(id),
 		MessageID:   messageID,
-		Text:        EscapeMarkdownV2(text),
-		ParseMode:   telego.ModeMarkdownV2,
+		Text:        escapeHTMLText(text),
+		ParseMode:   telego.ModeHTML,
 		ReplyMarkup: &telego.InlineKeyboardMarkup{InlineKeyboard: [][]telego.InlineKeyboardButton{}},
 	}
 	if _, err := a.api.EditMessageText(ctx, params); err != nil {
@@ -405,15 +426,25 @@ func parseCallbackData(data string) (verdict bool, id string, ok bool) {
 	}
 }
 
-// formatApprovalPrompt renders one Request as the Telegram message text:
-// the command in a code block plus the classifier's reason, if any.
-func formatApprovalPrompt(req tools.Request) string {
-	var b strings.Builder
-	fmt.Fprintf(&b, "Approval requested for %s:\n```\n%s\n```", req.Tool, req.Command)
+// formatApprovalPrompt renders one Request as the Telegram HTML message
+// text (see the returned html) and a plain-text fallback (see plain) for
+// sendOne's parse-error retry. req.Command is placed inside an
+// html-escaped <pre><code> span rather than markdown-rendered: since a
+// model-generated command can contain arbitrary text (including a
+// model steered by prompt-injected content), escaping is what guarantees it
+// can never break out of the code span to forge a fake "reason:" line or
+// otherwise spoof the rest of this message - the only security control the
+// user sees before approving an exec call.
+func formatApprovalPrompt(req tools.Request) (html, plain string) {
+	var hb, pb strings.Builder
+
+	fmt.Fprintf(&hb, "Approval requested for %s:\n<pre><code>%s</code></pre>", escapeHTMLText(req.Tool), escapeHTMLText(req.Command))
+	fmt.Fprintf(&pb, "Approval requested for %s:\n%s", req.Tool, req.Command)
 	if req.Reason != "" {
-		fmt.Fprintf(&b, "\nreason: %s", req.Reason)
+		fmt.Fprintf(&hb, "\nreason: %s", escapeHTMLText(req.Reason))
+		fmt.Fprintf(&pb, "\nreason: %s", req.Reason)
 	}
-	return b.String()
+	return hb.String(), pb.String()
 }
 
 // newApprovalID generates a random 128-bit nonce, hex-encoded, used both as

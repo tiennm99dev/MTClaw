@@ -59,8 +59,10 @@ internal/
   store/      interfaces (Store, SessionStore, MessageStore, ApprovalStore,
               AuditStore, CronRunStore) + sqlite/ (open, embedded
               migrations, one file per table). Every other package depends
-              on the interfaces, never on sqlite directly, except cli's
-              wiring and main.go.
+              on the interfaces, never on sqlite directly, except cli's and
+              gateway's own wiring (both call sqlite.Open/sqlite.New
+              directly to build the concrete store a command or the
+              long-running process needs); main.go itself never imports it.
   provider/   Provider interface + Request/Response/ToolSpec types,
               openai/ (the only package allowed to import the OpenAI SDK).
   agent/      the think/act/observe loop, prompt assembly, history
@@ -75,11 +77,17 @@ internal/
               Request/RedactSecrets - never on agent's loop internals.
   gateway/    ties everything together for the long-running process: the
               inbound queue, per-session dispatch serialization, the
-              instance lock, graceful shutdown.
+              instance lock (one per database, at storage.path + ".lock" -
+              see gateway.LockPath), graceful shutdown.
   cron/       the scheduler loop and per-job tick logic; gronx for
               expression parsing only, overlap/catch-up policy is ours.
   logging/    slog handler construction from log.*.
-  version/    build-stamped Version/Commit/Date, set via -ldflags.
+  version/    build-stamped Version/Commit/Date: Version is set via -ldflags
+              (only the release tag needs to be); Commit/Date are resolved
+              automatically from runtime/debug.ReadBuildInfo's own VCS
+              stamping for a `go build` run directly inside a git checkout -
+              not `go run`, and not a module-cache `go install`, neither of
+              which carries VCS settings ReadBuildInfo can read.
 docs/         this file, configuration.md, security.md, telegram-setup.md
 ```
 
@@ -120,8 +128,12 @@ A Telegram direct message, end to end:
    the store **once**, in a single transaction, at the end of the turn -
    see `docs/security.md`'s note on the crash exposure this trades for.
 8. **Reply.** The dispatcher hands the final text back to the channel,
-   which chunks it to Telegram's message-length limit and sends it,
-   MarkdownV2 with a plain-text fallback on a parse-mode rejection.
+   which splits it at markdown-aware boundaries to stay within Telegram's
+   4096-character message limit, renders each piece as Telegram HTML (bold,
+   italic, code, pre, links), and sends it - falling back to plain text on
+   an HTML parse-mode rejection. An approval prompt renders the command
+   inside an HTML-escaped `<pre><code>` span so the command's own text can
+   never break out of it.
 
 A cron-triggered turn follows the same agent-loop/policy/store path from
 step 5 onward; it enters at the queue (step 3) via the scheduler instead of

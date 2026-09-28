@@ -1,9 +1,10 @@
 // Package cron implements MTClaw's in-process scheduler: YAML-declared
 // prompts run on a cron expression and their result is delivered to a chat,
-// reusing the gateway dispatcher for serialization and delivery. See
-// plans/260731-2219-mtclaw-core-system/phase-08-cron-scheduler.md for the
-// design rationale, in particular the two independent guards (minute
-// de-dup, overlap) Scheduler.tryFire implements.
+// reusing the gateway dispatcher for serialization and delivery.
+// Scheduler.tryFire is the core of it: two independent guards (minute
+// de-dup, so a ticker firing twice for the same due minute cannot double
+// its turn; overlap, so a slow-running turn cannot get a second one
+// stacked on top of it) protect one fire.
 package cron
 
 import (

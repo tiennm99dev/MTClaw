@@ -11,16 +11,34 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 )
 
-// commandNames is the fixed set of bot commands this channel understands
-// itself (as opposed to ordinary text, which is forwarded to the agent
-// loop). Keep this in sync with registerCommands' setMyCommands call.
-var commandNames = map[string]string{
-	"start":  "Show what this bot can do",
-	"help":   "Show what this bot can do",
-	"new":    "Start a fresh conversation in this chat",
-	"status": "Show this session's message count, tokens, and model",
-	"whoami": "Show your user id and this chat's id",
-	"stop":   "Cancel the in-flight turn, if any",
+// botCommand is one bot command this channel understands itself (as
+// opposed to ordinary text, which is forwarded to the agent loop).
+type botCommand struct {
+	name, description string
+}
+
+// commands is the fixed, ordered set of bot commands: registerCommands
+// publishes all of them via setMyCommands, and helpText lists every one
+// except "start" (its own text is the help reply, not a menu entry worth
+// repeating).
+var commands = [...]botCommand{
+	{"start", "Show what this bot can do"},
+	{"help", "Show what this bot can do"},
+	{"new", "Start a fresh conversation in this chat"},
+	{"status", "Show this session's message count, tokens, and model"},
+	{"whoami", "Show your user id and this chat's id"},
+	{"stop", "Cancel the in-flight turn, if any"},
+}
+
+// isCommand reports whether name is one of commands, and known's caller
+// treats an unmatched name as ordinary text instead.
+func isCommand(name string) bool {
+	for _, c := range commands {
+		if c.name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // SessionStatus is the display data /status reports.
@@ -34,10 +52,10 @@ type SessionStatus struct {
 }
 
 // Deps is the narrow surface bot commands need from whatever wires this
-// channel up (the gateway, in phase 7). Depending on this instead of
-// internal/store or internal/agent directly keeps the channel boundary
-// honest: this package never reaches into the loop's or the store's
-// internals, only this three-method seam.
+// channel up (the gateway). Depending on this instead of internal/store or
+// internal/agent directly keeps the channel boundary honest: this package
+// never reaches into the loop's or the store's internals, only this
+// three-method seam.
 type Deps interface {
 	// Status reports live numbers for /status.
 	Status(ctx context.Context, chatID, threadID string) (SessionStatus, error)
@@ -48,58 +66,64 @@ type Deps interface {
 	Cancel(chatID, threadID string) bool
 }
 
-// commandName extracts the bare, lowercased command word from text if text
-// is a bot command - e.g. "/status@mybot" -> "status" - stripping the
-// "@botname" suffix Telegram appends in groups. Returns "" for anything
-// that is not a leading slash command at all.
-func commandName(text string) string {
+// parseCommand extracts the bare, lowercased command word from text if
+// text is a bot command - e.g. "/status@mybot" -> ("status", "mybot") -
+// splitting off the "@botname" suffix Telegram appends in groups instead of
+// silently discarding it: a command explicitly addressed to a different
+// bot must never run as this bot's own (see handleMessage). Returns ("",
+// "") for anything that is not a leading slash command at all.
+func parseCommand(text string) (name, target string) {
 	if !strings.HasPrefix(text, "/") {
-		return ""
+		return "", ""
 	}
 	fields := strings.Fields(text)
 	if len(fields) == 0 {
-		return ""
+		return "", ""
 	}
 	word := strings.TrimPrefix(fields[0], "/")
 	if at := strings.IndexByte(word, '@'); at >= 0 {
-		word = word[:at]
+		return strings.ToLower(word[:at]), word[at+1:]
 	}
-	return strings.ToLower(word)
+	return strings.ToLower(word), ""
 }
 
-// registerCommands publishes commandNames via setMyCommands so Telegram's
+// registerCommands publishes commands via setMyCommands so Telegram's
 // client shows the "/" command menu.
 func registerCommands(ctx context.Context, api botAPI) error {
-	cmds := make([]telego.BotCommand, 0, len(commandNames))
-	for _, name := range [...]string{"start", "help", "new", "status", "whoami", "stop"} {
-		cmds = append(cmds, telego.BotCommand{Command: name, Description: commandNames[name]})
+	cmds := make([]telego.BotCommand, 0, len(commands))
+	for _, c := range commands {
+		cmds = append(cmds, telego.BotCommand{Command: c.name, Description: c.description})
 	}
 	return api.SetMyCommands(ctx, &telego.SetMyCommandsParams{Commands: cmds})
 }
 
+// commandDBTimeout bounds every command's own call into deps: /new and
+// /status run on the Telegram update pump, not a session worker, so an
+// unbounded call here would let a held store write lock (a manual `mtclaw
+// cron run`, a backup holding the database's write lock) stall every
+// update this process ever processes, including approval callbacks.
+const commandDBTimeout = 10 * time.Second
+
 // handleCommand runs one recognized command and returns the reply text.
-// deps may be nil before the gateway wires it up (phase 7); commands that
-// need it degrade to a clear "not available yet" message instead of
-// panicking.
+// deps is the only production caller's non-nil Deps; a test exercising
+// "new"/"status"/"stop" supplies its own fake rather than nil.
 func handleCommand(ctx context.Context, cfg *config.Config, deps Deps, cmd, chatID, threadID string, fromID int64) string {
 	switch cmd {
 	case "start", "help":
 		return helpText(cfg)
 
 	case "new":
-		if deps == nil {
-			return "not available yet: this gateway has no session backend wired up."
-		}
-		if err := deps.Reset(ctx, chatID, threadID); err != nil {
+		cctx, cancel := context.WithTimeout(ctx, commandDBTimeout)
+		defer cancel()
+		if err := deps.Reset(cctx, chatID, threadID); err != nil {
 			return fmt.Sprintf("could not start a new conversation: %v", err)
 		}
 		return "started a new conversation. Previous history in this chat is cleared."
 
 	case "status":
-		if deps == nil {
-			return "not available yet: this gateway has no session backend wired up."
-		}
-		st, err := deps.Status(ctx, chatID, threadID)
+		cctx, cancel := context.WithTimeout(ctx, commandDBTimeout)
+		defer cancel()
+		st, err := deps.Status(cctx, chatID, threadID)
 		if err != nil {
 			return fmt.Sprintf("could not read session status: %v", err)
 		}
@@ -120,7 +144,7 @@ func handleCommand(ctx context.Context, cfg *config.Config, deps Deps, cmd, chat
 		)
 
 	case "stop":
-		if deps != nil && deps.Cancel(chatID, threadID) {
+		if deps.Cancel(chatID, threadID) {
 			return "cancelling the current turn."
 		}
 		return "nothing running."
@@ -140,8 +164,11 @@ func helpText(cfg *config.Config) string {
 	fmt.Fprintf(&b, "workspace: %s\n", cfg.Agent.Workspace)
 	fmt.Fprintf(&b, "exec mode: %s\n\n", cfg.Tools.Exec.Mode)
 	b.WriteString("Commands:\n")
-	for _, name := range [...]string{"new", "status", "whoami", "stop", "help"} {
-		fmt.Fprintf(&b, "/%s - %s\n", name, commandNames[name])
+	for _, c := range commands {
+		if c.name == "start" {
+			continue
+		}
+		fmt.Fprintf(&b, "/%s - %s\n", c.name, c.description)
 	}
 	return b.String()
 }

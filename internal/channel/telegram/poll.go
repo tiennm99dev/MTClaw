@@ -38,13 +38,13 @@ func (c *Channel) pumpUpdates(ctx context.Context, updates <-chan telego.Update,
 
 // handleMessage gates one inbound Telegram message, drops anything that
 // gated through with no usable text (a sticker, a photo with no caption, a
-// group service message - Decide already ruled out an access-denied
+// group service message - decide already ruled out an access-denied
 // rejection, there is just nothing here for the agent loop to act on),
 // intercepts recognized bot commands itself (replying directly rather than
 // forwarding them to the agent loop), and forwards anything else to out as
 // an accepted Inbound.
 func (c *Channel) handleMessage(ctx context.Context, msg *telego.Message, out chan<- channel.Inbound) {
-	accept, cleanText, reason := Decide(c.cfg.Channels.Telegram, c.username, c.botID, msg)
+	accept, cleanText, reason := decide(c.cfg.Channels.Telegram, c.username, c.botID, msg)
 	if !accept {
 		c.log.Debug("telegram: rejected inbound message", "reason", reason)
 		return
@@ -64,8 +64,19 @@ func (c *Channel) handleMessage(ctx context.Context, msg *telego.Message, out ch
 		fromID = msg.From.ID
 	}
 
-	if cmd := commandName(cleanText); cmd != "" {
-		if _, known := commandNames[cmd]; known {
+	if cmd, target := parseCommand(cleanText); cmd != "" {
+		if target != "" && !strings.EqualFold(target, c.username) {
+			// "/cmd@OtherBot": in a group with require_mention off, every
+			// bot with privacy mode off sees this update, but it is not
+			// addressed to this one - running it here would let any
+			// allowlisted member wipe this bot's session history (/new),
+			// cancel its turn (/stop), or trigger any other command by
+			// typing another bot's handle. Drop it silently, the same as
+			// any other message this bot was not addressed to.
+			c.log.Debug("telegram: dropping command addressed to another bot", "command", cmd, "target", target)
+			return
+		}
+		if isCommand(cmd) {
 			reply := handleCommand(ctx, c.cfg, c.deps, cmd, chatID, threadID, fromID)
 			if reply != "" {
 				if err := c.Send(ctx, chatID, threadID, reply, ""); err != nil {

@@ -20,6 +20,17 @@ import (
 	"github.com/tiennm99/MTClaw/internal/tools"
 )
 
+// gatewayChannel is the full surface Run needs from the channel it pumps:
+// channel.Channel's Start (updates in) plus the dispatcher's own Channel
+// (replies and typing indicators out). *telegram.Channel satisfies both;
+// declaring the field as this interface - rather than the concrete type -
+// is what lets a test exercise Run's startup/shutdown order against a fake
+// with no network at all.
+type gatewayChannel interface {
+	channel.Channel
+	Channel
+}
+
 // Gateway is the fully-wired, long-running mtclaw process: store, provider,
 // tool registry, Telegram channel, and dispatcher. New performs every step
 // of the startup order up to (but not including) starting the channel's
@@ -28,7 +39,7 @@ import (
 type Gateway struct {
 	log       *slog.Logger
 	store     store.Store
-	channel   *telegram.Channel
+	channel   gatewayChannel
 	disp      *dispatcher
 	cronSched *cron.Scheduler // nil when cron.enabled is false
 
@@ -48,14 +59,10 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 		return nil, fmt.Errorf("gateway: channels.telegram.enabled must be true to run the gateway")
 	}
 
-	stateDir, err := config.StateDir()
-	if err != nil {
-		return nil, fmt.Errorf("gateway: resolve state directory: %w", err)
+	lockPath := LockPath(cfg)
+	if err := os.MkdirAll(filepath.Dir(lockPath), 0o700); err != nil {
+		return nil, fmt.Errorf("gateway: create directory %s for the instance lock: %w", filepath.Dir(lockPath), err)
 	}
-	if err := os.MkdirAll(stateDir, 0o700); err != nil {
-		return nil, fmt.Errorf("gateway: create state directory %s: %w", stateDir, err)
-	}
-	lockPath := filepath.Join(stateDir, lockFileName)
 	release, err := Acquire(lockPath)
 	if err != nil {
 		// Acquire's own error is already a well-formed "gateway: ..."
@@ -96,19 +103,11 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 		return nil, fmt.Errorf("gateway: build openai client: %w", err)
 	}
 
-	mux := newApproverMux()
-	registry, err := tools.New(cfg, st, mux, log)
-	if err != nil {
-		st.Close()
-		release()
-		return nil, fmt.Errorf("gateway: build tool registry: %w", err)
-	}
-
 	// The dispatcher must exist before the Telegram channel does, because
-	// the channel's Deps (for /stop) needs a cancel registry to call into -
-	// but the dispatcher's own channel/runner fields are only filled in
-	// below, once those exist. Nothing reads them before Run starts the
-	// pump, so this ordering is safe.
+	// the channel's Deps (for /new and /stop) needs a cancel registry to
+	// call into - but the dispatcher's own channel/runner fields are only
+	// filled in below, once those exist. Nothing reads them before Run
+	// starts the pump, so this ordering is safe.
 	disp := newDispatcher(st, nil, nil, log, idleSessionTimeout, globalConcurrency)
 
 	deps := &telegramDeps{cfg: cfg, store: st, disp: disp}
@@ -118,7 +117,19 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 		release()
 		return nil, fmt.Errorf("gateway: build telegram channel: %w", err)
 	}
-	mux.setTelegram(tgChannel.Approver())
+
+	// The Telegram channel is built before the tool registry (which needs
+	// an Approver) rather than the other way around: telegram.New only
+	// needs st.Approvals() and deps, never the registry, so there is no
+	// wiring-order reason to build the registry first and patch the
+	// Telegram approver in afterward through a mutable setter.
+	mux := newApproverMux(tgChannel.Approver())
+	registry, err := tools.New(cfg, st, mux, log)
+	if err != nil {
+		st.Close()
+		release()
+		return nil, fmt.Errorf("gateway: build tool registry: %w", err)
+	}
 
 	loop := agent.New(cfg, client, st, registry, log)
 
@@ -149,16 +160,18 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 	}, nil
 }
 
-// Run starts the channel's long-poll loop, the global-inbound relay, the
-// dispatcher, and a SIGINT/SIGTERM watcher, then blocks until shutdown
-// completes. Shutdown order is the reverse of startup: the channel's update
-// pump stops first (no new inbound arrives), in-flight turns drain (bounded
-// by drainDeadline), then the store closes and the lock releases - closing
-// the store while a worker is mid-Append would lose a turn. If the drain
-// deadline is breached, the store is deliberately left open (closing a
-// database out from under a still-writing worker is worse than leaking the
-// fd at process exit) and Run returns a non-nil error so the process exits
-// non-zero instead of looking like a clean shutdown.
+// Run starts the channel's long-poll loop, the dispatcher, and (if enabled)
+// the cron scheduler, then blocks until shutdown completes. Shutdown order
+// is the reverse of startup: the channel's update pump stops first (no new
+// inbound arrives), in-flight turns drain (bounded by drainDeadline), then
+// detached reply goroutines get their own bounded wait (drainReplies,
+// bounded by replyDrainDeadline - a reply touches no store, so it is never
+// itself a drain breach), then the store closes and the lock releases -
+// closing the store while a worker is mid-Append would lose a turn. If the
+// drain deadline is breached, the store is deliberately left open (closing
+// a database out from under a still-writing worker is worse than leaking
+// the fd at process exit) and Run returns a non-nil error so the process
+// exits non-zero instead of looking like a clean shutdown.
 func (g *Gateway) Run(ctx context.Context) error {
 	var drained bool
 	defer func() {
@@ -183,34 +196,33 @@ func (g *Gateway) Run(ctx context.Context) error {
 	// when the channel itself fails.
 	runCtx, stop := context.WithCancel(ctx)
 	defer stop()
-	g.disp.rootCtx = runCtx
+	g.disp.start(runCtx)
 
-	// Mark the dispatcher closed as soon as runCtx ends, before
-	// waitForShutdown's own wg.Wait() can itself return - see dispatch's
-	// d.closed field and closeForShutdown for the wg.Add/wg.Wait race this
-	// closes.
-	go func() {
-		<-runCtx.Done()
-		g.disp.closeForShutdown()
-	}()
-
-	raw := make(chan channel.Inbound)
-	global := make(chan channel.Inbound, globalQueueSize)
+	// inbound is read only by the dispatcher's pump (its one reader) and
+	// written only by the channel's own update pump: no intermediate relay
+	// or second queue in between. The channel's blocking send is what
+	// enforces backpressure - once inbound's buffer fills, that send
+	// blocks, which pushes back on telego's own buffered long-poll channel
+	// (and, behind that, Telegram's server-side queue) instead of a
+	// separate drop-and-reply path. That is a fine trade for a
+	// single-user bot: there is no hard cap on total messages in flight
+	// beyond what Telegram itself buffers.
+	inbound := make(chan channel.Inbound, globalQueueSize)
 
 	var pumps sync.WaitGroup
-	pumps.Add(3)
+	pumps.Add(2)
 	if g.cronSched != nil {
 		pumps.Add(1)
 	}
 
 	// channelFailure is written only by the channel goroutine below, and
-	// only before it calls stop() (which is what waitForShutdown blocks
+	// only before it calls stop() (which is what drain blocks
 	// on); pumps.Wait() below happens-after that write via the WaitGroup,
 	// so reading it after both calls return is race-free.
 	var channelFailure error
 	go func() {
 		defer pumps.Done()
-		err := g.channel.Start(runCtx, raw)
+		err := g.channel.Start(runCtx, inbound)
 		if err != nil && runCtx.Err() == nil {
 			// The channel is the gateway's only inbound surface: if its
 			// poll loop dies for a reason other than shutdown (a revoked
@@ -226,11 +238,7 @@ func (g *Gateway) Run(ctx context.Context) error {
 	}()
 	go func() {
 		defer pumps.Done()
-		relayInbound(runCtx, raw, global, g.channel, g.log)
-	}()
-	go func() {
-		defer pumps.Done()
-		g.disp.pump(runCtx, global)
+		g.disp.pump(runCtx, inbound)
 	}()
 	if g.cronSched != nil {
 		go func() {
@@ -239,7 +247,8 @@ func (g *Gateway) Run(ctx context.Context) error {
 		}()
 	}
 
-	drained = waitForShutdown(runCtx, &g.disp.wg, g.log)
+	drained = drain(runCtx, &g.disp.wg, g.log, drainDeadline)
+	drainReplies(&g.disp.replyWG, g.log, replyDrainDeadline)
 	pumps.Wait()
 	if channelFailure != nil {
 		return channelFailure
@@ -280,12 +289,26 @@ func (d *telegramDeps) Status(ctx context.Context, chatID, threadID string) (tel
 	}, nil
 }
 
+// Reset clears a session's history for /new. If a turn is already running
+// in this session, it is canceled first, and the delete runs on that
+// session's own worker goroutine (see dispatcher.runOnWorker) strictly
+// after the canceled turn's end-of-turn flush has completed - otherwise
+// that flush could land after the delete and the "fresh" conversation
+// would start with the canceled turn's own messages still in it.
 func (d *telegramDeps) Reset(ctx context.Context, chatID, threadID string) error {
-	sess, err := d.store.Sessions().Ensure(ctx, "telegram", chatID, threadID)
-	if err != nil {
+	key := sessionKey("telegram", chatID, threadID)
+	var resetErr error
+	if err := d.disp.runOnWorker(ctx, key, func() {
+		sess, err := d.store.Sessions().Ensure(ctx, "telegram", chatID, threadID)
+		if err != nil {
+			resetErr = err
+			return
+		}
+		resetErr = d.store.Messages().DeleteBySession(ctx, sess.ID)
+	}); err != nil {
 		return err
 	}
-	return d.store.Messages().DeleteBySession(ctx, sess.ID)
+	return resetErr
 }
 
 func (d *telegramDeps) Cancel(chatID, threadID string) bool {
