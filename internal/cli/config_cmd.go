@@ -24,9 +24,10 @@ func newConfigCmd(s *state) *cobra.Command {
 // when the file is missing or invalid.
 func newConfigPathCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "path",
-		Short: "Print the resolved config file path and its source",
-		Args:  cobra.NoArgs,
+		Use:         "path",
+		Short:       "Print the resolved config file path and its source",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configNone),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := fmt.Fprintf(cmd.OutOrStdout(), "%s (source: %s)\n", s.configPath, s.configSource)
 			return err
@@ -39,9 +40,10 @@ func newConfigPathCmd(s *state) *cobra.Command {
 // loaded and validated successfully, since PersistentPreRunE runs first.
 func newConfigShowCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "show",
-		Short: "Print the resolved config with secrets redacted (not a loadable config file)",
-		Args:  cobra.NoArgs,
+		Use:         "show",
+		Short:       "Print the resolved config with secrets redacted (not a loadable config file)",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configInspect),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			out, err := config.MarshalRedacted(s.cfg)
 			if err != nil {
@@ -59,9 +61,10 @@ func newConfigShowCmd(s *state) *cobra.Command {
 // passed.
 func newConfigValidateCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "validate",
-		Short: "Validate the config file and report every error at once",
-		Args:  cobra.NoArgs,
+		Use:         "validate",
+		Short:       "Validate the config file and report every error at once",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configInspect),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := fmt.Fprintf(cmd.OutOrStdout(), "OK: %s\n", s.configPath)
 			return err

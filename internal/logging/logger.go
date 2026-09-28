@@ -16,10 +16,12 @@ import (
 // New builds an *slog.Logger from cfg and returns the function that
 // releases the log file it opened (a no-op when logging to stderr). The
 // caller must invoke it at process exit: an open handle keeps the file
-// undeletable on Windows and leaks a descriptor per New otherwise. An
-// unrecognized level falls back to info rather than failing, so a typo'd
-// --log-level flag degrades gracefully instead of blocking startup; the
-// only real failure mode is an unwritable log file.
+// undeletable on Windows and leaks a descriptor per New otherwise.
+// cfg.Level/cfg.Format are expected to already be one of config.Validate's
+// (and isValidLogLevel's) recognized spellings by the time they reach here -
+// parseLevel and the format comparison below still normalize case and
+// whitespace themselves (see parseLevel), so this never fails on cfg.Level/
+// cfg.Format alone; the only real failure mode is an unwritable log file.
 func New(cfg config.LogConfig) (*slog.Logger, func() error, error) {
 	var w io.Writer = os.Stderr
 	closeFn := func() error { return nil }

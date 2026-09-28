@@ -15,9 +15,10 @@ func newSendCmd(s *state) *cobra.Command {
 	var threadFlag string
 
 	cmd := &cobra.Command{
-		Use:   "send <text>",
-		Short: "Send one Telegram message directly, without running the gateway",
-		Args:  cobra.ExactArgs(1),
+		Use:         "send <text>",
+		Short:       "Send one Telegram message directly, without running the gateway",
+		Args:        cobra.ExactArgs(1),
+		Annotations: configAnnotation(configFull),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if chatFlag == "" {
 				return fmt.Errorf("--chat is required")

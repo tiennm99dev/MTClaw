@@ -92,26 +92,52 @@ func TestCheckDatabase(t *testing.T) {
 	assert.Equal(t, StatusFail, res.Status)
 }
 
-func TestCheckInstanceLock(t *testing.T) {
-	dir := t.TempDir()
+// TestCheckDatabase_BehindSchemaIsReportedNotSilentlyMigrated proves a
+// database left behind a pending migration (an older binary's schema) is
+// never migrated by doctor's own read-only-then-write fallback - only a
+// database that does not exist at all gets the write-mode retry. Simulated
+// here by setting a schema version below the latest embedded migration, so
+// the read-only open's own "behind the latest migration" check fires.
+func TestCheckDatabase_BehindSchemaIsReportedNotSilentlyMigrated(t *testing.T) {
+	cfg := testConfig(t)
 
-	res := checkInstanceLock(dir, nil)(context.Background(), nil)
+	db, err := sqlite.Open(context.Background(), cfg.Storage.Path, false)
+	require.NoError(t, err)
+	_, err = db.ExecContext(context.Background(), "PRAGMA user_version = 0")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	res := checkDatabase(context.Background(), cfg)
+	assert.Equal(t, StatusFail, res.Status)
+	assert.Contains(t, res.Message, "restart the gateway")
+
+	// The important invariant: user_version must be untouched by doctor's
+	// check - a second, independent read confirms nothing migrated it.
+	db2, err := sqlite.Open(context.Background(), cfg.Storage.Path, true)
+	require.Error(t, err, "a behind-schema database still refuses even a second read-only open")
+	if db2 != nil {
+		db2.Close()
+	}
+}
+
+func TestCheckInstanceLock(t *testing.T) {
+	cfg := testConfig(t)
+
+	res := checkInstanceLock(context.Background(), cfg)
 	assert.Equal(t, StatusOK, res.Status)
 
 	// Holding the kernel lock from this process on a separate descriptor
 	// is exactly what "another instance holds it" looks like to Held,
-	// without spawning a real second gateway.
-	release, err := gateway.Acquire(filepath.Join(dir, "gateway.lock"))
+	// without spawning a real second gateway. gateway.LockPath derives the
+	// path from cfg.Storage.Path, so Acquire must target that same path.
+	release, err := gateway.Acquire(gateway.LockPath(*cfg))
 	require.NoError(t, err)
-	res = checkInstanceLock(dir, nil)(context.Background(), nil)
+	res = checkInstanceLock(context.Background(), cfg)
 	assert.Equal(t, StatusInfo, res.Status)
 	require.NoError(t, release())
 
-	res = checkInstanceLock(dir, nil)(context.Background(), nil)
+	res = checkInstanceLock(context.Background(), cfg)
 	assert.Equal(t, StatusOK, res.Status)
-
-	res = checkInstanceLock("", assert.AnError)(context.Background(), nil)
-	assert.Equal(t, StatusFail, res.Status)
 }
 
 func TestCheckOpenAIKeyResolves(t *testing.T) {
@@ -163,18 +189,21 @@ func TestCheckTelegramGetMe_NoTokenDegradesToFail(t *testing.T) {
 	assert.Contains(t, res.Message, "no Telegram bot token resolved")
 }
 
-func TestCheckAllowlistNonEmpty(t *testing.T) {
+func TestCheckSystemPromptFiles(t *testing.T) {
 	cfg := testConfig(t)
-	res := checkAllowlistNonEmpty(context.Background(), cfg)
-	assert.Equal(t, StatusOK, res.Status, "disabled channel must skip, not fail")
+	res := checkSystemPromptFiles(context.Background(), cfg)
+	assert.Equal(t, StatusOK, res.Status, "empty list has nothing to check")
 
-	cfg.Channels.Telegram.Enabled = true
-	res = checkAllowlistNonEmpty(context.Background(), cfg)
-	assert.Equal(t, StatusFail, res.Status)
-
-	cfg.Channels.Telegram.AllowFrom = []int64{123}
-	res = checkAllowlistNonEmpty(context.Background(), cfg)
+	existing := filepath.Join(cfg.Agent.Workspace, "AGENTS.md")
+	require.NoError(t, os.WriteFile(existing, []byte("hi"), 0o644))
+	cfg.Agent.SystemPromptFiles = []string{existing}
+	res = checkSystemPromptFiles(context.Background(), cfg)
 	assert.Equal(t, StatusOK, res.Status)
+
+	cfg.Agent.SystemPromptFiles = append(cfg.Agent.SystemPromptFiles, filepath.Join(cfg.Agent.Workspace, "missing.md"))
+	res = checkSystemPromptFiles(context.Background(), cfg)
+	assert.Equal(t, StatusFail, res.Status)
+	assert.Contains(t, res.Message, "missing.md")
 }
 
 func TestCheckWorkspace(t *testing.T) {

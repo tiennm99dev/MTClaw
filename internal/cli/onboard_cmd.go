@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	_ "embed"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -19,6 +20,14 @@ import (
 	"github.com/tiennm99/MTClaw/internal/tools"
 )
 
+// errConfigAlreadyExists is runOnboard's sentinel for its refuse-to-
+// overwrite path (see showWouldNotOverwrite): the refusal is already
+// explained on stdout either way, but returning a distinguishable error too
+// means a script driving `mtclaw onboard` can tell "a config already
+// existed, nothing written" from "onboard actually ran and wrote one" by
+// exit code alone, instead of both looking like plain success.
+var errConfigAlreadyExists = errors.New("a config file already exists; onboard refuses to overwrite it")
+
 //go:embed prompts/AGENTS.md
 var starterAgentsMD string
 
@@ -27,7 +36,7 @@ var starterAgentsMD string
 const onboardVerifyTimeout = 15 * time.Second
 
 // telegramCaptureWindow is how long onboard's Telegram ID capture step
-// waits for a message, per phase-09-hardening-and-release.md step 5.
+// waits for a message before falling back to manual entry.
 const telegramCaptureWindow = 60 * time.Second
 
 // newOnboardCmd builds `mtclaw onboard`: interactive first-run setup that
@@ -36,9 +45,10 @@ const telegramCaptureWindow = 60 * time.Second
 // because its entire purpose is to run on a machine that has no config yet.
 func newOnboardCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "onboard",
-		Short: "Interactive first-run setup: writes a working config and runs doctor",
-		Args:  cobra.NoArgs,
+		Use:         "onboard",
+		Short:       "Interactive first-run setup: writes a working config and runs doctor",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configNone),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			p := newStdioPrompter(cmd.Context(), cmd.InOrStdin(), cmd.OutOrStdout(), int(os.Stdin.Fd()))
 			return runOnboard(cmd.Context(), cmd.OutOrStdout(), s.configPath, p, realTelegramCapturer{})
@@ -53,7 +63,10 @@ func newOnboardCmd(s *state) *cobra.Command {
 // TTY or a real network call.
 func runOnboard(ctx context.Context, out io.Writer, configPath string, p prompter, capturer telegramCapturer) error {
 	if _, err := os.Stat(configPath); err == nil {
-		return showWouldNotOverwrite(configPath, out)
+		if err := showWouldNotOverwrite(configPath, out); err != nil {
+			return err
+		}
+		return errConfigAlreadyExists
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("stat config file %s: %w", configPath, err)
 	}
@@ -69,7 +82,7 @@ func runOnboard(ctx context.Context, out io.Writer, configPath string, p prompte
 	}
 	// exec.mode is always "approval" and never offered as a choice here:
 	// "auto" is a deliberate, documented config edit, not an onboarding
-	// option (phase 5's Security Model, restated in docs/security.md).
+	// option - see docs/security.md's security model.
 	cfg.Tools.Exec.Mode = "approval"
 
 	// Steps 2+3: OpenAI key and model, verified together by listing models
@@ -113,7 +126,7 @@ func runOnboard(ctx context.Context, out io.Writer, configPath string, p prompte
 
 	// Step 8: starter AGENTS.md, written before the config so the config
 	// this run writes already references a file that exists.
-	agentsPath, err := writeStarterAgentsFile(configPath)
+	agentsPath, err := writeStarterAgentsFile(out, configPath)
 	if err != nil {
 		return err
 	}
@@ -343,7 +356,7 @@ func captureAllowFrom(ctx context.Context, p prompter, capturer telegramCapturer
 
 // manualAllowFromEntry is the fallback for captureAllowFrom: nothing
 // arrived, the single sender was declined, or more than one sender showed
-// up. It also serves as the `/whoami` pointer the phase file requires.
+// up. It also points the user at `/whoami` to get their id manually.
 func manualAllowFromEntry(p prompter, cfg *config.Config) error {
 	answer, err := p.Text("Enter your numeric Telegram user id manually (message the bot and run /whoami once it is live, or leave blank to set channels.telegram.allow_from later)", "")
 	if err != nil {
@@ -371,14 +384,29 @@ func manualAllowFromEntry(p prompter, cfg *config.Config) error {
 // to the config file being onboarded - rather than always under the
 // machine-wide ~/.mtclaw - keeps a `--config` pointed at a second install
 // self-contained instead of silently sharing (and overwriting) the first
-// install's starter prompt.
-func writeStarterAgentsFile(configPath string) (string, error) {
+// install's starter prompt. It never overwrites an existing AGENTS.md
+// (O_EXCL): re-onboarding after deleting config.yaml - exactly what
+// showWouldNotOverwrite tells a user to do - must not silently clobber a
+// prompt they have since customized. When one already exists, that file is
+// kept and referenced as-is, with a note printed so the user knows why
+// their edits were not touched.
+func writeStarterAgentsFile(out io.Writer, configPath string) (string, error) {
 	promptsDir := filepath.Join(filepath.Dir(configPath), "prompts")
 	if err := os.MkdirAll(promptsDir, 0o700); err != nil {
 		return "", fmt.Errorf("create %s: %w", promptsDir, err)
 	}
 	agentsPath := filepath.Join(promptsDir, "AGENTS.md")
-	if err := os.WriteFile(agentsPath, []byte(starterAgentsMD), 0o644); err != nil {
+
+	f, err := os.OpenFile(agentsPath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
+	switch {
+	case err == nil:
+		defer f.Close()
+		if _, err := f.WriteString(starterAgentsMD); err != nil {
+			return "", fmt.Errorf("write %s: %w", agentsPath, err)
+		}
+	case os.IsExist(err):
+		fmt.Fprintf(out, "keeping existing %s (onboard never overwrites a customized system prompt)\n", agentsPath)
+	default:
 		return "", fmt.Errorf("write %s: %w", agentsPath, err)
 	}
 	return agentsPath, nil
@@ -395,6 +423,13 @@ func writeStarterAgentsFile(configPath string) (string, error) {
 // never touches those fields), so plain yaml.Marshal omits them via their
 // `omitempty` tag, and the file contains only the env/file indirection
 // keys - never a secret.
+//
+// The write itself uses O_EXCL, not a plain create-or-truncate: runOnboard
+// already checked configPath does not exist before running the rest of its
+// interactive sequence, but that check and this write are not atomic with
+// each other, so a second onboard run started in the gap between them would
+// otherwise silently overwrite the first one's result. O_EXCL turns that
+// race into errConfigAlreadyExists instead.
 func writeOnboardConfig(path string, cfg *config.Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
@@ -403,7 +438,15 @@ func writeOnboardConfig(path string, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("render config: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return errConfigAlreadyExists
+		}
+		return fmt.Errorf("write config %s: %w", path, err)
+	}
+	defer f.Close()
+	if _, err := f.Write(data); err != nil {
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
 	return nil

@@ -10,12 +10,11 @@ import (
 // newApprovalsCmd groups read-only inspection of exec policy decisions.
 // There is deliberately no `approvals decide` (or similar) subcommand: a
 // pending approval's waiting goroutine lives in the gateway process's
-// memory (see internal/tools.TerminalApprover / the phase 6 Telegram
-// approver), not in a store row a separate CLI invocation could reach.
-// Deciding one from a second process would need an IPC channel to the
-// running gateway that v1 does not have; approve or deny from whichever
-// surface asked (the terminal prompt for `mtclaw prompt`, inline buttons
-// for Telegram).
+// memory (see internal/tools.TerminalApprover and the Telegram approver),
+// not in a store row a separate CLI invocation could reach. Deciding one
+// from a second process would need an IPC channel to the running gateway
+// that v1 does not have; approve or deny from whichever surface asked (the
+// terminal prompt for `mtclaw prompt`, inline buttons for Telegram).
 func newApprovalsCmd(s *state) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "approvals",
@@ -31,9 +30,10 @@ func newApprovalsListCmd(s *state) *cobra.Command {
 	var limit int
 
 	cmd := &cobra.Command{
-		Use:   "list",
-		Short: "List recent exec_audit rows: every command the policy engine decided on",
-		Args:  cobra.NoArgs,
+		Use:         "list",
+		Short:       "List recent exec_audit rows: every command the policy engine decided on",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configInspect),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			st, err := s.openStore(ctx, true)
@@ -59,7 +59,7 @@ func newApprovalsListCmd(s *state) *cobra.Command {
 				}
 				fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\t%s\t%v\t%s\n",
 					row.CreatedAt.Local().Format("2006-01-02 15:04:05"),
-					row.SessionID, row.Decision, decider(row.Decision), exit, dur, row.Truncated, row.Command,
+					row.SessionID, row.Decision, decider(row.Decision), exit, dur, row.Truncated, sanitizeForTable(row.Command),
 				)
 			}
 			return w.Flush()
@@ -84,6 +84,8 @@ func decider(decision string) string {
 		return "user"
 	case "expired":
 		return "timeout"
+	case "refused_too_long":
+		return "policy"
 	default:
 		return "unknown"
 	}

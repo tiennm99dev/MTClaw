@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/spf13/cobra"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -51,10 +53,10 @@ func TestNewRootCmd_ExecutesVersion(t *testing.T) {
 	assert.Contains(t, out.String(), "mtclaw")
 }
 
-// TestOpenStore_WriteModeCreatesStorageDir_ReadOnlyDoesNot pins the M1 fix:
+// TestOpenStore_WriteModeCreatesStorageDir_ReadOnlyDoesNot proves
 // config.Validate/config.LoadFile never create storage.path's parent
 // directory (see internal/config/validate.go's ensureDirCreatable), so a
-// read-only command that only loads the config must leave the filesystem
+// read-only command that only loads the config leaves the filesystem
 // untouched, while a write-mode store open is the one place that creates it.
 func TestOpenStore_WriteModeCreatesStorageDir_ReadOnlyDoesNot(t *testing.T) {
 	root := t.TempDir()
@@ -122,10 +124,170 @@ storage:
 	assert.True(t, info.IsDir())
 }
 
-// TestPrepare_ReadOnlyCommandsDoNotCreateLogFile pins the M1 fix: pointing
-// --config at a config whose log.file lives under a directory that does
-// not exist yet must not create that directory (or the log file) just to
-// run a read-only inspection command like `config validate`.
+// walkRunnable recurses through cmd's whole tree, calling fn on every
+// command cobra considers Runnable (has its own RunE/Run) - a group command
+// like `config` or `sessions` never executes on its own and does not need
+// its own annotation.
+func walkRunnable(cmd *cobra.Command, fn func(*cobra.Command)) {
+	if cmd.Runnable() {
+		fn(cmd)
+	}
+	for _, c := range cmd.Commands() {
+		walkRunnable(c, fn)
+	}
+}
+
+// TestEveryRunnableCommandDeclaresAConfigAnnotation walks the whole command
+// tree and asserts every command newRootCmd registers explicitly declares
+// its config requirement, rather than silently falling back to configLevel's
+// default - a renamed or newly added command that forgets to annotate
+// itself would otherwise load and validate the config (the safer default),
+// but silently, with nothing here to catch the omission.
+func TestEveryRunnableCommandDeclaresAConfigAnnotation(t *testing.T) {
+	root := newRootCmd(&state{})
+	walkRunnable(root, func(cmd *cobra.Command) {
+		_, ok := cmd.Annotations[annotationConfig]
+		assert.Truef(t, ok, "%q must declare Annotations[%q]", cmd.CommandPath(), annotationConfig)
+	})
+}
+
+// TestHelpAndCompletionWorkWithoutConfig proves cobra's built-in `help` and
+// `completion <shell>` commands, which inherit the root's
+// PersistentPreRunE, can run against a fresh HOME with no config file at
+// all - the first thing a new install's shell tab completion or `mtclaw
+// help` does must not itself require onboarding first.
+func TestHelpAndCompletionWorkWithoutConfig(t *testing.T) {
+	useFakeHome(t)
+
+	for _, args := range [][]string{
+		{"help"},
+		{"--help"},
+		{"completion", "bash"},
+		{"completion", "zsh"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			cmd := newRootCmd(&state{})
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetErr(&out)
+			cmd.SetArgs(args)
+			require.NoError(t, cmd.ExecuteContext(context.Background()))
+		})
+	}
+}
+
+// TestPrepare_InvalidLogLevelFlagIsRejected proves --log-level is validated
+// the same as log.level in the config file: an invalid flag value must fail
+// loudly instead of silently degrading to logging's own info fallback,
+// which is exactly what a typo'd config value no longer does either (see
+// config.validateLog).
+func TestPrepare_InvalidLogLevelFlagIsRejected(t *testing.T) {
+	useFakeHome(t)
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	doc := fmt.Sprintf(`version: 1
+agent:
+  model: gpt-4o-mini
+  workspace: %q
+channels:
+  telegram:
+    enabled: false
+tools:
+  filesystem:
+    roots: [%q]
+  exec:
+    cwd: %q
+cron:
+  timezone: UTC
+storage:
+  path: %q
+`, root, root, root, filepath.Join(root, "mtclaw.db"))
+	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
+
+	cmd := newRootCmd(&state{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"--config", configPath, "--log-level", "debgu", "config", "validate"})
+	err := cmd.ExecuteContext(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "--log-level")
+}
+
+// TestPrepare_LogLevelFlagAcceptsMixedCaseAndWarningAlias proves --log-level
+// is not stricter than the config file's own log.level: "WARN" and
+// "warning" always worked as a config value (see
+// TestValidate_LogFields_AcceptsMixedCaseWhitespaceAndWarningAlias) and
+// isValidLogLevel must accept the same spellings from the flag.
+func TestPrepare_LogLevelFlagAcceptsMixedCaseAndWarningAlias(t *testing.T) {
+	useFakeHome(t)
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	doc := fmt.Sprintf(`version: 1
+agent:
+  model: gpt-4o-mini
+  workspace: %q
+channels:
+  telegram:
+    enabled: false
+tools:
+  filesystem:
+    roots: [%q]
+  exec:
+    cwd: %q
+cron:
+  timezone: UTC
+storage:
+  path: %q
+`, root, root, root, filepath.Join(root, "mtclaw.db"))
+	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
+
+	for _, level := range []string{"WARN", "warning", " Info "} {
+		cmd := newRootCmd(&state{})
+		var out bytes.Buffer
+		cmd.SetOut(&out)
+		cmd.SetErr(&out)
+		cmd.SetArgs([]string{"--config", configPath, "--log-level", level, "config", "validate"})
+		assert.NoErrorf(t, cmd.ExecuteContext(context.Background()), "--log-level %q must be accepted", level)
+	}
+}
+
+// TestFinalizeExecuteError proves main.go can tell "a command failed
+// because the process was interrupted" apart from "a command failed on its
+// own", so it can exit 130 instead of the generic 1 only for the former.
+func TestFinalizeExecuteError(t *testing.T) {
+	boom := fmt.Errorf("boom")
+	interrupted := context.Canceled
+
+	assert.ErrorIs(t, finalizeExecuteError(boom, interrupted), ErrInterrupted,
+		"a command error while ctx had already ended must report as interrupted")
+	assert.Equal(t, boom, finalizeExecuteError(boom, nil),
+		"a command's own failure with a healthy ctx must be reported as-is")
+	assert.NoError(t, finalizeExecuteError(nil, interrupted),
+		"a command that still succeeded despite ctx ending must not be reported as an error at all")
+	assert.NoError(t, finalizeExecuteError(nil, nil))
+}
+
+// TestPrepare_MissingConfigPointsAtOnboard proves a first run of any
+// config-requiring command against a fresh HOME does not just report
+// "config file not found" with no pointer to how to fix it.
+func TestPrepare_MissingConfigPointsAtOnboard(t *testing.T) {
+	useFakeHome(t)
+	cmd := newRootCmd(&state{})
+	var out bytes.Buffer
+	cmd.SetOut(&out)
+	cmd.SetErr(&out)
+	cmd.SetArgs([]string{"config", "show"})
+
+	err := cmd.ExecuteContext(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "mtclaw onboard")
+}
+
+// TestPrepare_ReadOnlyCommandsDoNotCreateLogFile proves pointing --config
+// at a config whose log.file lives under a directory that does not exist
+// yet does not create that directory (or the log file) just to run a
+// read-only inspection command like `config validate`.
 func TestPrepare_ReadOnlyCommandsDoNotCreateLogFile(t *testing.T) {
 	root := t.TempDir()
 	logDir := filepath.Join(root, "nested", "logs")

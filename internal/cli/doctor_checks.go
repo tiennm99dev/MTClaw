@@ -17,6 +17,7 @@ import (
 	"github.com/tiennm99/MTClaw/internal/gateway"
 	"github.com/tiennm99/MTClaw/internal/provider/openai"
 	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	"github.com/tiennm99/MTClaw/internal/tools"
 )
 
 // doctorNetworkTimeout bounds every check that makes an outbound call
@@ -24,25 +25,25 @@ import (
 // `doctor` itself into the thing that hangs.
 const doctorNetworkTimeout = 15 * time.Second
 
-// doctorChecks returns every registered Check in the table order from
-// phase-09-hardening-and-release.md. configPath is closed over only by the
-// one check (config file permissions) that needs the config file's own
-// path rather than anything inside the loaded *config.Config.
+// doctorChecks returns every registered Check, in the order printed.
+// configPath is closed over only by the one check (config file permissions)
+// that needs the config file's own path rather than anything inside the
+// loaded *config.Config.
 func doctorChecks(configPath string) []Check {
 	stateDir, stateDirErr := config.StateDir()
 	return []Check{
 		{Name: "Config file permissions", Run: checkConfigFilePermissions(configPath)},
 		{Name: "State dir writable", Run: checkStateDirWritable(stateDir, stateDirErr)},
-		{Name: "DB opens and migrates", Run: checkDatabase},
-		{Name: "Instance lock", Run: checkInstanceLock(stateDir, stateDirErr)},
+		{Name: "DB opens at current schema", Run: checkDatabase},
+		{Name: "Instance lock", Run: checkInstanceLock},
 		{Name: "OpenAI key resolves", Run: checkOpenAIKeyResolves},
 		{Name: "OpenAI reachable", Run: checkOpenAIReachable},
 		{Name: "Model exists", Run: checkModelExists},
 		{Name: "Telegram token resolves", Run: checkTelegramTokenResolves},
 		{Name: "Telegram getMe", Run: checkTelegramGetMe},
-		{Name: "Allowlist non-empty", Run: checkAllowlistNonEmpty},
 		{Name: "Workspace exists and writable", Run: checkWorkspace},
 		{Name: "filesystem.roots exist", Run: checkFilesystemRoots},
+		{Name: "system_prompt_files readable", Run: checkSystemPromptFiles},
 		{Name: "exec.cwd exists", Run: checkExecCWD},
 		{Name: "Shell exists", Run: checkShellExists},
 		{Name: "Deny-list sanity", Run: checkDenyListSanity},
@@ -115,18 +116,27 @@ func checkDirWritable(label, dir string) Result {
 
 // checkDatabase opens storage.path the same way a real process would: a
 // database that already exists is opened read-only (never disturbing a
-// live gateway's connection), falling back to read-write only when that
-// fails (a fresh install with no database file yet); either way Open runs
-// pending migrations and refuses a schema newer than this binary supports,
-// so the same error text `doctor` reports here is what a real startup would
-// have hit.
+// live gateway's connection), falling back to read-write only when the
+// file does not exist yet at all (a fresh install, which is the one case
+// actually worth creating and migrating a database for). A read-only open
+// that fails for any other reason - most notably a database left behind a
+// pending migration, which a read-only connection refuses rather than
+// silently apply - is reported as-is, never retried read-write: retrying
+// unconditionally would let `doctor` migrate a database out from under a
+// gateway that is still running against it, exactly what a read-only-first
+// open is meant to avoid.
 func checkDatabase(ctx context.Context, cfg *config.Config) Result {
 	db, err := sqlite.Open(ctx, cfg.Storage.Path, true)
 	if err != nil {
-		db, err = sqlite.Open(ctx, cfg.Storage.Path, false)
-	}
-	if err != nil {
-		return Result{StatusFail, fmt.Sprintf("cannot open database %s: %v - check storage.path's parent directory permissions, or that this binary is at least as new as whatever last wrote this file", cfg.Storage.Path, err)}
+		if _, statErr := os.Stat(cfg.Storage.Path); os.IsNotExist(statErr) {
+			db, err = sqlite.Open(ctx, cfg.Storage.Path, false)
+			if err != nil {
+				return Result{StatusFail, fmt.Sprintf("cannot create database %s: %v - check storage.path's parent directory permissions", cfg.Storage.Path, err)}
+			}
+			defer db.Close()
+			return Result{StatusOK, fmt.Sprintf("%s created and migrated", cfg.Storage.Path)}
+		}
+		return Result{StatusFail, fmt.Sprintf("cannot open database %s read-only: %v - if this is a schema-behind database left by an older binary, restart the gateway (or run any command that opens it for writing) once to migrate it; doctor itself never migrates a database it only opened to inspect", cfg.Storage.Path, err)}
 	}
 	defer db.Close()
 	return Result{StatusOK, fmt.Sprintf("%s opens and is at the current schema version", cfg.Storage.Path)}
@@ -134,23 +144,19 @@ func checkDatabase(ctx context.Context, cfg *config.Config) Result {
 
 // checkInstanceLock reports a currently-held lock as INFO, not FAIL: a
 // running gateway holding its own lock is the expected, common case, not a
-// misconfiguration. stateDir/resolveErr are resolved once by doctorChecks;
-// see checkStateDirWritable's doc comment for why.
-func checkInstanceLock(stateDir string, resolveErr error) func(context.Context, *config.Config) Result {
-	return func(_ context.Context, _ *config.Config) Result {
-		if resolveErr != nil {
-			return Result{StatusFail, fmt.Sprintf("cannot resolve the state directory: %v", resolveErr)}
-		}
-		lockPath := filepath.Join(stateDir, "gateway.lock")
-		pid, held, err := gateway.Held(lockPath)
-		if err != nil {
-			return Result{StatusFail, fmt.Sprintf("cannot read instance lock %s: %v", lockPath, err)}
-		}
-		if held {
-			return Result{StatusInfo, fmt.Sprintf("gateway (pid %d) is running and holds the instance lock - expected while it runs; a persistent cron job cannot fire manually (`cron run`) until it stops", pid)}
-		}
-		return Result{StatusOK, "no gateway instance currently holds the lock"}
+// misconfiguration. The lock lives next to storage.path (gateway.LockPath),
+// not in a fixed state directory, so this reads cfg directly rather than a
+// stateDir resolved once for every check.
+func checkInstanceLock(_ context.Context, cfg *config.Config) Result {
+	lockPath := gateway.LockPath(*cfg)
+	pid, held, err := gateway.Held(lockPath)
+	if err != nil {
+		return Result{StatusFail, fmt.Sprintf("cannot read instance lock %s: %v", lockPath, err)}
 	}
+	if held {
+		return Result{StatusInfo, fmt.Sprintf("gateway (pid %d) is running and holds the instance lock at %s - expected while it runs; a persistent cron job cannot fire manually (`cron run`) until it stops", pid, lockPath)}
+	}
+	return Result{StatusOK, fmt.Sprintf("no gateway instance currently holds the lock at %s", lockPath)}
 }
 
 // checkOpenAIKeyResolves reports which source (env or file) filled
@@ -246,28 +252,29 @@ func checkTelegramGetMe(ctx context.Context, cfg *config.Config) Result {
 	return Result{StatusOK, fmt.Sprintf("bot is @%s", username)}
 }
 
-// checkAllowlistNonEmpty is a defensive duplicate, not load-bearing:
-// config.Validate already refuses to load a config where telegram is
-// enabled and every allowlist (channel-level and every group's) is empty,
-// and doctorChecks' only caller (runDoctor) always loads and validates the
-// config before running any Check - onboard included, since it runs
-// runDoctor against the file it just wrote. Reaching this check with cfg
-// loaded therefore means the allowlist cannot actually be empty; it stays
-// in the table anyway as an explicit, always-checkable row rather than a
-// silent assumption about what already ran.
-func checkAllowlistNonEmpty(_ context.Context, cfg *config.Config) Result {
-	tg := cfg.Channels.Telegram
-	if !tg.Enabled {
-		return Result{StatusOK, "channels.telegram.enabled is false; skipping"}
+// checkSystemPromptFiles verifies every agent.system_prompt_files entry
+// exists and is readable. config.Validate does not check this at all (it
+// cannot see the filesystem), and a missing file today is only a log Warn
+// from agent.assemblePrompt, skipped silently rather than failing the turn -
+// so this is doctor's one chance to surface it before a real conversation
+// starts with a thinner system prompt than the config implies.
+func checkSystemPromptFiles(_ context.Context, cfg *config.Config) Result {
+	files := cfg.Agent.SystemPromptFiles
+	if len(files) == 0 {
+		return Result{StatusOK, "agent.system_prompt_files is empty; nothing to check"}
 	}
-	groupAllows := 0
-	for _, g := range tg.Groups {
-		groupAllows += len(g.AllowFrom)
+	var unreadable []string
+	for _, path := range files {
+		if f, err := os.Open(path); err != nil {
+			unreadable = append(unreadable, fmt.Sprintf("%s (%v)", path, err))
+		} else {
+			f.Close()
+		}
 	}
-	if len(tg.AllowFrom) == 0 && groupAllows == 0 {
-		return Result{StatusFail, "channels.telegram.allow_from (and every group's allow_from) is empty; the bot would accept no one - run `mtclaw onboard` or add your user id to channels.telegram.allow_from (get it with /whoami)"}
+	if len(unreadable) > 0 {
+		return Result{StatusFail, fmt.Sprintf("cannot read: %s - a missing file is skipped with a log warning at turn time, not treated as an error, so the agent silently runs with a thinner system prompt than configured", strings.Join(unreadable, ", "))}
 	}
-	return Result{StatusOK, fmt.Sprintf("%d channel-level id(s), %d group-level id(s) allowed", len(tg.AllowFrom), groupAllows)}
+	return Result{StatusOK, fmt.Sprintf("%d file(s) readable", len(files))}
 }
 
 // checkWorkspace verifies agent.workspace exists and is writable.
@@ -317,32 +324,21 @@ func checkExecCWD(_ context.Context, cfg *config.Config) Result {
 	return Result{StatusOK, fmt.Sprintf("%q exists", execCfg.CWD)}
 }
 
-// checkShellExists resolves tools.exec.shell (or its OS default) and looks
+// checkShellExists resolves tools.exec.shell (or its OS default, via the
+// same tools.ResolveShell the exec tool itself uses - see policy.go/exec.go
+// - so this can never drift from what actually runs a command) and looks
 // it up on PATH.
 func checkShellExists(_ context.Context, cfg *config.Config) Result {
 	execCfg := cfg.Tools.Exec
 	if !execCfg.Enabled {
 		return Result{StatusOK, "tools.exec.enabled is false; skipping"}
 	}
-	shell := execCfg.Shell
-	if len(shell) == 0 {
-		shell = defaultShellArgv()
-	}
+	shell := tools.ResolveShell(execCfg.Shell)
 	path, err := osexec.LookPath(shell[0])
 	if err != nil {
 		return Result{StatusFail, fmt.Sprintf("shell %q is not on PATH: %v - install it or set tools.exec.shell", shell[0], err)}
 	}
 	return Result{StatusOK, fmt.Sprintf("%s -> %s", shell[0], path)}
-}
-
-// defaultShellArgv mirrors internal/tools's own (unexported) shell default:
-// deliberate small duplication rather than exporting policy-engine
-// internals from phase 5 just so a diagnostic can read them.
-func defaultShellArgv() []string {
-	if runtime.GOOS == "windows" {
-		return []string{"powershell", "-NoProfile", "-Command"}
-	}
-	return []string{"/bin/bash", "-lc"}
 }
 
 // checkDenyListSanity warns loudly on an empty deny-list while exec is
@@ -374,23 +370,23 @@ func checkExecModeAuto(_ context.Context, cfg *config.Config) Result {
 	return Result{StatusOK, fmt.Sprintf("tools.exec.mode is %q", execCfg.Mode)}
 }
 
-// checkCron loads cron.timezone, validates every job's cron expression, and
-// prints each enabled job's next due time. Expression validity and
-// deliver_to reachability are already enforced by config.Validate at load
-// time; this check re-derives the next-run time (the one thing Validate
-// does not compute) and would surface a timezone or expression regression
-// even if Validate somehow ran against a different config than the one
-// loaded here.
+// checkCron prints each enabled job's next due time. It assumes cfg already
+// passed config.Validate - true of every Check here, since runDoctor always
+// validates before running any of them (see runDoctor) - so it does not
+// re-check cron.timezone or re-validate each job's schedule; both would
+// already have failed to load if either were wrong. This check exists
+// because the next-run time itself is the one thing Validate does not
+// compute.
 func checkCron(_ context.Context, cfg *config.Config) Result {
 	if !cfg.Cron.Enabled {
 		return Result{StatusOK, "cron.enabled is false; skipping"}
 	}
+	if len(cfg.Cron.Jobs) == 0 {
+		return Result{StatusOK, "cron.enabled is true with no jobs configured"}
+	}
 	loc, err := time.LoadLocation(cfg.Cron.Timezone)
 	if err != nil {
 		return Result{StatusFail, fmt.Sprintf("cron.timezone %q does not load: %v", cfg.Cron.Timezone, err)}
-	}
-	if len(cfg.Cron.Jobs) == 0 {
-		return Result{StatusOK, "cron.enabled is true with no jobs configured"}
 	}
 
 	lines := make([]string, 0, len(cfg.Cron.Jobs))
@@ -398,9 +394,6 @@ func checkCron(_ context.Context, cfg *config.Config) Result {
 		if !job.Enabled {
 			lines = append(lines, fmt.Sprintf("%s: disabled", job.Name))
 			continue
-		}
-		if !gronx.IsValid(job.Schedule) {
-			return Result{StatusFail, fmt.Sprintf("cron job %q has an invalid schedule %q", job.Name, job.Schedule)}
 		}
 		next, err := gronx.NextTickAfter(job.Schedule, time.Now().In(loc), false)
 		if err != nil {

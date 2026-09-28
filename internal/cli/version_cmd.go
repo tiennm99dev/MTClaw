@@ -10,9 +10,10 @@ import (
 
 func newVersionCmd() *cobra.Command {
 	return &cobra.Command{
-		Use:   "version",
-		Short: "Print the mtclaw version",
-		Args:  cobra.NoArgs,
+		Use:         "version",
+		Short:       "Print the mtclaw version",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configNone),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			_, err := fmt.Fprintln(cmd.OutOrStdout(), version.String())
 			return err

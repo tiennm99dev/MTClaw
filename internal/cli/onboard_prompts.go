@@ -74,17 +74,67 @@ func (p *stdioPrompter) Text(question, def string) (string, error) {
 	return line, nil
 }
 
+// Secret reads a hidden answer without echo, the same way readLine handles
+// a plain one: the actual term.ReadPassword call runs on its own goroutine
+// so a ctx cancellation (SIGINT) can interrupt the wait immediately instead
+// of blocking until the terminal produces another byte. term.ReadPassword
+// clears ECHO but keeps ISIG, so the read itself is not what used to ignore
+// the first Ctrl-C - nothing was watching p.ctx.Done() at all while it
+// blocked. On cancellation this also explicitly restores the terminal state
+// captured before the read started: previously, only term.ReadPassword's
+// own deferred restore ever ran that, and a second Ctrl-C killed the
+// process (via the root context's own hard-kill-on-second-signal handling)
+// before that deferred restore had a chance to execute, leaving the shell
+// with echo off until `stty sane`.
 func (p *stdioPrompter) Secret(question string) (string, error) {
 	fmt.Fprintf(p.out, "%s: ", question)
-	if p.stdinFd >= 0 && term.IsTerminal(p.stdinFd) {
-		data, err := term.ReadPassword(p.stdinFd)
-		fmt.Fprintln(p.out)
-		if err != nil {
-			return "", fmt.Errorf("read secret input: %w", err)
-		}
-		return strings.TrimSpace(string(data)), nil
+	if p.stdinFd < 0 || !term.IsTerminal(p.stdinFd) {
+		return p.readLine()
 	}
-	return p.readLine()
+
+	state, err := term.GetState(p.stdinFd)
+	if err != nil {
+		return "", fmt.Errorf("read secret input: %w", err)
+	}
+
+	// If ctx already ended (a signal landed, or the caller's own timeout
+	// already elapsed) before this point, return now instead of starting
+	// the read goroutine at all: term.ReadPassword itself is what turns
+	// echo off, and it does that on its own goroutine, not synchronously
+	// here - if the select below picked the ctx.Done() case before that
+	// goroutine reached its own echo-off step, Restore below would run
+	// against the still-echo-on state, and then the goroutine's later
+	// echo-off would never be undone. Checking here closes that for the
+	// common case (ctx already done when Secret is entered); a signal
+	// landing in the few microseconds between this check and the read
+	// goroutine actually turning echo off is not - that residual window is
+	// accepted.
+	if p.ctx.Err() != nil {
+		return "", fmt.Errorf("interrupted while waiting for an answer: %w", p.ctx.Err())
+	}
+
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		data, err := term.ReadPassword(p.stdinFd)
+		ch <- result{data, err}
+	}()
+
+	select {
+	case r := <-ch:
+		fmt.Fprintln(p.out)
+		if r.err != nil {
+			return "", fmt.Errorf("read secret input: %w", r.err)
+		}
+		return strings.TrimSpace(string(r.data)), nil
+	case <-p.ctx.Done():
+		_ = term.Restore(p.stdinFd, state)
+		fmt.Fprintln(p.out)
+		return "", fmt.Errorf("interrupted while waiting for an answer: %w", p.ctx.Err())
+	}
 }
 
 func (p *stdioPrompter) Confirm(question string, defaultYes bool) (bool, error) {
@@ -107,9 +157,9 @@ func (p *stdioPrompter) Confirm(question string, defaultYes bool) (bool, error) 
 // readLine reads one line, trimmed. A final answer with no trailing newline
 // (EOF right after some content) is still real input and is returned
 // normally; EOF with nothing pending means stdin closed before answering,
-// which must abort the caller instead of looping forever on an empty
-// answer - see runOnboard's model prompt, which used to spin forever (and
-// fill the disk) against a closed or `/dev/null` stdin.
+// which must abort the caller with an error instead of returning an empty
+// string a required-answer loop (like runOnboard's model prompt) would
+// just re-prompt for forever against a closed or `/dev/null` stdin.
 //
 // The read runs on its own goroutine so an interrupt (ctx done) aborts the
 // prompt immediately: a blocking os.Stdin read cannot otherwise be woken,

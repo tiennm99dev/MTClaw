@@ -28,7 +28,8 @@ func newPromptCmd(s *state) *cobra.Command {
 			"session are not serialized (unlike `cron run`, which refuses to run a " +
 			"persistent job while the gateway holds its lock): two overlapping runs " +
 			"read the same history and can interleave the transcript.",
-		Args: cobra.ExactArgs(1),
+		Args:        cobra.ExactArgs(1),
+		Annotations: configAnnotation(configFull),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -54,7 +55,7 @@ func newPromptCmd(s *state) *cobra.Command {
 			}
 
 			if !result.NoReply {
-				if _, err := fmt.Fprintln(cmd.OutOrStdout(), result.Text); err != nil {
+				if _, err := fmt.Fprintln(cmd.OutOrStdout(), sanitizeForTerminal(result.Text)); err != nil {
 					return err
 				}
 			}
@@ -64,6 +65,7 @@ func newPromptCmd(s *state) *cobra.Command {
 
 	cmd.Flags().StringVar(&sessionFlag, "session", "", "reuse a specific session id instead of the default cli/local session")
 	cmd.Flags().BoolVar(&newFlag, "new", false, "force a fresh session instead of reusing the default cli/local one")
+	cmd.MarkFlagsMutuallyExclusive("session", "new")
 
 	return cmd
 }

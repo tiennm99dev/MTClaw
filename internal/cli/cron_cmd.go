@@ -3,7 +3,7 @@ package cli
 import (
 	"context"
 	"fmt"
-	"path/filepath"
+	"os"
 	"text/tabwriter"
 	"time"
 
@@ -34,9 +34,10 @@ func newCronCmd(s *state) *cobra.Command {
 // list`: WAL lets it run safely alongside a live gateway.
 func newCronListCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "list",
-		Short: "List configured cron jobs, their schedule, and last run",
-		Args:  cobra.NoArgs,
+		Use:         "list",
+		Short:       "List configured cron jobs, their schedule, and last run",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configInspect),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 
@@ -45,9 +46,18 @@ func newCronListCmd(s *state) *cobra.Command {
 				return fmt.Errorf("cron.timezone: %w", err)
 			}
 
-			st, err := s.openStore(ctx, true)
-			if err != nil {
-				return err
+			// A database that has never been created (no gateway, `prompt`,
+			// or `cron run` has run yet) is not a failure worth reporting
+			// here: cron list's whole point is to work from the config
+			// alone, falling back to "-" for the last-run columns precisely
+			// because there is nothing to report yet, not because anything
+			// is broken.
+			var st store.Store
+			if _, statErr := os.Stat(s.cfg.Storage.Path); statErr == nil {
+				st, err = s.openStore(ctx, true)
+				if err != nil {
+					return err
+				}
 			}
 
 			w := tabwriter.NewWriter(cmd.OutOrStdout(), 0, 2, 2, ' ', 0)
@@ -63,13 +73,15 @@ func newCronListCmd(s *state) *cobra.Command {
 				}
 
 				lastStatus, lastRun := "-", "-"
-				runs, err := st.CronRuns().List(ctx, job.Name, 1)
-				if err != nil {
-					return fmt.Errorf("list runs for job %s: %w", job.Name, err)
-				}
-				if len(runs) > 0 {
-					lastStatus = runs[0].Status
-					lastRun = runs[0].StartedAt.In(loc).Format("2006-01-02 15:04:05 MST")
+				if st != nil {
+					runs, err := st.CronRuns().List(ctx, job.Name, 1)
+					if err != nil {
+						return fmt.Errorf("list runs for job %s: %w", job.Name, err)
+					}
+					if len(runs) > 0 {
+						lastStatus = runs[0].Status
+						lastRun = runs[0].StartedAt.In(loc).Format("2006-01-02 15:04:05 MST")
+					}
 				}
 
 				fmt.Fprintf(w, "%s\t%s\t%t\t%s\t%s\t%s\n", job.Name, job.Schedule, job.Enabled, nextDue, lastStatus, lastRun)
@@ -85,15 +97,20 @@ func newCronListCmd(s *state) *cobra.Command {
 // actually sending the result. A persistent job (and one not overridden by
 // --ephemeral) refuses to run while the gateway lock is held: nothing
 // serializes two processes appending to the same session, and the gateway
-// may fire this exact job concurrently.
+// may fire this exact job concurrently. This check and the turn that
+// follows are not atomic - a gateway starting in the gap between the lock
+// check and the store open could still race this run - a narrow,
+// documented window rather than one this command closes by holding the
+// lock itself for the run's duration.
 func newCronRunCmd(s *state) *cobra.Command {
 	var deliverFlag bool
 	var ephemeralFlag bool
 
 	cmd := &cobra.Command{
-		Use:   "run <name>",
-		Short: "Fire one cron job immediately, in-process",
-		Args:  cobra.ExactArgs(1),
+		Use:         "run <name>",
+		Short:       "Fire one cron job immediately, in-process",
+		Args:        cobra.ExactArgs(1),
+		Annotations: configAnnotation(configFull),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			name := args[0]
@@ -105,7 +122,7 @@ func newCronRunCmd(s *state) *cobra.Command {
 
 			ephemeral := ephemeralFlag || job.Session == "ephemeral"
 			if !ephemeral {
-				if err := refuseIfGatewayLocked(name); err != nil {
+				if err := refuseIfGatewayLocked(*s.cfg, name); err != nil {
 					return err
 				}
 			}
@@ -136,9 +153,10 @@ func newCronRunCmd(s *state) *cobra.Command {
 				}()
 			}
 
+			started := time.Now()
 			result := loop.Run(ctx, sess.ID, job.Prompt, "", nil)
 
-			recordManualRun(ctx, cmd, st.CronRuns(), job.Name, sess.ID, result.Err)
+			recordManualRun(ctx, cmd, st.CronRuns(), job.Name, sess.ID, started, result.Err)
 
 			if result.Err != nil {
 				return fmt.Errorf("job %q failed: %w", name, result.Err)
@@ -149,7 +167,13 @@ func newCronRunCmd(s *state) *cobra.Command {
 			}
 
 			if !deliverFlag {
-				_, err := fmt.Fprintln(cmd.OutOrStdout(), result.Text)
+				// sanitizeForTerminal, not on the --deliver path below: this
+				// writes straight to a terminal, the same surface `prompt`
+				// prints to (see prompt_cmd.go), and the model's own text -
+				// or content a web_fetch tool call pulled in - is not
+				// trusted to be free of control/escape sequences that could
+				// redraw or hide what the terminal shows.
+				_, err := fmt.Fprintln(cmd.OutOrStdout(), sanitizeForTerminal(result.Text))
 				return err
 			}
 			return deliverCronResult(cmd, s, job.DeliverTo, result.Text)
@@ -183,15 +207,12 @@ func findCronJob(jobs []config.CronJob, name string) *config.CronJob {
 }
 
 // refuseIfGatewayLocked errors out, naming the blocking pid, if a gateway
-// instance currently holds the lock file - see gateway.Held's doc comment
-// for why a persistent job's manual run must not proceed concurrently with
-// one.
-func refuseIfGatewayLocked(jobName string) error {
-	stateDir, err := config.StateDir()
-	if err != nil {
-		return fmt.Errorf("resolve state directory: %w", err)
-	}
-	lockPath := filepath.Join(stateDir, "gateway.lock")
+// instance currently holds the instance lock next to cfg's database - see
+// gateway.Held's doc comment for why a persistent job's manual run must not
+// proceed concurrently with one, and gateway.LockPath for why the lock
+// lives next to storage.path rather than in a fixed location.
+func refuseIfGatewayLocked(cfg config.Config, jobName string) error {
+	lockPath := gateway.LockPath(cfg)
 	pid, held, err := gateway.Held(lockPath)
 	if err != nil {
 		return fmt.Errorf("check gateway lock: %w", err)
@@ -205,19 +226,22 @@ func refuseIfGatewayLocked(jobName string) error {
 // recordManualRun writes one cron_runs row for a `cron run` invocation,
 // mirroring the scheduler's own started->finished bookkeeping but
 // collapsed into a single Append (there is no concurrent tick to race
-// against here). A store failure is a warning, not a command failure: the
-// turn itself already ran to completion (or was cancelled) by the time this
-// is called. It records under context.WithoutCancel(ctx) - same rationale
-// as the ephemeral-session cleanup above - so a Ctrl-C that cancelled ctx
-// mid-turn does not also cancel the write that records how the turn ended;
-// otherwise an interrupted run would vanish from cron_runs with no trace.
-func recordManualRun(ctx context.Context, cmd *cobra.Command, runs store.CronRunStore, jobName, sessionID string, turnErr error) {
+// against here). started is captured by the caller before loop.Run, so
+// StartedAt actually precedes FinishedAt instead of both being the same
+// post-turn timestamp. A store failure is a warning, not a command failure:
+// the turn itself already ran to completion (or was cancelled) by the time
+// this is called. It records under context.WithoutCancel(ctx) - same
+// rationale as the ephemeral-session cleanup above - so a Ctrl-C that
+// cancelled ctx mid-turn does not also cancel the write that records how
+// the turn ended; otherwise an interrupted run would vanish from cron_runs
+// with no trace.
+func recordManualRun(ctx context.Context, cmd *cobra.Command, runs store.CronRunStore, jobName, sessionID string, started time.Time, turnErr error) {
 	status, errMsg := "ok", ""
 	if turnErr != nil {
 		status, errMsg = "error", turnErr.Error()
 	}
-	now := time.Now()
-	run := &store.CronRun{JobName: jobName, SessionID: sessionID, Status: status, Error: errMsg, StartedAt: now, FinishedAt: &now}
+	finished := time.Now()
+	run := &store.CronRun{JobName: jobName, SessionID: sessionID, Status: status, Error: errMsg, StartedAt: started, FinishedAt: &finished}
 	if err := runs.Append(context.WithoutCancel(ctx), run); err != nil {
 		fmt.Fprintf(cmd.ErrOrStderr(), "warning: record cron run: %v\n", err)
 	}

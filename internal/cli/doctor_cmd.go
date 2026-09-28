@@ -113,9 +113,10 @@ func newDoctorCmd(s *state) *cobra.Command {
 	var jsonOut bool
 
 	cmd := &cobra.Command{
-		Use:   "doctor",
-		Short: "Diagnose the local install and configuration",
-		Args:  cobra.NoArgs,
+		Use:         "doctor",
+		Short:       "Diagnose the local install and configuration",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configNone),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			rows := runDoctor(cmd.Context(), s.configPath)
 			if err := printDoctorReport(cmd.OutOrStdout(), rows, jsonOut); err != nil {

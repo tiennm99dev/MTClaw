@@ -269,11 +269,10 @@ func TestRunOnboard_TelegramEnabled_NonPositiveManualIDWarns(t *testing.T) {
 	assert.Contains(t, p.out.String(), "not a positive user id")
 }
 
-// TestRunOnboard_ClosedStdinAbortsWithoutWritingConfig pins the C1 fix end
-// to end: onboard driven by a real stdioPrompter over an already-closed
-// reader (the `mtclaw onboard < /dev/null` / systemd-unit / CI-step case
-// that used to spin forever and fill the disk) must abort with an error
-// and must never write a config file.
+// TestRunOnboard_ClosedStdinAbortsWithoutWritingConfig proves onboard driven
+// by a real stdioPrompter over an already-closed reader (the `mtclaw
+// onboard < /dev/null` / systemd-unit / CI-step case) aborts with an error
+// and never writes a config file, end to end.
 func TestRunOnboard_ClosedStdinAbortsWithoutWritingConfig(t *testing.T) {
 	useFakeHome(t)
 	configPath := onboardConfigPath(t)
@@ -295,10 +294,44 @@ func TestRunOnboard_RefusesToOverwriteExistingConfig(t *testing.T) {
 
 	p := &scriptedPrompter{t: t}
 	err := runOnboard(context.Background(), &p.out, configPath, p, &fakeTelegramCapturer{})
-	require.NoError(t, err, "refusing to overwrite is not itself an error")
+	require.ErrorIs(t, err, errConfigAlreadyExists, "a script driving onboard must be able to tell this apart from a real run by exit code")
 
 	after, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 	assert.Equal(t, original, after, "the existing config file must be byte-for-byte untouched")
 	assert.Contains(t, p.out.String(), "refuses to overwrite")
+}
+
+// TestRunOnboard_PreservesExistingCustomizedAgentsMD proves a user who
+// deletes (or renames) config.yaml to re-onboard - exactly what
+// showWouldNotOverwrite's own message tells them to do - and re-runs onboard
+// does not lose a prompts/AGENTS.md they have since customized, even though
+// onboard writes a fresh config.yaml right next to it.
+func TestRunOnboard_PreservesExistingCustomizedAgentsMD(t *testing.T) {
+	useFakeHome(t)
+	configPath := onboardConfigPath(t)
+	promptsDir := filepath.Join(filepath.Dir(configPath), "prompts")
+	require.NoError(t, os.MkdirAll(promptsDir, 0o700))
+	agentsPath := filepath.Join(promptsDir, "AGENTS.md")
+	const customized = "# My customized instructions\nNever delete anything without asking.\n"
+	require.NoError(t, os.WriteFile(agentsPath, []byte(customized), 0o644))
+
+	p := &scriptedPrompter{
+		t:        t,
+		texts:    []string{"", "gpt-4o-mini", filepath.Join(t.TempDir(), "workspace")},
+		secrets:  []string{""},
+		confirms: []bool{false},
+	}
+	err := runOnboard(context.Background(), &p.out, configPath, p, &fakeTelegramCapturer{})
+	require.NoError(t, err)
+
+	after, err := os.ReadFile(agentsPath)
+	require.NoError(t, err)
+	assert.Equal(t, customized, string(after), "onboard must never overwrite an existing prompts/AGENTS.md")
+	assert.Contains(t, p.out.String(), "keeping existing")
+
+	cfg, err := config.LoadFile(configPath)
+	require.NoError(t, err)
+	require.Len(t, cfg.Agent.SystemPromptFiles, 1)
+	assert.Equal(t, agentsPath, cfg.Agent.SystemPromptFiles[0], "the fresh config must still reference the preserved file")
 }

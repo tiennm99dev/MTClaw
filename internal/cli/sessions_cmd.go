@@ -23,12 +23,19 @@ func newSessionsCmd(s *state) *cobra.Command {
 }
 
 // newSessionsListCmd opens the store read-only: WAL lets it run safely
-// while the gateway is writing.
+// while the gateway is writing. --limit bounds both the session list itself
+// and, transitively, how many per-session CountBySession queries this runs
+// (one per listed session): the default of 50 keeps an install with a very
+// long session history from making an unbounded number of extra queries
+// every time someone runs `sessions list` with no arguments.
 func newSessionsListCmd(s *state) *cobra.Command {
-	return &cobra.Command{
-		Use:   "list",
-		Short: "List stored sessions",
-		Args:  cobra.NoArgs,
+	var limit int
+
+	cmd := &cobra.Command{
+		Use:         "list",
+		Short:       "List stored sessions",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configInspect),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			st, err := s.openStore(ctx, true)
@@ -36,7 +43,7 @@ func newSessionsListCmd(s *state) *cobra.Command {
 				return err
 			}
 
-			sessions, err := st.Sessions().List(ctx, 0)
+			sessions, err := st.Sessions().List(ctx, limit)
 			if err != nil {
 				return fmt.Errorf("list sessions: %w", err)
 			}
@@ -56,14 +63,18 @@ func newSessionsListCmd(s *state) *cobra.Command {
 			return w.Flush()
 		},
 	}
+
+	cmd.Flags().IntVar(&limit, "limit", 50, "maximum number of sessions to show, most recently updated first (0 = no limit)")
+	return cmd
 }
 
 // newSessionsShowCmd opens the store read-only, same rationale as list.
 func newSessionsShowCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "show <id>",
-		Short: "Print a session's message transcript",
-		Args:  cobra.ExactArgs(1),
+		Use:         "show <id>",
+		Short:       "Print a session's message transcript",
+		Args:        cobra.ExactArgs(1),
+		Annotations: configAnnotation(configInspect),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			id := args[0]
@@ -88,12 +99,12 @@ func newSessionsShowCmd(s *state) *cobra.Command {
 			out := cmd.OutOrStdout()
 			fmt.Fprintf(out, "session %s (%s/%s) created %s\n\n", sess.ID, sess.Channel, sess.ChatID, sess.CreatedAt.Local().Format(time.RFC3339))
 			for _, m := range msgs {
-				fmt.Fprintf(out, "[%d] %s: %s\n", m.Seq, m.Role, m.Content)
+				fmt.Fprintf(out, "[%d] %s: %s\n", m.Seq, m.Role, sanitizeForTerminal(m.Content))
 				if m.ToolCalls != "" {
-					fmt.Fprintf(out, "    tool_calls: %s\n", m.ToolCalls)
+					fmt.Fprintf(out, "    tool_calls: %s\n", sanitizeForTerminal(m.ToolCalls))
 				}
 				if m.ToolCallID != "" {
-					fmt.Fprintf(out, "    tool_call_id: %s tool_name: %s\n", m.ToolCallID, m.ToolName)
+					fmt.Fprintf(out, "    tool_call_id: %s tool_name: %s\n", sanitizeForTerminal(m.ToolCallID), sanitizeForTerminal(m.ToolName))
 				}
 			}
 			return nil
@@ -102,14 +113,15 @@ func newSessionsShowCmd(s *state) *cobra.Command {
 }
 
 // newSessionsRmCmd is the one sessions subcommand that writes: it is one
-// of the deliberate second writers documented in phase 2's architecture
+// of the deliberate second writers documented in docs/architecture.md
 // (dropping a poisoned session without stopping the gateway), so it opens
 // read-write while every other sessions command stays read-only.
 func newSessionsRmCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "rm <id>",
-		Short: "Delete a session (cascades messages and approvals; preserves exec_audit)",
-		Args:  cobra.ExactArgs(1),
+		Use:         "rm <id>",
+		Short:       "Delete a session (cascades messages and approvals; preserves exec_audit)",
+		Args:        cobra.ExactArgs(1),
+		Annotations: configAnnotation(configFull),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			id := args[0]

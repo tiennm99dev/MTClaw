@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/tiennm99/MTClaw/internal/gateway"
+	"github.com/tiennm99/MTClaw/internal/tools"
 	"github.com/tiennm99/MTClaw/internal/version"
 )
 
@@ -18,9 +19,10 @@ import (
 // end, since it also needs the instance lock acquired first.
 func newGatewayCmd(s *state) *cobra.Command {
 	return &cobra.Command{
-		Use:   "gateway",
-		Short: "Run the long-running Telegram gateway",
-		Args:  cobra.NoArgs,
+		Use:         "gateway",
+		Short:       "Run the long-running Telegram gateway",
+		Args:        cobra.NoArgs,
+		Annotations: configAnnotation(configFull),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if !s.cfg.Channels.Telegram.Enabled {
 				return fmt.Errorf("gateway: channels.telegram.enabled is false in %s; the gateway has no channel to serve", s.configPath)
@@ -28,6 +30,17 @@ func newGatewayCmd(s *state) *cobra.Command {
 
 			log := slog.Default()
 			logStartupBanner(log, s)
+
+			// Closes the one remaining vector filterEnv itself cannot: a
+			// same-uid process reading this one's secrets straight out of
+			// /proc/<pid>/environ, regardless of what the exec tool's own
+			// child inherits (see docs/security.md). Best-effort: a
+			// platform where this is a no-op (anything but Linux), or a
+			// permission error setting PR_SET_DUMPABLE, must not stop the
+			// gateway from starting.
+			if err := tools.DisableEnvironRead(); err != nil {
+				log.Warn("gateway: disable /proc/<pid>/environ read failed", "error", err)
+			}
 
 			gw, err := gateway.New(*s.cfg, log)
 			if err != nil {
