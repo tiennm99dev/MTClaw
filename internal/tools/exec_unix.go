@@ -8,18 +8,30 @@ import (
 )
 
 // setProcessGroup puts cmd's child in its own process group (setpgid) so
-// killProcessTree can signal the whole group - the child and anything it
-// forked - in one syscall instead of only the direct child.
+// unixProcessTree.kill can signal the whole group - the child and anything
+// it forked - in one syscall instead of only the direct child.
 func setProcessGroup(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 }
 
-// killProcessTree sends SIGKILL to cmd's entire process group. The negative
-// pid is the POSIX convention for "the process group led by this pid",
-// which setProcessGroup made cmd's own pid.
-func killProcessTree(cmd *exec.Cmd) {
+// unixProcessTree kills the process group setProcessGroup placed cmd's
+// child into. The negative pid is the POSIX convention for "the process
+// group led by this pid".
+type unixProcessTree struct {
+	pid int
+}
+
+// trackProcessTree must be called after cmd.Start succeeds, once cmd.Process
+// is populated. On unix there is nothing extra to set up - the process
+// group was already created via setProcessGroup before Start - so this only
+// captures the pid the kill will target.
+func trackProcessTree(cmd *exec.Cmd) processTree {
 	if cmd.Process == nil {
-		return
+		return nil
 	}
-	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	return &unixProcessTree{pid: cmd.Process.Pid}
+}
+
+func (t *unixProcessTree) kill() {
+	_ = syscall.Kill(-t.pid, syscall.SIGKILL)
 }

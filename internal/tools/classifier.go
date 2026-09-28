@@ -22,9 +22,9 @@ type ClassifyResult struct {
 // than a concrete type baked into Policy - specifically so tests can inject
 // a fake that returns malformed JSON, times out, or reports a chosen risk,
 // without exercising a real provider call. The real implementation,
-// LLMClassifier, is a convenience feature, not a security control: see the
-// package doc and phase 5's Security Model for why the deny-list, not this,
-// is the enforcement boundary.
+// LLMClassifier, is a convenience feature, not a security control: see
+// docs/security.md for why the deny-list, not this, is the enforcement
+// boundary.
 type Classifier interface {
 	// Classify receives only the command, its cwd, and the shell that will
 	// run it - never any other context the model may be holding (a fetched
@@ -64,8 +64,8 @@ var _ Classifier = (*LLMClassifier)(nil)
 // (and re-spend latency and money) as many times as the agent's own
 // provider.MaxRetries, defeating the whole point of a "cheap" classifier
 // call. model falls back to oaiCfg's own default only if the caller passes
-// one; New in registry.go resolves tools.exec.auto.model -> agent.model
-// before calling this.
+// one; registerExecTool in exec.go resolves tools.exec.auto.model ->
+// agent.model before calling this.
 func NewLLMClassifier(oaiCfg config.OpenAIConfig, model string) (*LLMClassifier, error) {
 	cfg := oaiCfg
 	cfg.MaxRetries = 0
@@ -76,12 +76,15 @@ func NewLLMClassifier(oaiCfg config.OpenAIConfig, model string) (*LLMClassifier,
 	return &LLMClassifier{prov: client, model: model}, nil
 }
 
-// Classify calls the provider with a forced-JSON prompt and a fixed
-// classifierTimeout bound derived from ctx (so turn cancellation still
-// cancels it immediately), then strictly unmarshals the response. Any
+// Classify calls the provider with a forced-JSON prompt using whatever ctx
+// the caller passes, then strictly unmarshals the response. Policy.
+// evaluateAuto is the only caller; it derives ctx from its own
+// classifierTimeout bound before calling Classify, so a slow or hanging
+// provider call still ends promptly and turn cancellation still cancels it
+// immediately - this function itself applies no timeout of its own. Any
 // error, timeout, or unparseable/invalid response is returned as an error;
-// Policy.evaluateAuto is the only caller and always treats a non-nil error
-// as VerdictAsk, never VerdictRun.
+// evaluateAuto always treats a non-nil error as VerdictAsk, never
+// VerdictRun.
 func (c *LLMClassifier) Classify(ctx context.Context, command, cwd string, shell []string) (ClassifyResult, error) {
 	req := provider.Request{
 		Model: c.model,

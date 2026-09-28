@@ -51,7 +51,7 @@ func newTestExecTool(t *testing.T, approver Approver, cfgFn func(*config.ExecCon
 
 	et := &execTool{
 		cfg:      cfg,
-		shell:    resolveShell(cfg.Shell),
+		shell:    ResolveShell(cfg.Shell),
 		policy:   policy,
 		approver: approver,
 		audit:    st.Audit(),
@@ -156,6 +156,33 @@ func TestExec_ApprovalMode_ApproverDenies(t *testing.T) {
 	assert.Equal(t, "denied_user", rows[0].Decision)
 }
 
+// TestExec_ApprovalMode_ControlAndBidiCharsInCommandReachApproverEscaped
+// proves displayCommand's escaping (see escapeControlAndBidi) actually
+// reaches Request.Command through the real ask() path, not just as an
+// isolated unit test of the helper itself: a raw control character (which
+// could redraw what a terminal approver shows after the real command) and
+// a raw bidi override character (which could reorder how a Telegram prompt
+// reads) must never reach the approver unescaped.
+func TestExec_ApprovalMode_ControlAndBidiCharsInCommandReachApproverEscaped(t *testing.T) {
+	approver := &recordingApprover{approve: true}
+	et, _ := newTestExecTool(t, approver, nil)
+
+	rlo := string(rune(0x202e)) // right-to-left override
+	cmd := "echo hi\x1b[2K" + rlo + "evil"
+
+	_, err := et.run(context.Background(), mustArgs(t, execArgs{Command: cmd}), testMeta())
+	require.NoError(t, err)
+	require.True(t, approver.called)
+
+	got := approver.lastReq.Command
+	wantControlEscape := fmt.Sprintf("\\x%02x", 0x1b)
+	wantBidiEscape := fmt.Sprintf("\\u%04x", 0x202e)
+	assert.NotContains(t, got, "\x1b", "a raw control character must not reach the approver unescaped")
+	assert.NotContains(t, got, rlo, "a raw bidi override character must not reach the approver unescaped")
+	assert.Contains(t, got, wantControlEscape, "the escaped literal form must still be visible so a human can tell something was there")
+	assert.Contains(t, got, wantBidiEscape, "the escaped literal form of the bidi override must still be visible")
+}
+
 func TestExec_ApprovalMode_NoApproverExpires(t *testing.T) {
 	et, st := newTestExecTool(t, DenyAllApprover{}, nil)
 
@@ -167,6 +194,26 @@ func TestExec_ApprovalMode_NoApproverExpires(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, rows, 1)
 	assert.Equal(t, "expired", rows[0].Decision)
+}
+
+// TestExec_ApprovalMode_OverLongCommandRefusedBeforeAsking proves a command
+// whose redacted form is longer than maxDisplayCommandLen is refused before
+// the approver is ever consulted, rather than shown as a truncated preview
+// a human might approve without seeing in full.
+func TestExec_ApprovalMode_OverLongCommandRefusedBeforeAsking(t *testing.T) {
+	approver := &recordingApprover{approve: true}
+	et, st := newTestExecTool(t, approver, nil)
+
+	long := strings.Repeat("echo hi; ", 500) // far longer than maxDisplayCommandLen
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: long}), testMeta())
+	require.NoError(t, err)
+	assert.Contains(t, out, "too long to review")
+	assert.False(t, approver.called, "an over-length command must be refused before ever asking")
+
+	rows, err := st.Audit().List(context.Background(), 0)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	assert.Equal(t, "refused_too_long", rows[0].Decision)
 }
 
 func TestExec_MessageIDPassedThroughToApprovalRequest(t *testing.T) {
@@ -195,11 +242,11 @@ func TestExec_UnusualSyntaxStillGoesThroughDenyThenApprover(t *testing.T) {
 	assert.Contains(t, out, "denied")
 }
 
-// TestExec_SubshellWrappedDenyCommandIsRefusedNotAsked is the H1 regression:
-// before the tokenize gate was removed, a command a naive tokenizer could
-// not parse (a subshell) skipped the deny-list entirely and fell through to
-// an approval prompt instead of being refused outright. The raw command
-// string now always reaches Policy.Evaluate first, so this must refuse.
+// TestExec_SubshellWrappedDenyCommandIsRefusedNotAsked proves a command a
+// naive tokenizer could not parse (a subshell) still reaches the deny-list
+// and gets refused outright, rather than falling through to an approval
+// prompt: the raw command string always reaches Policy.Evaluate first, with
+// no tokenize gate ahead of it that a subshell could skip.
 func TestExec_SubshellWrappedDenyCommandIsRefusedNotAsked(t *testing.T) {
 	approver := &recordingApprover{approve: true}
 	et, _ := newTestExecTool(t, approver, func(c *config.ExecConfig) { c.Deny = DefaultDenyPOSIX })
@@ -326,6 +373,37 @@ func TestExec_RedactSecretsAppliedToAuditAndExecutedCommandUnaltered(t *testing.
 	assert.NotContains(t, rows[0].Command, "Bearer sk-abc123")
 }
 
+// TestExec_AutoModeApprovalReasonIsSanitizedBeforeReachingApprover proves an
+// auto-mode classifier's Reason - free text produced from the raw,
+// unredacted command (see Policy.evaluateAuto) - is redacted, control/bidi
+// escaped, and length-capped before it ever reaches the approver, since the
+// approver renders it to a human (a Telegram prompt, a terminal) and stores
+// it in the approvals table. Without sanitizeReason, a classifier that
+// quotes the raw command back would leak the credential RedactSecrets
+// already stripped from the command's own display copy.
+func TestExec_AutoModeApprovalReasonIsSanitizedBeforeReachingApprover(t *testing.T) {
+	const secret = "sk-live-abcdef0123456789ABCDEF0123456789"
+	rawReason := fmt.Sprintf("classifier saw Authorization: Bearer %s and \x1b[2K\rthen %s",
+		secret, strings.Repeat("x", maxDisplayReasonLen+50))
+
+	classifier := &fakeClassifier{result: ClassifyResult{Risk: "high", Reason: rawReason}}
+	approver := &recordingApprover{approve: true}
+	et, _ := newTestExecTool(t, approver, func(c *config.ExecConfig) { c.Mode = "auto" })
+
+	policy, err := NewPolicy(et.cfg, classifier)
+	require.NoError(t, err)
+	et.policy = policy
+
+	_, err = et.run(context.Background(), mustArgs(t, execArgs{Command: "curl https://example.invalid"}), testMeta())
+	require.NoError(t, err)
+	require.True(t, approver.called)
+
+	got := approver.lastReq.Reason
+	assert.NotContains(t, got, secret, "a credential-shaped value in the classifier's reason must be redacted")
+	assert.NotContains(t, got, "\x1b", "a raw control character must be escaped, not passed through unescaped")
+	assert.LessOrEqual(t, len(got), maxDisplayReasonLen+len("... [truncated]"), "an oversized reason must be capped, not left free to grow the prompt without bound")
+}
+
 // childSurvivalScript returns a shell-appropriate script that spawns a
 // detached background child which, after childDelay, writes markerPath -
 // used to prove a kill reaches the whole process tree, not just the
@@ -339,6 +417,50 @@ func childSurvivalScript(markerPath string, childDelay, parentSleep time.Duratio
 	}
 	return fmt.Sprintf(`(sleep %d && echo done > %s) & sleep %d`,
 		int(childDelay.Seconds()), markerPath, int(parentSleep.Seconds()))
+}
+
+// TestExec_BackgroundedChildDoesNotOutliveCallAndExitStatusIsReported proves
+// a command that leaves a background child holding stdout/stderr open past
+// its own exit is reported as a normal completion with its real exit code
+// and captured output - not "command failed to run" with the output thrown
+// away - and that the background child does not survive past the call
+// returning.
+func TestExec_BackgroundedChildDoesNotOutliveCallAndExitStatusIsReported(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("posix background job semantics assumed")
+	}
+	marker := filepath.Join(t.TempDir(), "marker.txt")
+	// childDelay must exceed execWaitDelay (3s): the child has to still be
+	// running when WaitDelay fires, or it would just exit on its own and
+	// this test would never actually exercise the ErrWaitDelay path.
+	const childDelay = 4 * time.Second
+	cmd := fmt.Sprintf("echo started; (sleep %d; echo done > %s) &", int(childDelay.Seconds()), marker)
+
+	et, st := newTestExecTool(t, nil, func(c *config.ExecConfig) {
+		c.Allow = []string{".*"}
+		c.Timeout = config.Duration(30 * time.Second) // long enough that only WaitDelay ends this run
+	})
+
+	start := time.Now()
+	out, err := et.run(context.Background(), mustArgs(t, execArgs{Command: cmd}), testMeta())
+	elapsed := time.Since(start)
+	require.NoError(t, err, "a background child holding stdout open must be a normal result, not a Go error")
+	assert.Contains(t, out, "exit_code: 0")
+	assert.Contains(t, out, "started")
+	assert.GreaterOrEqual(t, elapsed, execWaitDelay, "must actually wait out WaitDelay before reporting, not return instantly")
+
+	rows, err := st.Audit().List(context.Background(), 0)
+	require.NoError(t, err)
+	require.Len(t, rows, 1)
+	require.NotNil(t, rows[0].ExitCode)
+	assert.Equal(t, 0, *rows[0].ExitCode)
+
+	// Wait past the child's own target delay (measured from the script's
+	// own start, not from when Run returned): if the process tree kill had
+	// not reached the backgrounded child, the marker would exist by now.
+	time.Sleep(childDelay)
+	_, statErr := os.Stat(marker)
+	assert.True(t, os.IsNotExist(statErr), "a backgrounded child must not outlive the exec call once it returns")
 }
 
 func TestExec_TimeoutKillsWholeProcessTree(t *testing.T) {

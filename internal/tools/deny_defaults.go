@@ -3,12 +3,11 @@ package tools
 // DefaultDenyPOSIX is the starting tools.exec.deny list `onboard` writes for
 // a bash/zsh/sh default shell. It is necessary, not sufficient: a deny-list
 // stops accidents and naive prompt injection, not a determined attacker who
-// already has message access. Patterns are copied verbatim from
-// plans/260731-2219-mtclaw-core-system/phase-05-tools-and-policy-engine.md;
-// do not "simplify" them without re-running the corpus test in
-// policy_test.go, because two earlier, more obvious versions of the rm
-// patterns were bypassed by `rm --recursive --force /` and `/bin/rm -rf /`
-// respectively.
+// already has message access. Do not "simplify" these patterns without
+// re-running the corpus test in policy_test.go: both `rm --recursive
+// --force /` and `/bin/rm -rf /` must keep matching the rm rules below, and
+// TestDenyCorpus_RmRulesCatchLongFlagsAndPathPrefixedForms pins exactly
+// that.
 var DefaultDenyPOSIX = []string{
 	// recursive/forced rm - short flags, long flags, path-prefixed
 	// invocations, and a subshell/group open paren directly before rm
@@ -31,9 +30,8 @@ var DefaultDenyPOSIX = []string{
 
 // DefaultDenyWindows is the starting tools.exec.deny list `onboard` writes
 // when the default shell is PowerShell. PowerShell is case-insensitive, so
-// every pattern carries (?i). Copied verbatim from the phase 5 plan file;
-// see DefaultDenyPOSIX's comment for the same "do not simplify without
-// re-testing" warning.
+// every pattern carries (?i). See DefaultDenyPOSIX's comment for the same
+// "do not simplify without re-testing" warning.
 var DefaultDenyWindows = []string{
 	`(?i)\bremove-item\b[^|;&]*\s-(recurse|force)\b`,
 	`(?i)\b(rd|rmdir)\b[^|;&]*\s/s\b`,

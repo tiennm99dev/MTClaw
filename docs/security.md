@@ -6,7 +6,7 @@ for comfort.
 
 ## The threat model, stated plainly
 
-This is the phase 5 design document's Security Model, verbatim:
+This is this project's security model, stated plainly:
 
 > MTClaw turns a Telegram message into shell execution on the host. Anyone who can
 > message the bot, and anyone who can inject text the model reads (a web page it
@@ -160,8 +160,19 @@ any `*_KEY=`/`*_TOKEN=`/`*_SECRET=`/`*_PASSWORD=`/`*_PASSWD=` assignment (so
 `API_KEY=`, `GITHUB_TOKEN=`, `AWS_SECRET_ACCESS_KEY=`, and the bare
 `PASSWORD=` form are all caught, not just the exact keyword alone), and
 common key shapes like `sk-...`, `ghp_...`, `AKIA...`, and long base64/hex
-runs) before a command ever reaches an approval prompt or the `exec_audit`
-table.
+runs (only when the run mixes uppercase, lowercase, and a digit - an
+all-lowercase hex string, such as a git SHA, is deliberately left alone so a
+commit hash in a command is not masked) before a command ever reaches an
+approval prompt or the `exec_audit` table. Every captured value stops at the
+first character outside a fixed credential alphabet (letters, digits, and
+`. _ ~ + / = : @ % -`), so a shell metacharacter next to a credential-shaped
+token - `;`, `|`, `&`, `$`, a backtick, parentheses, angle brackets - is
+never swallowed into `[REDACTED]` along with it: what the human is shown
+still shows the rest of the command, not a false all-clear. The display
+copy an approval prompt actually renders also escapes control characters
+(other than newline and tab) and Unicode bidirectional-override characters,
+so neither a carriage-return-plus-ANSI sequence nor a reordering trick can
+make the prompt show something other than what runs.
 
 **This is pattern matching over plain text, not a security boundary.** It
 will miss credentials in shapes it does not recognize, and it does not
@@ -171,12 +182,42 @@ Put them in an env file the command reads instead, or in the shell
 environment MTClaw's own process inherits, never as literal text the model
 has to type into a command.
 
+A command longer than about 3500 characters after redaction is refused
+before it ever reaches an approval prompt - the model gets a clear error
+back instead - rather than shown as a truncated preview a human could
+approve without seeing in full. `exec_audit.command` is not bound by that
+same limit: it keeps the full redacted command up to 64 KiB, since it is
+the durable forensic record and losing the tail there would defeat the
+point of keeping it at all.
+
 A spawned command's environment is not the full inherited environment
-either: `exec` strips the specific variables MTClaw itself resolved its own
-secrets from (`openai.api_key_env`, `channels.telegram.token_env`) before
-starting the child, so `env` or `echo $OPENAI_API_KEY` inside a command
-cannot read this process's own API key or bot token back out and hand it to
-the model. Nothing else in the environment is filtered.
+either: `exec` strips the environment variable names MTClaw's own secrets
+would come from - `openai.api_key_env` / `channels.telegram.token_env` when
+set, and the same `OPENAI_API_KEY` / `TELEGRAM_BOT_TOKEN` defaults
+`config.Load` itself falls back to when either is left empty - before
+starting the child, so `env` or `echo $OPENAI_API_KEY` inside that child's
+own environment cannot read this process's key or token back out. That is
+narrower than it may sound, and the honest limits are worth stating
+plainly:
+
+- It only governs the direct child's own environment. Any same-uid
+  process - not just that child - can otherwise read this process's
+  environment straight out of `/proc/<pid>/environ` on Linux, regardless of
+  what the child's own environment contains. Every command that can run the
+  exec tool calls `tools.DisableEnvironRead` once at startup (Linux-only; a
+  documented no-op elsewhere) to close that vector: `mtclaw gateway` calls it
+  directly, and `mtclaw prompt` / `mtclaw cron run` both go through
+  `state.newLoop`, which calls it once for both. It sets `PR_SET_DUMPABLE=0` -
+  a best-effort call whose own failure only logs a warning, never blocks
+  startup. This is process-wide, not something `filterEnv` (or anything
+  per-command) does.
+- The default shell (`/bin/bash -lc`) is a login shell: it re-sources
+  `/etc/profile` and `~/.bash_profile` or `~/.profile` on every invocation,
+  which is the ordinary place a user exports `OPENAI_API_KEY` for their own
+  shell sessions - if it is exported there, the command's own shell
+  start-up puts it right back into that command's environment, and nothing
+  described above stops that.
+- Nothing else in the environment is filtered at all.
 
 ## The atomicity/crash exposure
 

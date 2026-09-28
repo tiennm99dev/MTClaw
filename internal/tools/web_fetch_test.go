@@ -3,11 +3,14 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"fmt"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -19,12 +22,12 @@ import (
 
 func newWebFetchTool(t *testing.T) *webFetchTool {
 	t.Helper()
-	return &webFetchTool{client: newSafeHTTPClient(5 * time.Second), maxBytes: 1 << 20}
+	return &webFetchTool{client: newSafeHTTPClient(5*time.Second, productionBlockedAddr), maxBytes: 1 << 20}
 }
 
-// TestIsBlockedAddr_Matrix is the SSRF address matrix from the phase 5 spec:
-// every address a real request must never reach, plus a normal public IP
-// that must still be allowed through (guarding against over-blocking).
+// TestIsBlockedAddr_Matrix is the SSRF address matrix: every address a real
+// request must never reach, plus a normal public IP that must still be
+// allowed through (guarding against over-blocking).
 func TestIsBlockedAddr_Matrix(t *testing.T) {
 	cases := []struct {
 		addr    string
@@ -55,15 +58,17 @@ func TestIsBlockedAddr_Matrix(t *testing.T) {
 }
 
 // TestIsBlockedAddr_ResidualRanges covers the ranges added on top of the
-// phase 5 matrix above: the limited broadcast address, the two remaining
-// IETF-reserved IPv4 blocks, and IPv6 encodings (NAT64, 6to4) that embed a
+// matrix above: the reserved 240.0.0.0/4 block (and its own top address,
+// the limited broadcast address), the two remaining IETF-reserved IPv4
+// blocks, and IPv6 encodings (NAT64, 6to4, IPv4-compatible) that embed a
 // blocked or an ordinary public IPv4 address.
 func TestIsBlockedAddr_ResidualRanges(t *testing.T) {
 	cases := []struct {
 		addr    string
 		blocked bool
 	}{
-		{"255.255.255.255", true},   // limited broadcast
+		{"255.255.255.255", true},   // limited broadcast, within 240.0.0.0/4
+		{"240.0.0.1", true},         // 240.0.0.0/4 reserved ("Class E")
 		{"192.0.0.1", true},         // 192.0.0.0/24 IETF protocol assignments
 		{"192.0.0.170", true},       // NAT64/DNS64 discovery address within that block
 		{"198.18.0.1", true},        // 198.18.0.0/15 benchmarking
@@ -72,6 +77,8 @@ func TestIsBlockedAddr_ResidualRanges(t *testing.T) {
 		{"64:ff9b::808:808", false}, // NAT64-embedded 8.8.8.8 (public) must not be blocked
 		{"2002:7f00:1::", true},     // 6to4-embedded 127.0.0.1
 		{"2002:0808:0808::", false}, // 6to4-embedded 8.8.8.8 (public) must not be blocked
+		{"::10.0.0.1", true},        // IPv4-compatible-embedded 10.0.0.1 (private)
+		{"::93.184.216.34", false},  // IPv4-compatible-embedded public IP must not be blocked
 	}
 	for _, c := range cases {
 		addr, err := netip.ParseAddr(c.addr)
@@ -87,10 +94,10 @@ func TestWebFetch_RefusesLoopbackTarget(t *testing.T) {
 	assert.Contains(t, out, "web_fetch:")
 }
 
-// TestWebFetch_HostnameResolvingToPrivateIPRefused covers "a hostname
-// resolving to a private IP" from the phase 5 spec using "localhost",
-// which every OS resolves locally (via /etc/hosts or its NSS equivalent)
-// with no real DNS query, so the test needs no network access. The point
+// TestWebFetch_HostnameResolvingToPrivateIPRefused covers a hostname
+// resolving to a private IP using "localhost", which every OS resolves
+// locally (via /etc/hosts or its NSS equivalent) with no real DNS query, so
+// the test needs no network access. The point
 // is that Control receives the *resolved* address (127.0.0.1 or ::1), not
 // the hostname text, so a pre-resolution string check on "localhost" would
 // have been unnecessary and a check against the wrong thing would have
@@ -205,6 +212,57 @@ func TestWebFetch_AllowsXMLAndSuffixedAndJavaScriptContentTypes(t *testing.T) {
 	}
 }
 
+// TestWebFetch_NonHTMLTextualTypesAreReturnedVerbatim proves htmlToText only
+// ever runs on text/html and application/xhtml+xml: every other textual
+// type must come back byte-for-byte, tags and entities untouched, since
+// stripping "<...>" out of source code or XML/JSON containing "<" would
+// corrupt it. Asserting the literal body substring (not just that some
+// expected word survives) is what actually exercises this - a body whose
+// tags were wrongly stripped would still contain the word "hello" as loose
+// text, which would not catch the regression a weaker assertion missed.
+func TestWebFetch_NonHTMLTextualTypesAreReturnedVerbatim(t *testing.T) {
+	cases := []struct {
+		contentType string
+		body        string
+	}{
+		{"text/plain", `if (a < b && c > d) { x = "&amp;" }`},
+		{"application/xml", "<root><item>hello</item></root>"},
+		{"application/json", `{"a": "<b>not html</b>"}`},
+	}
+	for _, c := range cases {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", c.contentType)
+			_, _ = w.Write([]byte(c.body))
+		}))
+
+		wf := &webFetchTool{client: srv.Client(), maxBytes: 1 << 20}
+		out, err := wf.run(context.Background(), mustArgs(t, webFetchArgs{URL: srv.URL}), agent.Meta{})
+		require.NoError(t, err)
+		assert.Contains(t, out, c.body, "content-type: %q", c.contentType)
+
+		srv.Close()
+	}
+}
+
+// TestWebFetch_HTMLContentTypeStillStripsTags is the html/xhtml half of the
+// same contract: those two types must still go through htmlToText.
+func TestWebFetch_HTMLContentTypeStillStripsTags(t *testing.T) {
+	for _, contentType := range []string{"text/html", "application/xhtml+xml"} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", contentType)
+			_, _ = w.Write([]byte("<p>hello</p>"))
+		}))
+
+		wf := &webFetchTool{client: srv.Client(), maxBytes: 1 << 20}
+		out, err := wf.run(context.Background(), mustArgs(t, webFetchArgs{URL: srv.URL}), agent.Meta{})
+		require.NoError(t, err)
+		assert.Contains(t, out, "hello", "content-type: %q", contentType)
+		assert.NotContains(t, out, "<p>", "content-type: %q", contentType)
+
+		srv.Close()
+	}
+}
+
 func TestWebFetch_MaxBytesCapTruncates(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(strings.Repeat("a", 100)))
@@ -217,48 +275,69 @@ func TestWebFetch_MaxBytesCapTruncates(t *testing.T) {
 	assert.Contains(t, out, "[truncated to 10 bytes]")
 }
 
-// TestWebFetch_RedirectToLocalhostRefused proves web_fetch follows a
-// redirect (via CheckRedirect) and then still refuses to connect to the
-// redirect target through the same Dialer.Control hook that guards the
-// original request - so the redirect target's response body is never
-// returned to the caller. httptest servers can only bind to loopback, so
-// both hops here are loopback and therefore both individually blocked; that
-// still exercises the real code path (CheckRedirect decides to follow, then
-// Control fires again on the resulting dial) rather than a live public
-// origin, which the phase 5 spec explicitly does not require this test to
-// have. TestWebFetch_RefusesLoopbackTarget already shows Control blocks a
-// direct connect through this same Transport, and net/http dials every hop
-// - original or redirected - through the same Transport.DialContext, so
-// there is no separate "first hop" code path that could bypass this.
-func TestWebFetch_RedirectToLocalhostRefused(t *testing.T) {
+// TestWebFetch_FollowsRedirectThenRefusesDifferentTarget proves web_fetch
+// follows a redirect through the real production client (CheckRedirect
+// deciding to follow, then Dialer.Control firing again on the resulting
+// dial) rather than bypassing newSafeHTTPClient with srv.Client() the way
+// the tests above do for unrelated (content-parsing) coverage. Both
+// httptest servers bind to loopback, so isBlockedAddr alone cannot tell
+// them apart; the injected predicate (see newSafeHTTPClient) allows only
+// the redirecting server's own port and blocks everything else, including
+// the redirect target's port on that same loopback address - the real
+// Control hook then refuses the second hop exactly the way isBlockedAddr
+// would refuse a private/loopback redirect target in production, and the
+// hit counters prove both that the first hop was actually dialed and that
+// the second one never was.
+func TestWebFetch_FollowsRedirectThenRefusesDifferentTarget(t *testing.T) {
+	var targetHits, redirectHits int32
+
 	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&targetHits, 1)
 		_, _ = w.Write([]byte("should never be reached"))
 	}))
 	defer target.Close()
 
-	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	var redirectSrv *httptest.Server
+	redirectSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&redirectHits, 1)
 		http.Redirect(w, r, target.URL, http.StatusFound)
 	}))
 	defer redirectSrv.Close()
 
-	w := newWebFetchTool(t)
+	redirectPort := redirectSrv.Listener.Addr().(*net.TCPAddr).Port
+	client := newSafeHTTPClient(5*time.Second, func(ap netip.AddrPort) bool {
+		return int(ap.Port()) != redirectPort
+	})
+	w := &webFetchTool{client: client, maxBytes: 1 << 20}
+
 	out, err := w.run(context.Background(), mustArgs(t, webFetchArgs{URL: redirectSrv.URL}), agent.Meta{})
 	require.NoError(t, err)
 	assert.Contains(t, out, "web_fetch:")
 	assert.NotContains(t, out, "should never be reached")
+	assert.Equal(t, int32(1), atomic.LoadInt32(&redirectHits), "the first hop must actually be dialed")
+	assert.Equal(t, int32(0), atomic.LoadInt32(&targetHits), "the redirect target must never be reached")
 }
 
+// TestWebFetch_TooManyRedirectsRefused proves maxRedirects is enforced by
+// the real CheckRedirect, using a predicate that blocks nothing (this test
+// is only about the redirect count, not address safety) so every hop is
+// actually dialed and the hit counter proves exactly how many were.
 func TestWebFetch_TooManyRedirectsRefused(t *testing.T) {
 	var target *httptest.Server
+	var hits int32
 	target = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&hits, 1)
 		http.Redirect(w, r, target.URL+"/next", http.StatusFound)
 	}))
 	defer target.Close()
 
-	w := newWebFetchTool(t)
+	client := newSafeHTTPClient(5*time.Second, func(netip.AddrPort) bool { return false })
+	w := &webFetchTool{client: client, maxBytes: 1 << 20}
+
 	out, err := w.run(context.Background(), mustArgs(t, webFetchArgs{URL: target.URL}), agent.Meta{})
 	require.NoError(t, err)
-	assert.Contains(t, out, "web_fetch:")
+	assert.Contains(t, out, fmt.Sprintf("stopped after %d redirects", maxRedirects))
+	assert.Equal(t, int32(maxRedirects), atomic.LoadInt32(&hits), "must dial the original request plus exactly maxRedirects-1 follow-ups before refusing")
 }
 
 // TestWebFetch_PublicURLE2E is gated behind MTCLAW_E2E=1: it requires real

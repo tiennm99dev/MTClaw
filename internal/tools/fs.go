@@ -8,7 +8,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 
 	"github.com/tiennm99/MTClaw/internal/agent"
@@ -64,18 +63,20 @@ type readFileArgs struct {
 	Limit  int64  `json:"limit,omitempty"`
 }
 
-// readFile resolves path within the configured roots, refuses binary
-// content (a NUL byte in the first binarySniffBytes), and returns content
-// bounded by limit (default and cap: maxReadBytes) starting at offset, with
-// an explicit truncation marker when the file has more to give.
+// readFile resolves path within the configured roots, refuses anything
+// that is not a regular file (a directory, or - on POSIX - a FIFO, device,
+// or socket that os.Open would otherwise block on indefinitely with no way
+// for ctx to interrupt it) and binary content (a NUL byte in the first
+// binarySniffBytes), and returns content bounded by limit (default and cap:
+// maxReadBytes) starting at offset, with an explicit truncation marker when
+// the file has more to give.
 func (f *fsTools) readFile(ctx context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
 	var a readFileArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("read_file: invalid arguments: %v", err), nil
+	}
+	if a.Offset < 0 {
+		return "read_file: offset must not be negative", nil
 	}
 
 	resolved, err := Resolve(f.roots, a.Path)
@@ -83,19 +84,27 @@ func (f *fsTools) readFile(ctx context.Context, args json.RawMessage, _ agent.Me
 		return fmt.Sprintf("read_file: %v", err), nil
 	}
 
-	file, err := os.Open(resolved)
-	if err != nil {
-		return fmt.Sprintf("read_file: %v", err), nil
-	}
-	defer file.Close()
-
-	info, err := file.Stat()
+	// Stat the path before ever opening it: open(2) on a FIFO blocks until
+	// the other end opens too, and that block cannot be interrupted by ctx
+	// ending, which would hang this call (and its goroutine) indefinitely.
+	// Stat itself never blocks that way, so the type check has to happen
+	// first, not after Open.
+	info, err := os.Stat(resolved)
 	if err != nil {
 		return fmt.Sprintf("read_file: %v", err), nil
 	}
 	if info.IsDir() {
 		return fmt.Sprintf("read_file: %q is a directory; use list_dir instead", a.Path), nil
 	}
+	if !info.Mode().IsRegular() {
+		return fmt.Sprintf("read_file: %q is not a regular file; refusing to read a device, pipe, or socket", a.Path), nil
+	}
+
+	file, err := os.Open(resolved)
+	if err != nil {
+		return fmt.Sprintf("read_file: %v", err), nil
+	}
+	defer file.Close()
 
 	sniff := make([]byte, binarySniffBytes)
 	n, err := file.ReadAt(sniff, 0)
@@ -106,19 +115,23 @@ func (f *fsTools) readFile(ctx context.Context, args json.RawMessage, _ agent.Me
 		return fmt.Sprintf("read_file: %q looks like binary content (a NUL byte was found in the first %d bytes); refusing to return it as text", a.Path, binarySniffBytes), nil
 	}
 
+	// An offset that is not strictly inside the file (past its last byte,
+	// or equal to a nonzero size) has nothing left to read; say so
+	// explicitly rather than returning "" indistinguishably from a
+	// genuinely empty file. offset 0 against a genuinely empty file is not
+	// an error - there is nothing past EOF to report, just nothing at all.
+	if a.Offset > 0 && a.Offset >= info.Size() {
+		return fmt.Sprintf("read_file: offset %d is past end of file (size %d)", a.Offset, info.Size()), nil
+	}
+
 	limit := a.Limit
 	if limit <= 0 || limit > int64(f.maxReadBytes) {
 		limit = int64(f.maxReadBytes)
 	}
-	if limit <= 0 {
-		// Defense in depth: a misconfigured (non-positive) max_read_bytes
-		// must never reach make([]byte, limit) below, which panics on a
-		// negative length.
-		return "read_file: server misconfiguration: tools.filesystem.max_read_bytes must be positive", nil
-	}
-	if a.Offset < 0 {
-		return "read_file: offset must not be negative", nil
-	}
+	// Never allocate more than the file actually has left to give: a
+	// 5-byte file must not make(...) the full max_read_bytes just to read
+	// 5 bytes into it.
+	limit = min(limit, info.Size()-a.Offset)
 
 	buf := make([]byte, limit)
 	n2, err := file.ReadAt(buf, a.Offset)
@@ -128,11 +141,18 @@ func (f *fsTools) readFile(ctx context.Context, args json.RawMessage, _ agent.Me
 	content := buf[:n2]
 	// More remains past what we read if the file is longer than offset+n2.
 	truncated := a.Offset+int64(n2) < info.Size()
+	if truncated {
+		// The byte limit above cut at a raw byte count with no regard for
+		// UTF-8 boundaries; trim back to the last complete rune so a
+		// truncated multi-byte character is never split in the returned
+		// content.
+		content = content[:runeSafeLen(content)]
+	}
 
 	var b strings.Builder
 	b.Write(content)
 	if truncated {
-		fmt.Fprintf(&b, "\n[truncated: showing %d bytes starting at offset %d; file is %d bytes total]", n2, a.Offset, info.Size())
+		fmt.Fprintf(&b, "\n[truncated: showing %d bytes starting at offset %d; file is %d bytes total]", len(content), a.Offset, info.Size())
 	}
 	return b.String(), nil
 }
@@ -157,12 +177,11 @@ type writeFileArgs struct {
 
 // writeFile resolves path within the configured roots, creates any missing
 // parent directories (which Resolve has already proven stay inside a root),
-// and writes content according to mode, bounded by maxWriteBytes.
+// and writes content according to mode, bounded by maxWriteBytes. It
+// refuses to write to an existing non-regular target (a FIFO, device, or
+// socket): opening one of those for writing can block indefinitely with no
+// way for ctx to interrupt it, the same hang read_file guards against.
 func (f *fsTools) writeFile(ctx context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
 	var a writeFileArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("write_file: invalid arguments: %v", err), nil
@@ -192,6 +211,10 @@ func (f *fsTools) writeFile(ctx context.Context, args json.RawMessage, _ agent.M
 	resolved, err := Resolve(f.roots, a.Path)
 	if err != nil {
 		return fmt.Sprintf("write_file: %v", err), nil
+	}
+
+	if info, statErr := os.Stat(resolved); statErr == nil && !info.Mode().IsRegular() {
+		return fmt.Sprintf("write_file: %q exists and is not a regular file; refusing to write to a device, pipe, or socket", a.Path), nil
 	}
 
 	if err := os.MkdirAll(filepath.Dir(resolved), 0o755); err != nil {
@@ -237,10 +260,6 @@ type listDirArgs struct {
 // itself inside a root - which is the simplest rule that both prevents
 // escaping the root and avoids symlink-cycle loops.
 func (f *fsTools) listDir(ctx context.Context, args json.RawMessage, _ agent.Meta) (string, error) {
-	if err := ctx.Err(); err != nil {
-		return "", err
-	}
-
 	var a listDirArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return fmt.Sprintf("list_dir: invalid arguments: %v", err), nil
@@ -268,10 +287,14 @@ func (f *fsTools) listDir(ctx context.Context, args json.RawMessage, _ agent.Met
 
 	var lines []string
 	count := 0
+	// capped covers both "hit listDirEntryCap" and "ctx ended mid-walk"; it
+	// does not need to tell those two apart. When ctx ended, Registry.Run's
+	// uniform ctx.Err() check (see registry.go) turns this call's return
+	// into a Go error regardless of what capped's message says, and the
+	// agent loop discards a failed tool call's result string outright - so
+	// the entry-cap wording below is never actually shown to the model in
+	// that case.
 	capped := walkDir(ctx, resolved, depth, "", &lines, &count)
-	if err := ctx.Err(); err != nil {
-		return "list_dir: canceled", err
-	}
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "list_dir: %s\n", a.Path)
@@ -287,20 +310,19 @@ func (f *fsTools) listDir(ctx context.Context, args json.RawMessage, _ agent.Met
 
 // walkDir appends one line per entry under dir to out, recursing while
 // depth remains and count is under listDirEntryCap. It returns true if the
-// cap was hit, or ctx ended, before the tree was fully listed; the caller
-// distinguishes the two afterward via ctx.Err().
+// cap was hit, or ctx ended, before the tree was fully listed.
 func walkDir(ctx context.Context, dir string, depth int, prefix string, out *[]string, count *int) bool {
 	if ctx.Err() != nil {
 		return true
 	}
 
+	// os.ReadDir already returns entries sorted by filename, so no separate
+	// sort is needed here.
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		*out = append(*out, prefix+fmt.Sprintf("[error reading directory: %v]", err))
 		return false
 	}
-
-	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 
 	for _, entry := range entries {
 		if *count >= listDirEntryCap || ctx.Err() != nil {

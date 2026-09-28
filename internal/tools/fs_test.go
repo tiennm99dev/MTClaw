@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -69,33 +71,96 @@ func TestReadFile_OutsideRootRefused(t *testing.T) {
 	assert.NotContains(t, out, "nope")
 }
 
-func TestReadFile_NonPositiveMaxReadBytesRefusesInsteadOfPanicking(t *testing.T) {
-	f, root := newFSTools(t, 0, 1024)
+// TestReadFile_OffsetPastEOFReturnsExplicitMarker proves an offset beyond
+// the file's last byte is reported explicitly, not returned as "" - which
+// would be indistinguishable from a genuinely empty file.
+func TestReadFile_OffsetPastEOFReturnsExplicitMarker(t *testing.T) {
+	f, root := newFSTools(t, 1024, 1024)
 	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+
+	out, err := f.readFile(context.Background(), mustArgs(t, readFileArgs{Path: "a.txt", Offset: 10}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Contains(t, out, "offset 10 is past end of file (size 5)")
+}
+
+// TestReadFile_OffsetAtExactEOFReturnsExplicitMarker covers the boundary:
+// an offset equal to a nonzero file size has nothing left to read either.
+func TestReadFile_OffsetAtExactEOFReturnsExplicitMarker(t *testing.T) {
+	f, root := newFSTools(t, 1024, 1024)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+
+	out, err := f.readFile(context.Background(), mustArgs(t, readFileArgs{Path: "a.txt", Offset: 5}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Contains(t, out, "offset 5 is past end of file (size 5)")
+}
+
+// TestReadFile_EmptyFileAtOffsetZeroReturnsEmptyNotAMarker proves offset 0
+// against a genuinely empty file is not treated as "past EOF": there is
+// nothing past the end to report, just nothing at all.
+func TestReadFile_EmptyFileAtOffsetZeroReturnsEmptyNotAMarker(t *testing.T) {
+	f, root := newFSTools(t, 1024, 1024)
+	require.NoError(t, os.WriteFile(filepath.Join(root, "empty.txt"), []byte{}, 0o644))
+
+	out, err := f.readFile(context.Background(), mustArgs(t, readFileArgs{Path: "empty.txt"}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Equal(t, "", out)
+}
+
+// TestReadFile_TruncationIsRuneSafe proves a byte limit that lands mid
+// multi-byte character is trimmed back to the last complete rune, the same
+// guarantee exec output already has.
+func TestReadFile_TruncationIsRuneSafe(t *testing.T) {
+	f, root := newFSTools(t, 10, 1024) // not a multiple of 3, the byte width of "あ"
+	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte(strings.Repeat("あ", 5)), 0o644))
 
 	out, err := f.readFile(context.Background(), mustArgs(t, readFileArgs{Path: "a.txt"}), agent.Meta{})
 	require.NoError(t, err)
-	assert.Contains(t, out, "max_read_bytes must be positive")
+	body := out[:strings.Index(out, "\n[truncated")]
+	assert.True(t, utf8.ValidString(body), "read_file must never return a truncated multi-byte rune")
 }
 
-func TestReadFile_CanceledContextReturnsErrorImmediately(t *testing.T) {
-	f, root := newFSTools(t, 1024, 1024)
-	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+func TestReadFile_RefusesNonRegularFile(t *testing.T) {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "p")
+	requireFIFO(t, fifo)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := f.readFile(ctx, mustArgs(t, readFileArgs{Path: "a.txt"}), agent.Meta{})
-	assert.ErrorIs(t, err, context.Canceled)
+	f := &fsTools{roots: []string{root}, maxReadBytes: 1024, maxWriteBytes: 1024}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		out, err := f.readFile(context.Background(), mustArgs(t, readFileArgs{Path: "p"}), agent.Meta{})
+		require.NoError(t, err)
+		assert.Contains(t, out, "not a regular file")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("read_file blocked on a FIFO instead of refusing it before ever calling os.Open")
+	}
 }
 
-func TestListDir_CanceledContextReturnsErrorImmediately(t *testing.T) {
-	f, root := newFSTools(t, 1024, 1024)
-	require.NoError(t, os.WriteFile(filepath.Join(root, "a.txt"), []byte("hello"), 0o644))
+func TestWriteFile_RefusesExistingNonRegularTarget(t *testing.T) {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "p")
+	requireFIFO(t, fifo)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	_, err := f.listDir(ctx, mustArgs(t, listDirArgs{Path: "."}), agent.Meta{})
-	assert.ErrorIs(t, err, context.Canceled)
+	f := &fsTools{roots: []string{root}, maxReadBytes: 1024, maxWriteBytes: 1024}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		out, err := f.writeFile(context.Background(), mustArgs(t, writeFileArgs{Path: "p", Content: "x"}), agent.Meta{})
+		require.NoError(t, err)
+		assert.Contains(t, out, "not a regular file")
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("write_file blocked on an existing FIFO instead of refusing it before ever calling os.OpenFile")
+	}
 }
 
 func TestReadFile_InvalidArgsReturnsResultString(t *testing.T) {

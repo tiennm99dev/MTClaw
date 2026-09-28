@@ -49,9 +49,9 @@ func TestResolve_AbsolutePathOutsideRootRejected(t *testing.T) {
 	assert.Error(t, err)
 }
 
-// TestResolve_PrefixConfusionRejected is the "/data-evil vs /data" case from
-// the phase 5 spec: a naive strings.HasPrefix(path, root) check would wrongly
-// accept a sibling directory that merely starts with the same characters.
+// TestResolve_PrefixConfusionRejected proves the "/data-evil vs /data" case:
+// a naive strings.HasPrefix(path, root) check would wrongly accept a
+// sibling directory that merely starts with the same characters.
 func TestResolve_PrefixConfusionRejected(t *testing.T) {
 	base := t.TempDir()
 	root := filepath.Join(base, "data")

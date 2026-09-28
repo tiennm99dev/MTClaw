@@ -36,10 +36,16 @@ type webFetchTool struct {
 
 func registerWebFetchTool(r *Registry, cfg config.WebFetchConfig) {
 	w := &webFetchTool{
-		client:   newSafeHTTPClient(cfg.Timeout.Std()),
+		client:   newSafeHTTPClient(cfg.Timeout.Std(), productionBlockedAddr),
 		maxBytes: cfg.MaxBytes,
 	}
 	r.Register("web_fetch", Tool{Spec: webFetchSpec(), Run: w.run})
+}
+
+// productionBlockedAddr is the real address predicate every web_fetch call
+// in production is guarded by; see newSafeHTTPClient.
+func productionBlockedAddr(addr netip.AddrPort) bool {
+	return isBlockedAddr(addr.Addr())
 }
 
 func webFetchSpec() provider.ToolSpec {
@@ -51,18 +57,33 @@ func webFetchSpec() provider.ToolSpec {
 }
 
 // newSafeHTTPClient builds an http.Client whose Transport dials through a
-// net.Dialer.Control hook that rejects loopback/private/link-local/
-// unspecified/multicast/CGNAT/metadata addresses at connect time - the
-// actual resolved address, which is what survives a redirect or a DNS
-// rebind that a pre-resolution hostname check would miss - and whose
-// CheckRedirect caps redirects and re-validates the scheme on every hop.
-// Because every hop dials through the same Transport, the Control hook runs
-// again for each one: a public URL that redirects to 127.0.0.1 is refused
-// on the second hop even though the first hop's URL looked fine.
-func newSafeHTTPClient(timeout time.Duration) *http.Client {
+// net.Dialer.Control hook that calls blocked with the actual resolved
+// address and port about to be connected to - what survives a redirect or a
+// DNS rebind that a pre-resolution hostname check would miss - refusing the
+// dial whenever blocked reports true, and whose CheckRedirect caps
+// redirects and re-validates the scheme on every hop. Because every hop
+// dials through the same Transport, the Control hook runs again for each
+// one: a public URL that redirects to 127.0.0.1 is refused on the second
+// hop even though the first hop's URL looked fine. Production always calls
+// this with productionBlockedAddr (which ignores the port and applies
+// isBlockedAddr to the address alone); blocked is a parameter so tests can
+// exercise this exact code path - CheckRedirect actually following a hop,
+// Control actually firing again on the resulting dial - against real
+// loopback test servers with a narrower, port-aware predicate, instead of
+// bypassing this function outright.
+func newSafeHTTPClient(timeout time.Duration, blocked func(netip.AddrPort) bool) *http.Client {
 	dialer := &net.Dialer{
 		Timeout: dialTimeout,
-		Control: controlRejectUnsafeAddr,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			addrPort, err := netip.ParseAddrPort(address)
+			if err != nil {
+				return fmt.Errorf("web_fetch: unparseable connect address %q: %w", address, err)
+			}
+			if blocked(addrPort) {
+				return fmt.Errorf("web_fetch: refusing to connect to %s: address is loopback, private, link-local, unspecified, multicast, CGNAT, or cloud metadata range", addrPort.Addr())
+			}
+			return nil
+		},
 	}
 	transport := &http.Transport{
 		DialContext: dialer.DialContext,
@@ -80,25 +101,6 @@ func newSafeHTTPClient(timeout time.Duration) *http.Client {
 			return nil
 		},
 	}
-}
-
-// controlRejectUnsafeAddr is the net.Dialer.Control hook: address is the
-// actual IP:port about to be connected to, resolved from whatever hostname
-// or redirect target produced it, so this check cannot be bypassed by DNS
-// tricks or a redirect chain.
-func controlRejectUnsafeAddr(_, address string, _ syscall.RawConn) error {
-	host, _, err := net.SplitHostPort(address)
-	if err != nil {
-		return fmt.Errorf("web_fetch: unparseable connect address %q: %w", address, err)
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil {
-		return fmt.Errorf("web_fetch: unparseable connect address %q", host)
-	}
-	if isBlockedAddr(addr) {
-		return fmt.Errorf("web_fetch: refusing to connect to %s: address is loopback, private, link-local, unspecified, multicast, CGNAT, or cloud metadata range", addr)
-	}
-	return nil
 }
 
 // isBlockedAddr reports whether ip must never be connected to by web_fetch.
@@ -134,6 +136,17 @@ func isBlockedAddr(ip netip.Addr) bool {
 		if b[0] == 0x20 && b[1] == 0x02 { // 6to4: 2002:aabb:ccdd::/16 embeds a.b.c.d
 			return isBlockedAddr(netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}))
 		}
+		if bytes.Equal(b[:12], zero12Prefix[:]) {
+			// IPv4-compatible IPv6 address (RFC 4291 2.5.5.1, deprecated):
+			// the low 32 bits hold a plain IPv4 address with no special
+			// encoding. The IsUnspecified/IsLoopback checks above already
+			// excluded "::" and "::1" (the two embeddings this shape would
+			// otherwise collide with - embedded 0.0.0.0 and 0.0.0.1), so
+			// anything that reaches here embeds a different address that
+			// netip's IPv6 predicates have no way to recognize as
+			// private/link-local/etc. on their own.
+			return isBlockedAddr(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
+		}
 	}
 
 	return false
@@ -143,22 +156,27 @@ func isBlockedAddr(ip netip.Addr) bool {
 // IPv4 address, checked separately in isBlockedAddr).
 var nat64Prefix = [12]byte{0x00, 0x64, 0xff, 0x9b}
 
+// zero12Prefix is 12 zero bytes: the high 96 bits of an IPv4-compatible
+// IPv6 address (::a.b.c.d), checked separately in isBlockedAddr.
+var zero12Prefix = [12]byte{}
+
 // isBlocked4 covers the IPv4-specific ranges netip's own predicates (already
-// applied in isBlockedAddr) do not: 0.0.0.0/8, 100.64.0.0/10 CGNAT, the
-// limited broadcast address 255.255.255.255, 192.0.0.0/24 (IETF protocol
-// assignments, including the NAT64/DNS64 discovery addresses .170/.171), and
-// 198.18.0.0/15 (benchmarking).
+// applied in isBlockedAddr) do not: 0.0.0.0/8, 100.64.0.0/10 CGNAT,
+// 192.0.0.0/24 (IETF protocol assignments, including the NAT64/DNS64
+// discovery addresses .170/.171), 198.18.0.0/15 (benchmarking), and
+// 240.0.0.0/4 (formerly "Class E", reserved - this single range also covers
+// its own top address, the limited broadcast address 255.255.255.255).
 func isBlocked4(b [4]byte) bool {
 	switch {
 	case b[0] == 0:
 		return true
 	case b[0] == 100 && b[1] >= 64 && b[1] <= 127:
 		return true
-	case b == [4]byte{255, 255, 255, 255}:
-		return true
 	case b[0] == 192 && b[1] == 0 && b[2] == 0:
 		return true
 	case b[0] == 198 && (b[1] == 18 || b[1] == 19):
+		return true
+	case b[0] >= 240:
 		return true
 	}
 	return false
@@ -196,6 +214,14 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 	}
 	defer resp.Body.Close()
 
+	// Decide on Content-Type before spending any bandwidth or memory on the
+	// body: a binary response (an image, an archive) is refused here, not
+	// after reading up to max_bytes of it only to throw the result away.
+	contentType := resp.Header.Get("Content-Type")
+	if !isTextualContentType(contentType) {
+		return fmt.Sprintf("web_fetch: binary content skipped (content-type: %q)", contentType), nil
+	}
+
 	limited := io.LimitReader(resp.Body, int64(w.maxBytes)+1)
 	body, err := io.ReadAll(limited)
 	if err != nil {
@@ -206,12 +232,14 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 		body = body[:w.maxBytes]
 	}
 
-	contentType := resp.Header.Get("Content-Type")
-	if !isTextualContentType(contentType) {
-		return fmt.Sprintf("web_fetch: binary content skipped (content-type: %q, %d bytes)", contentType, len(body)), nil
+	// htmlToText's tag-stripping and entity-decoding only makes sense for
+	// actual markup; running it over text/plain, JSON, or XML would corrupt
+	// source code and any text that happens to contain "<" or "&". Every
+	// other textual type is returned exactly as fetched.
+	text := string(body)
+	if isHTMLContentType(contentType) {
+		text = htmlToText(text)
 	}
-
-	text := htmlToText(string(body))
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "web_fetch result for %s (HTTP %d)\n", a.URL, resp.StatusCode)
@@ -224,6 +252,19 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 	return b.String(), nil
 }
 
+// mediaTypeOf parses contentType down to its bare media type (dropping
+// parameters such as "; charset=utf-8"), falling back to a manual split on
+// the first ";" when mime.ParseMediaType itself rejects the header - some
+// servers send a Content-Type that is not fully RFC-compliant, and reading
+// the type is still worth attempting rather than refusing outright.
+func mediaTypeOf(contentType string) string {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		mediaType = strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
+	}
+	return mediaType
+}
+
 // isTextualContentType reports whether contentType is text the model can
 // usefully read: text/*, application/json, application/xml,
 // application/javascript, application/xhtml+xml, or any application/*
@@ -231,19 +272,13 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 // e.g. application/vnd.api+json, application/atom+xml). An absent header is
 // treated as text (the prior behavior, unchanged) rather than refused,
 // since plenty of plain servers omit it. Anything else - images, archives,
-// other application/* binary formats - is skipped instead of being run
-// through htmlToText, which would burn context tokens on garbage. Note this
-// check runs after the response body has already been fully read (see
-// run above): it saves the model's context budget, not fetch-time
-// bandwidth or memory.
+// other application/* binary formats - is skipped instead of being read at
+// all, which saves both bandwidth/memory and the model's context budget.
 func isTextualContentType(contentType string) bool {
 	if contentType == "" {
 		return true
 	}
-	mediaType, _, err := mime.ParseMediaType(contentType)
-	if err != nil {
-		mediaType = strings.ToLower(strings.TrimSpace(strings.SplitN(contentType, ";", 2)[0]))
-	}
+	mediaType := mediaTypeOf(contentType)
 	if strings.HasPrefix(mediaType, "text/") {
 		return true
 	}
@@ -255,6 +290,23 @@ func isTextualContentType(contentType string) bool {
 		return true
 	}
 	return false
+}
+
+// isHTMLContentType reports whether contentType is markup htmlToText should
+// run on: text/html or application/xhtml+xml. Every other textual type
+// (text/plain, application/json, application/xml, ...) is returned to the
+// model exactly as fetched, since running the same tag-stripping,
+// entity-decoding pass meant for HTML over plain text or structured data
+// would corrupt source code, JSON containing "<", and XML alike. An absent
+// Content-Type header is treated as non-HTML: isTextualContentType already
+// lets it through as plain text, and there is no header claiming it is
+// markup to strip.
+func isHTMLContentType(contentType string) bool {
+	if contentType == "" {
+		return false
+	}
+	mediaType := mediaTypeOf(contentType)
+	return mediaType == "text/html" || mediaType == "application/xhtml+xml"
 }
 
 // scriptStyleRe strips <script>...</script> and <style>...</style> blocks

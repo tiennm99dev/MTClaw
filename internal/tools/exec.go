@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tiennm99/MTClaw/internal/agent"
@@ -20,11 +21,47 @@ import (
 )
 
 // execWaitDelay bounds how long cmd.Wait() will wait for the process to
-// actually exit after Cancel (killProcessTree) has been invoked, before
-// giving up and returning anyway. It exists so a process that ignores
-// SIGKILL's effect on its pipes (rare, but not impossible) cannot hang the
-// tool call forever.
+// actually exit after Cancel (trackedProcessTree.kill) has been invoked,
+// before giving up and returning anyway. It exists so a process that
+// ignores SIGKILL's effect on its pipes (rare, but not impossible) cannot
+// hang the tool call forever.
 const execWaitDelay = 3 * time.Second
+
+// processTree is a started command's process (and, on Windows, the Job
+// Object it was assigned to right after Start) tracked so the whole tree -
+// including any child the shell backgrounded - can be killed as a unit. See
+// trackProcessTree and the kill method in exec_unix.go and exec_windows.go.
+type processTree interface {
+	kill()
+}
+
+// trackedProcessTree lets a cmd.Cancel callback set up before Start safely
+// observe the processTree assigned after Start returns: Start's own
+// ctx-watcher goroutine can invoke Cancel concurrently with that
+// assignment, so the reference needs a mutex, not a plain variable. kill is
+// idempotent (via sync.Once) so it is safe to call from both Cancel and the
+// unconditional post-Wait kill below without a double SIGKILL/CloseHandle.
+type trackedProcessTree struct {
+	mu   sync.Mutex
+	tree processTree
+	once sync.Once
+}
+
+func (t *trackedProcessTree) set(tree processTree) {
+	t.mu.Lock()
+	t.tree = tree
+	t.mu.Unlock()
+}
+
+func (t *trackedProcessTree) kill() {
+	t.mu.Lock()
+	tree := t.tree
+	t.mu.Unlock()
+	if tree == nil {
+		return
+	}
+	t.once.Do(tree.kill)
+}
 
 func execToolSpec() provider.ToolSpec {
 	return provider.ToolSpec{
@@ -46,9 +83,24 @@ type execTool struct {
 	// resolved its own secrets from (the OpenAI API key, the Telegram bot
 	// token); execute strips them from the spawned child's environment so a
 	// command cannot read them back out via `env` or `echo $VAR` and hand
-	// them to the model - see filterEnv.
+	// them to the model - see filterEnv. This is a display/child-environment
+	// mitigation only: it does not stop a same-uid child from reading this
+	// process's own environment straight out of /proc/<pid>/environ - see
+	// DisableEnvironRead and docs/security.md.
 	secretEnvNames []string
 }
+
+// defaultOpenAIAPIKeyEnv and defaultTelegramTokenEnv mirror the same
+// fallback environment variable names config.Load resolves a secret from
+// when openai.api_key_env / channels.telegram.token_env is left empty -
+// including an explicit empty override of the onboard-written default, not
+// just an absent key. Stripping must use the same fallback: an empty
+// *_env field otherwise mistakenly implies "nothing to strip" even though
+// the real secret still came from the default variable name.
+const (
+	defaultOpenAIAPIKeyEnv  = "OPENAI_API_KEY"
+	defaultTelegramTokenEnv = "TELEGRAM_BOT_TOKEN"
+)
 
 func registerExecTool(r *Registry, cfg config.Config, st store.Store, approver Approver, log *slog.Logger) error {
 	execCfg := cfg.Tools.Exec
@@ -71,17 +123,14 @@ func registerExecTool(r *Registry, cfg config.Config, st store.Store, approver A
 		return fmt.Errorf("tools: registering exec tool: %w", err)
 	}
 
-	var secretEnvNames []string
-	if cfg.OpenAI.APIKeyEnv != "" {
-		secretEnvNames = append(secretEnvNames, cfg.OpenAI.APIKeyEnv)
-	}
-	if cfg.Channels.Telegram.TokenEnv != "" {
-		secretEnvNames = append(secretEnvNames, cfg.Channels.Telegram.TokenEnv)
+	secretEnvNames := []string{
+		envNameOrDefault(cfg.OpenAI.APIKeyEnv, defaultOpenAIAPIKeyEnv),
+		envNameOrDefault(cfg.Channels.Telegram.TokenEnv, defaultTelegramTokenEnv),
 	}
 
 	et := &execTool{
 		cfg:            execCfg,
-		shell:          resolveShell(execCfg.Shell),
+		shell:          ResolveShell(execCfg.Shell),
 		policy:         policy,
 		approver:       approver,
 		audit:          st.Audit(),
@@ -92,13 +141,26 @@ func registerExecTool(r *Registry, cfg config.Config, st store.Store, approver A
 	return nil
 }
 
-// resolveShell returns configured, or the platform default when configured
+// envNameOrDefault returns name, or def when name is empty - the same
+// fallback config.Load applies when resolving the secret itself, so
+// stripping always targets the environment variable name a secret could
+// actually have come from.
+func envNameOrDefault(name, def string) string {
+	if name == "" {
+		return def
+	}
+	return name
+}
+
+// ResolveShell returns configured, or the platform default when configured
 // is empty: [/bin/bash -lc] on POSIX, [powershell -NoProfile -Command] on
 // Windows. The command line is always passed as shell[1:] plus one final
 // argument (the raw command string) - it is never tokenized into argv for
 // the OS to exec directly, matching how a user would type it at that
-// shell's own prompt.
-func resolveShell(configured []string) []string {
+// shell's own prompt. Exported so other packages (a `doctor` check
+// verifying the configured shell is on PATH) resolve the exact same default
+// instead of keeping their own copy that could silently drift from this one.
+func ResolveShell(configured []string) []string {
 	if len(configured) > 0 {
 		return configured
 	}
@@ -128,18 +190,18 @@ func (e *execTool) run(ctx context.Context, args json.RawMessage, meta agent.Met
 	if rawCmd == "" {
 		return "exec: command must not be empty", nil
 	}
-	displayCmd := RedactSecrets(rawCmd)
+	redactedCmd := RedactSecrets(rawCmd)
 
 	decision := e.policy.Evaluate(ctx, rawCmd)
 
 	switch decision.Verdict {
 	case VerdictRefuse:
-		e.writeAudit(ctx, meta.SessionID, displayCmd, decision.Audit, decision.Rule, nil, nil, false)
+		e.writeAudit(ctx, meta.SessionID, redactedCmd, decision.Audit, decision.Rule, nil, nil, false)
 		return fmt.Sprintf("exec: refused permanently by policy (deny rule: %s). This is not retryable by rephrasing the command; tell the user it was blocked and why.", decision.Rule), nil
 	case VerdictRun:
-		return e.execute(ctx, meta, rawCmd, displayCmd, decision.Audit, decision.Rule)
+		return e.execute(ctx, meta, rawCmd, redactedCmd, decision.Audit, decision.Rule)
 	case VerdictAsk:
-		return e.ask(ctx, meta, rawCmd, displayCmd, decision.Reason)
+		return e.ask(ctx, meta, rawCmd, redactedCmd, decision.Reason)
 	default:
 		return "exec: internal policy error: unrecognized verdict", nil
 	}
@@ -152,32 +214,45 @@ func (e *execTool) run(ctx context.Context, args json.RawMessage, meta agent.Met
 // (the row id is its inline-button callback payload), and creating a second
 // one here would double-book every prompt. Terminal and deny-all approvals
 // keep no approvals row at all - exec_audit is their durable record.
-func (e *execTool) ask(ctx context.Context, meta agent.Meta, rawCmd, displayCmd, reason string) (string, error) {
+//
+// reason, unlike rawCmd/redactedCmd, has not been through RedactSecrets or
+// any escaping yet - in auto mode it is free text an LLM classifier wrote
+// after seeing the raw command (see Policy.evaluateAuto) - so this is the
+// one place it is sanitized (see sanitizeReason) before it reaches Request,
+// which every approval surface and the approvals table read from.
+func (e *execTool) ask(ctx context.Context, meta agent.Meta, rawCmd, redactedCmd, reason string) (string, error) {
+	display, ok := displayCommand(redactedCmd)
+	if !ok {
+		// The command is too long to review in an approval prompt at all -
+		// refuse before ever asking, rather than showing a truncated
+		// preview a human might approve without seeing the whole thing.
+		e.writeAudit(ctx, meta.SessionID, redactedCmd, "refused_too_long", "", nil, nil, false)
+		return fmt.Sprintf("exec: command is %d bytes after redaction, too long to review in an approval prompt (limit %d); split it into smaller steps, or write it to a file with write_file and run that file instead", len(redactedCmd), maxDisplayCommandLen), nil
+	}
+
 	req := Request{
 		SessionID: meta.SessionID,
 		Channel:   meta.Channel,
 		ChatID:    meta.ChatID,
 		ThreadID:  meta.ThreadID,
 		Tool:      "exec",
-		Command:   displayCmd,
-		Reason:    reason,
+		Command:   display,
+		Reason:    sanitizeReason(reason),
 		MessageID: meta.MessageID,
 	}
 	approved, askErr := e.approver.Ask(ctx, req)
 
-	if errors.Is(askErr, context.Canceled) {
-		// The caller's own ctx ended (typically the turn being canceled),
-		// not the approver's timeout: propagate so the agent loop's
-		// cancellation path runs, same as a canceled exec run would.
-		e.writeAudit(ctx, meta.SessionID, displayCmd, "expired", "", nil, nil, false)
-		return "exec: approval wait canceled because the turn ended", ctx.Err()
-	}
-
 	var label, modelMsg string
 	switch {
 	case askErr != nil:
-		// Approver timeout (context.DeadlineExceeded) or no interactive
-		// approver at all (ErrNoApprover): both fail closed the same way.
+		// Approver timeout (context.DeadlineExceeded), no interactive
+		// approver at all (ErrNoApprover), or the turn's own ctx ending
+		// mid-wait: all fail closed the same way here. Registry.Run's
+		// uniform "ctx ended after a tool returns (result, nil) still
+		// surfaces as a Go error" contract (see registry.go) is what turns
+		// this into cancellation propagation when it was really the turn
+		// ending, rather than an ordinary approval timeout - ask itself
+		// does not need to tell those two apart.
 		label = "expired"
 		modelMsg = fmt.Sprintf("exec: no approval decision was reached (%v); command refused. Do not retry immediately.", askErr)
 	case !approved:
@@ -188,20 +263,23 @@ func (e *execTool) ask(ctx context.Context, meta agent.Meta, rawCmd, displayCmd,
 	}
 
 	if label != "approved" {
-		e.writeAudit(ctx, meta.SessionID, displayCmd, label, "", nil, nil, false)
+		e.writeAudit(ctx, meta.SessionID, redactedCmd, label, "", nil, nil, false)
 		return modelMsg, nil
 	}
 
-	return e.execute(ctx, meta, rawCmd, displayCmd, "approved", "")
+	return e.execute(ctx, meta, rawCmd, redactedCmd, "approved", "")
 }
 
 // execute runs rawCmd under e.shell, bounded by e.cfg.Timeout as an
-// additional bound derived from ctx (not a replacement for it), and kills
-// the whole process tree on either bound firing. A non-zero exit code is a
-// normal result; only the caller's own ctx ending mid-run is surfaced as a
-// Go error, so the agent loop's cancellation handling can flush and abort
-// the turn instead of the exec tool silently swallowing it.
-func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, displayCmd, decision, rule string) (string, error) {
+// additional bound derived from ctx (not a replacement for it). It always
+// kills rawCmd's whole process tree once the command finishes, regardless
+// of how it finished, so a command that backgrounds a child (`sleep 30 &`)
+// never leaves that child running past this call - see trackProcessTree and
+// the unconditional call below. A non-zero exit code is a normal result;
+// only the caller's own ctx ending mid-run is surfaced as a Go error, so
+// the agent loop's cancellation handling can flush and abort the turn
+// instead of the exec tool silently swallowing it.
+func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, redactedCmd, decision, rule string) (string, error) {
 	runCtx, cancel := context.WithTimeout(ctx, e.cfg.Timeout.Std())
 	defer cancel()
 
@@ -211,8 +289,14 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 	cmd.Env = filterEnv(os.Environ(), e.secretEnvNames)
 	cmd.WaitDelay = execWaitDelay
 	setProcessGroup(cmd)
+
+	// tracked is set from trackProcessTree just below, after Start succeeds.
+	// cmd.Cancel must be assigned before Start (os/exec requires it), so it
+	// cannot capture the tree directly - it goes through tracked instead,
+	// which is safe to read concurrently with the assignment below.
+	var tracked trackedProcessTree
 	cmd.Cancel = func() error {
-		killProcessTree(cmd)
+		tracked.kill()
 		return nil
 	}
 
@@ -222,7 +306,7 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 	// into it instead of two goroutines writing to it concurrently, and
 	// Wait always joins that copier before returning - so capWriter.Write
 	// itself never needs to be goroutine-safe, and out.buf/out.over are
-	// safe to read once cmd.Run returns. Two distinct writers here would
+	// safe to read once cmd.Wait returns. Two distinct writers here would
 	// silently reintroduce a concurrent-write race this type does nothing
 	// to guard against.
 	out := &capWriter{max: e.cfg.MaxOutputBytes}
@@ -230,8 +314,35 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 	cmd.Stderr = out
 
 	start := time.Now()
-	runErr := cmd.Run()
+	runErr := cmd.Start()
+	if runErr == nil {
+		tracked.set(trackProcessTree(cmd))
+		// Start's own ctx-watcher goroutine can invoke cmd.Cancel any time
+		// after Start returns, including in the narrow window before the
+		// line above runs; if that happened, tracked.kill was a no-op
+		// against a still-nil tree. Checking runCtx.Err() again now that
+		// the tree is assigned, and killing directly, closes that window -
+		// tracked.kill's sync.Once means this never double-kills whether
+		// or not cmd.Cancel also fires.
+		if runCtx.Err() != nil {
+			tracked.kill()
+		}
+		runErr = cmd.Wait()
+	}
 	durationMS := time.Since(start).Milliseconds()
+
+	// A background child (e.g. the shell ran `sleep 30 &`) inherits the
+	// same stdout/stderr pipe and can keep it open long after the shell
+	// itself has exited; cmd.WaitDelay bounds how long Wait waits for that
+	// before force-closing the pipe (see the ErrWaitDelay case below), but
+	// nothing about a normal, on-time exit stops that child from
+	// continuing to run afterward. Killing the whole process tree here,
+	// unconditionally, after every return path from Start/Wait - not only
+	// on timeout or cancellation, where cmd.Cancel above already does it -
+	// is what guarantees a backgrounded child never outlives this call.
+	// tracked.kill is a no-op once the tree is already gone, so calling it
+	// again when cmd.Cancel already fired costs nothing.
+	tracked.kill()
 
 	output := out.buf.Bytes()
 	truncated := out.over
@@ -245,7 +356,7 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 	var exitErr *exec.ExitError
 	switch {
 	case runErr == nil:
-		return e.finishExecute(ctx, meta, decision, rule, displayCmd, 0, durationMS, truncated, output, "")
+		return e.finishExecute(ctx, meta, decision, rule, redactedCmd, 0, durationMS, truncated, output, "")
 
 	case ctx.Err() != nil:
 		// The caller's own context ended (turn canceled, or its own
@@ -254,26 +365,45 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, display
 		// normal-looking *exec.ExitError with a non-zero code, which would
 		// otherwise be indistinguishable from a genuine non-zero exit.
 		// Audit best-effort and propagate so the agent loop's cancellation
-		// handling runs.
-		e.writeAudit(context.WithoutCancel(ctx), meta.SessionID, displayCmd, decision, rule, nil, &durationMS, truncated)
+		// handling runs; writeAudit already detaches the context it is
+		// given from ctx's own cancellation, so ctx itself is passed as-is.
+		e.writeAudit(ctx, meta.SessionID, redactedCmd, decision, rule, nil, &durationMS, truncated)
 		return "exec: command canceled because the turn ended", ctx.Err()
 
 	case errors.Is(runCtx.Err(), context.DeadlineExceeded):
 		// Only this call's own tools.exec.timeout fired; the turn itself
 		// (ctx) is still alive, so this is a normal result, not an error.
-		return e.finishExecute(ctx, meta, decision, rule, displayCmd, -1, durationMS, truncated, output, "killed after exceeding tools.exec.timeout")
+		return e.finishExecute(ctx, meta, decision, rule, redactedCmd, -1, durationMS, truncated, output, "killed after exceeding tools.exec.timeout")
+
+	case errors.Is(runErr, exec.ErrWaitDelay):
+		// The shell process itself exited on its own (state.Success(), so
+		// cmd.ProcessState.ExitCode() below is always 0 - see os/exec's own
+		// Wait: this error only replaces a nil result, never an *ExitError),
+		// but a backgrounded child (e.g. `sleep 30 &`) kept stdout/stderr
+		// open past execWaitDelay, so cmd.Run reports ErrWaitDelay instead
+		// of nil even though the command completed normally. Report it as
+		// a normal completion with whatever output was captured before the
+		// pipe was force-closed, not a failure - a "failed to run" result
+		// with no output would both mislead the model and lose the real
+		// result. killProcessTree above already ensures the background
+		// child does not outlive this call either way.
+		exitCode := 0
+		if cmd.ProcessState != nil {
+			exitCode = cmd.ProcessState.ExitCode()
+		}
+		return e.finishExecute(ctx, meta, decision, rule, redactedCmd, exitCode, durationMS, truncated, output, "a background process kept the output pipe open past the command's own exit; any output after that point was discarded")
 
 	case errors.As(runErr, &exitErr):
-		return e.finishExecute(ctx, meta, decision, rule, displayCmd, exitErr.ExitCode(), durationMS, truncated, output, "")
+		return e.finishExecute(ctx, meta, decision, rule, redactedCmd, exitErr.ExitCode(), durationMS, truncated, output, "")
 
 	default:
-		e.writeAudit(ctx, meta.SessionID, displayCmd, decision, rule, nil, &durationMS, truncated)
+		e.writeAudit(ctx, meta.SessionID, redactedCmd, decision, rule, nil, &durationMS, truncated)
 		return fmt.Sprintf("exec: command failed to run: %v", runErr), nil
 	}
 }
 
-func (e *execTool) finishExecute(ctx context.Context, meta agent.Meta, decision, rule, displayCmd string, exitCode int, durationMS int64, truncated bool, output []byte, statusNote string) (string, error) {
-	e.writeAudit(ctx, meta.SessionID, displayCmd, decision, rule, &exitCode, &durationMS, truncated)
+func (e *execTool) finishExecute(ctx context.Context, meta agent.Meta, decision, rule, redactedCmd string, exitCode int, durationMS int64, truncated bool, output []byte, statusNote string) (string, error) {
+	e.writeAudit(ctx, meta.SessionID, redactedCmd, decision, rule, &exitCode, &durationMS, truncated)
 
 	var b strings.Builder
 	fmt.Fprintf(&b, "exit_code: %d\nduration_ms: %d\n", exitCode, durationMS)
@@ -299,7 +429,7 @@ func (e *execTool) writeAudit(ctx context.Context, sessionID, command, decision,
 	bg := context.WithoutCancel(ctx)
 	row := &store.ExecAudit{
 		SessionID:  sessionID,
-		Command:    command,
+		Command:    capForAudit(command),
 		CWD:        e.cfg.CWD,
 		Decision:   decision,
 		Rule:       rule,

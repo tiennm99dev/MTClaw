@@ -214,10 +214,10 @@ func TestNewPolicy_InvalidAllowRegexErrors(t *testing.T) {
 
 // --- Deny-list corpus -------------------------------------------------
 //
-// Required deliverable, not optional coverage (phase 5 spec). An earlier,
-// more "obvious" version of the rm patterns was bypassed by
-// `rm --recursive --force /` and `/bin/rm -rf /`; this corpus is what would
-// have caught that, and is what must catch the next one.
+// Required deliverable, not optional coverage. An earlier, more "obvious"
+// version of the rm patterns was bypassed by `rm --recursive --force /` and
+// `/bin/rm -rf /`; this corpus is what would have caught that, and is what
+// must catch the next one.
 
 func mustCatchPOSIX() []string {
 	return []string{
@@ -243,6 +243,17 @@ func mustCatchPOSIX() []string {
 		"'rm' -rf /home/me",
 		`\rm -rf /home/me`,
 		`"rm" -rf /home/me`,
+		// Command-word positions the deny normalization pass must also
+		// unquote/unescape at: right after a newline, inside a subshell or
+		// group opening paren/brace applied to an *escaped* command word
+		// (a bare "(rm ...)" is already caught directly by the rm pattern's
+		// own paren alternative, so these specifically combine that
+		// position with quoting/escaping), and right after a "$(" command
+		// substitution opens.
+		"true\n'rm' -rf ~",
+		`(\rm -rf ~)`,
+		`{ 'rm' -rf ~; }`,
+		`x=$('rm' -rf ~)`,
 	}
 }
 
@@ -308,10 +319,10 @@ func TestDenyCorpus_POSIX(t *testing.T) {
 	}
 }
 
-// TestDenyCorpus_BothBypassesFromRedTeam pins the two specific bypasses the
-// plan's red team found in an earlier pattern draft, so a future
-// "simplification" of the regex cannot silently reintroduce them.
-func TestDenyCorpus_BothBypassesFromRedTeam(t *testing.T) {
+// TestDenyCorpus_RmRulesCatchLongFlagsAndPathPrefixedForms pins two specific
+// bypasses an earlier, more "obvious" version of the rm patterns missed, so
+// a future "simplification" of the regex cannot silently reintroduce them.
+func TestDenyCorpus_RmRulesCatchLongFlagsAndPathPrefixedForms(t *testing.T) {
 	p := newDenyOnlyPolicy(t, DefaultDenyPOSIX)
 
 	for _, cmd := range []string{"rm --recursive --force /", "/bin/rm -rf /"} {

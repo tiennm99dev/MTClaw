@@ -1,10 +1,8 @@
 // Package tools implements MTClaw's tool registry and policy engine: the
 // filesystem, web_fetch, and exec tools the agent loop can call, and the
-// deny-list -> allow-list -> mode pipeline that gates exec. See
-// plans/260731-2219-mtclaw-core-system/phase-05-tools-and-policy-engine.md
-// for the security model this package is required to implement, in
-// particular that the deny-list - not the auto-mode classifier - is the
-// only real enforcement boundary.
+// deny-list -> allow-list -> mode pipeline that gates exec. The deny-list -
+// not the auto-mode classifier - is the only real enforcement boundary; see
+// docs/security.md for the full security model this package implements.
 package tools
 
 import (
@@ -75,21 +73,36 @@ func (r *Registry) Specs() []provider.ToolSpec {
 // malformed arguments are never a Go error here: they are the model's
 // mistake, reported back as a result string so it can self-correct on the
 // next turn instead of aborting the whole conversation.
+//
+// It also owns the one rule every ToolFunc relies on instead of each
+// re-implementing its own version: if a tool call returns normally (a
+// result string, no error) but ctx had already ended by the time it did -
+// canceled, or its deadline elapsed, typically because the turn itself was
+// aborted while the call was still in flight - Run turns that into a Go
+// error here, once, so the agent loop's cancellation handling always runs
+// on a dead context regardless of whether the specific tool that was
+// running noticed. A tool that fails for its own reason keeps that error
+// untouched; this only applies when the tool itself reported success.
 func (r *Registry) Run(ctx context.Context, call provider.ToolCall, meta agent.Meta) (string, error) {
 	t, ok := r.tools[call.Name]
 	if !ok {
 		return fmt.Sprintf("error: unknown tool %q; available tools: %s", call.Name, strings.Join(r.names, ", ")), nil
 	}
-	return t.Run(ctx, call.Args, meta)
+	out, err := t.Run(ctx, call.Args, meta)
+	if err == nil && ctx.Err() != nil {
+		return out, ctx.Err()
+	}
+	return out, err
 }
 
 // New builds the full tool registry for one process from cfg: filesystem
 // tools when tools.filesystem.enabled, web_fetch when tools.web_fetch.enabled,
-// and exec when tools.exec.enabled and its mode is not "off" (mode: off is
-// deliberately implemented as "never register the tool", not as a runtime
-// check inside it). approver is used only by the exec tool; a nil approver
-// falls back to DenyAllApprover so a caller that forgets to wire one fails
-// safe instead of panicking on first use.
+// and exec when tools.exec.enabled. config.Load already normalizes
+// tools.exec.mode: "off" down to tools.exec.enabled: false right after
+// decode (see config.normalizeExecMode), so Enabled alone is authoritative
+// here - "off" never has to be checked separately. approver is used only by
+// the exec tool; a nil approver falls back to DenyAllApprover so a caller
+// that forgets to wire one fails safe instead of panicking on first use.
 func New(cfg config.Config, st store.Store, approver Approver, log *slog.Logger) (*Registry, error) {
 	if log == nil {
 		log = slog.Default()
@@ -106,7 +119,7 @@ func New(cfg config.Config, st store.Store, approver Approver, log *slog.Logger)
 	if cfg.Tools.WebFetch.Enabled {
 		registerWebFetchTool(r, cfg.Tools.WebFetch)
 	}
-	if cfg.Tools.Exec.Enabled && cfg.Tools.Exec.Mode != "off" {
+	if cfg.Tools.Exec.Enabled {
 		if err := registerExecTool(r, cfg, st, approver, log); err != nil {
 			return nil, err
 		}

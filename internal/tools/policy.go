@@ -83,7 +83,7 @@ func NewPolicy(cfg config.ExecConfig, classifier Classifier) (*Policy, error) {
 		classifier: classifier,
 		confirmOn:  confirmOn,
 		cwd:        cfg.CWD,
-		shell:      resolveShell(cfg.Shell),
+		shell:      ResolveShell(cfg.Shell),
 	}, nil
 }
 
@@ -114,17 +114,22 @@ func compileRules(patterns []string, deny bool) ([]compiledRule, error) {
 }
 
 // denyCommandWordQuote matches a command word at the very start of cmd, or
-// immediately after a `;`, `&`, or `|` segment separator, that is wrapped in
-// a single quote, a double quote, or escaped with a single leading
-// backslash - the shapes `'rm' -rf /`, `"rm" -rf /`, and `\rm -rf /` use to
-// dodge a plain "rm" pattern without changing what the shell actually runs.
-// It is deliberately anchored to the command-word position only: a quoted
+// immediately after a `;`, `&`, `|`, `(`, `{`, or newline segment separator
+// (or a `$(` subshell open), that is wrapped in a single quote, a double
+// quote, or escaped with a single leading backslash - the shapes
+// `'rm' -rf /`, `"rm" -rf /`, and `\rm -rf /` use to dodge a plain "rm"
+// pattern without changing what the shell actually runs. The separator
+// class covers every position a deny pattern's own command-word
+// alternatives already recognize unquoted (a literal `(` before `rm`, a
+// newline joining two commands, `$(...)` command substitution) plus `{`,
+// which a brace group opens the same way `(` opens a subshell. It is
+// deliberately anchored to the command-word position only: a quoted
 // *argument* elsewhere in the command (`grep "rm -rf" file`, `cat "my 'rm
 // -rf' notes.txt"`) must keep its quotes, because those quotes are what
 // keep "rm -rf" inert text instead of a command - stripping them there
 // would turn an ordinary read-only command into a permanent, non-overridable
 // refusal.
-var denyCommandWordQuote = regexp.MustCompile(`(^|[;&|]\s*)(?:'([^'\s]+)'|"([^"\s]+)"|\\(\w))`)
+var denyCommandWordQuote = regexp.MustCompile(`(^|[;&|({\n]\s*|\$\()(?:'([^'\s]+)'|"([^"\s]+)"|\\(\w))`)
 
 // normalizeForDeny rewrites only each segment's leading command word,
 // unquoting or unescaping it, so a deny rule also catches a command whose
