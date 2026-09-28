@@ -17,62 +17,60 @@ jobs:
                         # is pure Go (see docs/architecture.md).
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
-          fetch-depth: 0 # full history, so `git describe`-style tooling and Commit below work
+          # This job's token has contents: write (it publishes the
+          # release); persisting it in .git/config for the rest of the job
+          # would let any step after this one - go test, a dependency's
+          # build script - read it out of a world-readable file instead of
+          # only the steps that actually need it (softprops/action-gh-
+          # release takes its own token as an explicit input, not from
+          # persisted git credentials).
+          persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      # `stable` with check-latest is a moving tag: it always resolves to
+      # the newest stable Go release rather than pinning the go.mod
+      # directive's minimum (which, left running long enough, drifts behind
+      # upstream security fixes - see the govulncheck job in ci.yml). CI
+      # keeps one leg on the go.mod minimum to prove that floor still
+      # builds; release always ships on current Go.
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: stable
+          check-latest: true
 
-      - name: Build all release targets
-        run: |
-          set -euo pipefail
+      # A tag pushed from a local branch that never ran CI must not publish
+      # a release built from untested code: gate the build on the same
+      # checks CI runs, against this exact tagged commit.
+      - name: go vet
+        run: go vet ./...
 
-          VERSION="${GITHUB_REF_NAME}"
-          COMMIT="$(git rev-parse --short HEAD)"
-          DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      - name: go test
+        run: go test ./...
 
-          # -X paths match internal/version's package-level vars exactly;
-          # -s -w strip debug info and the symbol table (smaller static
-          # binaries, matching the CGO_ENABLED=0 single-binary story).
-          LDFLAGS="-s -w"
-          LDFLAGS="$LDFLAGS -X github.com/tiennm99/MTClaw/internal/version.Version=${VERSION}"
-          LDFLAGS="$LDFLAGS -X github.com/tiennm99/MTClaw/internal/version.Commit=${COMMIT}"
-          LDFLAGS="$LDFLAGS -X github.com/tiennm99/MTClaw/internal/version.Date=${DATE}"
-
-          mkdir -p dist
-
-          # linux amd64/arm64, darwin amd64/arm64, windows amd64 - the exact
-          # matrix from phase-09-hardening-and-release.md.
-          targets="linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64"
-          for target in $targets; do
-            GOOS="${target%/*}"
-            GOARCH="${target#*/}"
-            ext=""
-            if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-            out="dist/mtclaw-${VERSION}-${GOOS}-${GOARCH}${ext}"
-            echo "building ${out}"
-            GOOS="$GOOS" GOARCH="$GOARCH" go build -trimpath -ldflags "$LDFLAGS" -o "$out" .
-          done
-
-          ls -la dist
-
-      - name: Checksums
-        working-directory: dist
-        run: sha256sum * > SHA256SUMS
+      # The Makefile owns the actual build recipe (targets, -trimpath,
+      # -ldflags, SHA256SUMS) so there is exactly one place that knows it,
+      # not one copy here and one in `make release` that can drift apart.
+      # VERSION is passed through env, not interpolated straight into run:
+      # a tag name can contain shell metacharacters ($, (), ;) that git
+      # itself allows, and an expression substituted directly into a run:
+      # block is not shell-quoted the way an env var expansion is.
+      - name: Build release artifacts
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: make release VERSION="$VERSION"
 
       - name: Create GitHub release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*
           generate_release_notes: true
           body: |
-            Untested cross-compiled targets: only linux/amd64 and the
-            release runner's own host binary are actually executed as part
-            of this workflow. The other four targets build cleanly
-            (CGO_ENABLED=0, pure-Go sqlite driver) but are not run here -
-            see docs/architecture.md and the phase 9 implementation report
-            for what was verified and how.
+            Every target is cross-compiled with `CGO_ENABLED=0` (the sqlite
+            driver, modernc.org/sqlite, is pure Go, so this needs no
+            cross-toolchain). This workflow itself only executes `go vet`/
+            `go test` on the runner's own linux/amd64 host before building -
+            it does not run any of the produced binaries, on this or any
+            other target.

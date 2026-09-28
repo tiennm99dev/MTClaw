@@ -1,14 +1,15 @@
 MODULE  := github.com/tiennm99/MTClaw
 BIN     := mtclaw
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
-DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
 
-LDFLAGS := -X '$(MODULE)/internal/version.Version=$(VERSION)' \
-           -X '$(MODULE)/internal/version.Commit=$(COMMIT)' \
-           -X '$(MODULE)/internal/version.Date=$(DATE)'
+# Only the tag name needs an explicit -X: internal/version.String resolves
+# Commit and Date on its own from runtime/debug.ReadBuildInfo's VCS
+# stamping (the commit SHA and commit time, not build wall-clock time),
+# which Go embeds automatically for any binary built from within this git
+# checkout - see internal/version/version.go.
+LDFLAGS := -X '$(MODULE)/internal/version.Version=$(VERSION)'
 
-.PHONY: build test race lint fmt install clean release
+.PHONY: build test race lint fmt fmt-check install clean release
 
 build:
 	CGO_ENABLED=0 go build -ldflags "$(LDFLAGS)" -o bin/$(BIN) .
@@ -24,8 +25,18 @@ race:
 lint:
 	go vet ./...
 
+# fmt rewrites every unformatted file in place; use fmt-check (what CI runs)
+# to only report a problem and fail without touching anything.
 fmt:
-	gofmt -l .
+	gofmt -w .
+
+fmt-check:
+	@fmtOut="$$(gofmt -l .)"; \
+	if [ -n "$$fmtOut" ]; then \
+		echo "gofmt found unformatted files:"; \
+		echo "$$fmtOut"; \
+		exit 1; \
+	fi
 
 install:
 	CGO_ENABLED=0 go install -ldflags "$(LDFLAGS)" .
@@ -34,10 +45,18 @@ clean:
 	rm -rf bin/ dist/
 
 # release cross-compiles the exact matrix release.yml builds, stamps the
-# same -X paths, and writes SHA256SUMS - so a maintainer can produce and
-# spot-check the release artifacts locally before ever pushing a tag.
+# same -X path, and writes SHA256SUMS - so a maintainer can produce and
+# spot-check the release artifacts locally before ever pushing a tag, and so
+# release.yml itself has exactly one place that knows the build recipe.
+# VERSION is normally overridden on the command line by the release
+# workflow (`make release VERSION=$GITHUB_REF_NAME`); the git-describe
+# default above is what a local `make release` gets instead.
 RELEASE_LDFLAGS := -s -w $(LDFLAGS)
 RELEASE_TARGETS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64
+
+# sha256sum is not available on macOS by default (it ships `shasum -a 256`
+# instead); checksum picks whichever this host actually has.
+checksum := $(shell command -v sha256sum 2>/dev/null || echo "shasum -a 256")
 
 release: clean
 	mkdir -p dist
@@ -48,4 +67,4 @@ release: clean
 		echo "building $$out"; \
 		CGO_ENABLED=0 GOOS=$$os GOARCH=$$arch go build -trimpath -ldflags "$(RELEASE_LDFLAGS)" -o "$$out" . || exit 1; \
 	done
-	cd dist && sha256sum * > SHA256SUMS
+	cd dist && $(checksum) * > SHA256SUMS

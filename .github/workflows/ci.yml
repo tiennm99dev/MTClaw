@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   test:
-    name: test (${{ matrix.os }})
+    name: test (${{ matrix.os }}, go.mod minimum)
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -19,10 +19,17 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      # Pins this leg to exactly the go.mod minimum (go-version-file
+      # installs the go directive's version, not a moving one), so a
+      # regression against the oldest Go this project claims to support is
+      # caught here - see the test-stable job for the moving `stable` tag
+      # every actual release is built with.
+      - name: Set up Go (go.mod minimum)
+        uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -96,7 +103,49 @@ jobs:
 
       - name: Upload test output on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-output-${{ matrix.os }}
           path: test-output.log
+
+  test-stable:
+    # A single ubuntu leg on the moving `stable` tag: this is the toolchain
+    # release.yml actually builds with, so a build/vet/test regression that
+    # only shows up on a newer Go than go.mod's minimum is caught here
+    # instead of first being discovered by a tag push. check-latest ensures
+    # the runner's own cached "stable" alias can never be stale.
+    name: test (ubuntu-latest, stable Go)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Go (stable)
+        uses: actions/setup-go@v7
+        with:
+          go-version: stable
+          check-latest: true
+          cache: true
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: go test
+        run: go test ./...
+
+  govulncheck:
+    # golang/govulncheck-action manages its own Go install (no separate
+    # checkout/setup-go step needed) and checks out the repo itself.
+    name: govulncheck (stable Go)
+    runs-on: ubuntu-latest
+    steps:
+      - name: govulncheck
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: stable
+          check-latest: true
