@@ -28,14 +28,14 @@ toolchain that is already at least 1.25.7). No Go toolchain is required if
 you download a release binary.
 
 **From a release** (no Go toolchain needed): download the `mtclaw` binary for
-your OS/arch from the [releases page](https://github.com/tiennm99/MTClaw/releases)
+your OS/arch from the [releases page](https://github.com/tiennm99dev/MTClaw/releases)
 (bare binaries, not archives), verify it against the accompanying
 `SHA256SUMS`, and put it on your `PATH`.
 
 **From source:**
 
 ```sh
-git clone https://github.com/tiennm99/MTClaw.git
+git clone https://github.com/tiennm99dev/MTClaw.git
 cd MTClaw
 make build      # -> bin/mtclaw, version-stamped from git
 ```
@@ -46,12 +46,33 @@ Or, without cloning:
 go install github.com/tiennm99/MTClaw@latest
 ```
 
-`go install` applies no `-ldflags`, so that binary reports `mtclaw dev
-(commit none, built unknown)` from `mtclaw version` - only `make
-build`/`install` and the release workflow stamp a real version.
+The module's import path is `github.com/tiennm99/MTClaw` - a different
+owner than the repo actually lives under
+(`github.com/tiennm99dev/MTClaw`, see the clone URL above). `go install`
+resolves the import path through GitHub's own repo-rename redirect, which
+works today but is a redirect this project does not control; if it is ever
+missed, clone or download a release instead. `go install` also reports a
+real `Version` (whatever `@vX` you asked for) but no commit or build date,
+since there is no local `.git` checkout for `runtime/debug.ReadBuildInfo`
+to read VCS metadata from - only `make build`/`install` and the release
+workflow, both run from inside a git checkout, get all three.
 
-`CGO_ENABLED=0` is used everywhere, so every build - local or released - is
-a single static binary with no runtime dependency.
+Every build - local or released - passes `CGO_ENABLED=0`, so it is a single
+static binary with no runtime dependency; the plain `go install` line above
+is the one exception, since it does not set that variable itself and
+inherits whatever `CGO_ENABLED` your own environment defaults to.
+
+## Upgrading
+
+The gateway's instance lock lives next to the database
+(`storage.path + ".lock"`, see `docs/configuration.md`'s `storage.path`
+row) - not at a fixed path under `~/.mtclaw/`. If you are upgrading from a
+version that predates this, stop the old gateway process before starting
+the new binary: a new `mtclaw gateway`, `cron run`, or `doctor` checks only
+the new lock path, so it cannot see an old gateway still holding the old
+`~/.mtclaw/gateway.lock` and would happily run against the same database at
+the same time. The stale `~/.mtclaw/gateway.lock` left behind by the old
+process is no longer read by anything and can be deleted.
 
 ## 5-minute quickstart
 
@@ -97,12 +118,14 @@ workspace"` runs one full tool-using agent turn with no Telegram involved.
 ## Windows support: honesty note
 
 MTClaw builds and its test suite passes on Windows, and the `exec` tool
-defaults to PowerShell there with its own OS-appropriate deny-list. That
-said, Windows is the least battle-tested target: there is no POSIX-style
-process-group kill for a runaway command (Windows needs a job object or
-`taskkill /T` for equivalent behavior), file-permission checks that matter
-on POSIX (world-readable secrets, `chmod 600` on the config file) are
-documented no-ops on Windows because ACL-based permissions are not the mode
-bits those checks read, and the deny-list corpus is necessarily
-shell-specific. Treat Windows support as best-effort, not equivalent to
-Linux/macOS, until it has seen more real use.
+defaults to PowerShell there with its own OS-appropriate deny-list. A
+runaway command's whole process tree is killed on timeout or turn
+cancellation there too, via `taskkill /F /T` (Windows has no POSIX process
+group to signal, so this is a different mechanism than the `setpgid`+
+`SIGKILL` the POSIX build uses, not a gap). That said, Windows is still the
+least battle-tested target: file-permission checks that matter on POSIX
+(world-readable secrets, `chmod 600` on the config file) are documented
+no-ops on Windows because ACL-based permissions are not the mode bits those
+checks read, and the deny-list corpus is necessarily shell-specific. Treat
+Windows support as best-effort, not equivalent to Linux/macOS, until it has
+seen more real use.
