@@ -18,7 +18,7 @@ import (
 // way Execute does and walks it, asserting the commands other tests and
 // docs assume exist actually got wired into root.go.
 func TestNewRootCmd_RegistersExpectedCommands(t *testing.T) {
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 
 	prompt, _, err := root.Find([]string{"prompt"})
 	require.NoError(t, err)
@@ -43,7 +43,7 @@ func TestNewRootCmd_RegistersExpectedCommands(t *testing.T) {
 func TestNewRootCmd_ExecutesVersion(t *testing.T) {
 	useFakeHome(t) // version resolves a config path via os.UserHomeDir even though it never loads it
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -84,7 +84,7 @@ storage:
 
 	// `config validate` only loads the config (PersistentPreRunE); it never
 	// calls openStore, so the storage directory must not appear.
-	validateCmd := newRootCmd(&state{})
+	validateCmd := newTestRootCmd(t)
 	var out bytes.Buffer
 	validateCmd.SetOut(&out)
 	validateCmd.SetErr(&out)
@@ -144,7 +144,7 @@ func walkRunnable(cmd *cobra.Command, fn func(*cobra.Command)) {
 // itself would otherwise load and validate the config (the safer default),
 // but silently, with nothing here to catch the omission.
 func TestEveryRunnableCommandDeclaresAConfigAnnotation(t *testing.T) {
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	walkRunnable(root, func(cmd *cobra.Command) {
 		_, ok := cmd.Annotations[annotationConfig]
 		assert.Truef(t, ok, "%q must declare Annotations[%q]", cmd.CommandPath(), annotationConfig)
@@ -166,7 +166,7 @@ func TestHelpAndCompletionWorkWithoutConfig(t *testing.T) {
 		{"completion", "zsh"},
 	} {
 		t.Run(strings.Join(args, " "), func(t *testing.T) {
-			cmd := newRootCmd(&state{})
+			cmd := newTestRootCmd(t)
 			var out bytes.Buffer
 			cmd.SetOut(&out)
 			cmd.SetErr(&out)
@@ -204,7 +204,7 @@ storage:
 `, root, root, root, filepath.Join(root, "mtclaw.db"))
 	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
 
-	cmd := newRootCmd(&state{})
+	cmd := newTestRootCmd(t)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
@@ -243,7 +243,7 @@ storage:
 	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
 
 	for _, level := range []string{"WARN", "warning", " Info "} {
-		cmd := newRootCmd(&state{})
+		cmd := newTestRootCmd(t)
 		var out bytes.Buffer
 		cmd.SetOut(&out)
 		cmd.SetErr(&out)
@@ -273,7 +273,7 @@ func TestFinalizeExecuteError(t *testing.T) {
 // "config file not found" with no pointer to how to fix it.
 func TestPrepare_MissingConfigPointsAtOnboard(t *testing.T) {
 	useFakeHome(t)
-	cmd := newRootCmd(&state{})
+	cmd := newTestRootCmd(t)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)
@@ -314,7 +314,7 @@ log:
 `, root, root, root, filepath.Join(root, "mtclaw.db"), filepath.Join(logDir, "mtclaw.log"))
 	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
 
-	cmd := newRootCmd(&state{})
+	cmd := newTestRootCmd(t)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)

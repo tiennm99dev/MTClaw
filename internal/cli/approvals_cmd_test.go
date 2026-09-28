@@ -34,7 +34,7 @@ func TestApprovalsListCmd_SanitizesEmbeddedControlCharsAndNewlines(t *testing.T)
 	}))
 	require.NoError(t, st.Close())
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)

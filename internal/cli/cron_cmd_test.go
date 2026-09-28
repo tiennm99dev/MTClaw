@@ -67,7 +67,7 @@ func TestCronRunCmd_PrintOnlyOutputIsSanitizedForTerminal(t *testing.T) {
 	srv := fakeOpenAIChatCompletionWithControlChar(t)
 	configPath, _ := cronTestConfigPath(t, srv)
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -154,7 +154,7 @@ func TestCronListCmd_NoDatabaseYetShowsDashesInsteadOfFailing(t *testing.T) {
 	_, statErr := os.Stat(dbPath)
 	require.True(t, os.IsNotExist(statErr), "test setup must not have created the database")
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -181,7 +181,7 @@ func TestCronRunCmd_RecordsRunWithStartedBeforeFinished(t *testing.T) {
 	srv := fakeOpenAIChatCompletion(t, "hello from the job")
 	configPath, dbPath := cronTestConfigPath(t, srv)
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -218,7 +218,7 @@ func TestCronRunCmd_RefusesWhilePersistentJobsGatewayLockIsHeld(t *testing.T) {
 	require.NoError(t, err)
 	defer release()
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -229,7 +229,7 @@ func TestCronRunCmd_RefusesWhilePersistentJobsGatewayLockIsHeld(t *testing.T) {
 
 	// --ephemeral bypasses the lock check entirely (a fresh session can
 	// never race the gateway's persistent one).
-	root2 := newRootCmd(&state{})
+	root2 := newTestRootCmd(t)
 	root2.SetOut(&out)
 	root2.SetErr(&out)
 	root2.SetArgs([]string{"--config", configPath, "cron", "run", "daily", "--ephemeral"})

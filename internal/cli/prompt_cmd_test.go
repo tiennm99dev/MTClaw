@@ -75,7 +75,7 @@ storage:
 `, root, root, root, filepath.Join(root, "mtclaw.db"))
 	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
 
-	cmd := newRootCmd(&state{})
+	cmd := newTestRootCmd(t)
 	var out bytes.Buffer
 	cmd.SetOut(&out)
 	cmd.SetErr(&out)

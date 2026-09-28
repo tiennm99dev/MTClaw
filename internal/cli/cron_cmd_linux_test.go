@@ -27,7 +27,7 @@ func TestCronRunCmd_DisablesEnvironRead(t *testing.T) {
 	srv := fakeOpenAIChatCompletion(t, "hello from the job")
 	configPath, _ := cronTestConfigPath(t, srv)
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)

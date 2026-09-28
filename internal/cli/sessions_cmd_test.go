@@ -17,7 +17,7 @@ import (
 
 // sessionsTestConfigPath writes a minimal, loadable, telegram-disabled
 // config next to a fresh sqlite database (both under a temp dir) and
-// returns the config path, ready for `newRootCmd(&state{}).SetArgs(...)`.
+// returns the config path, ready for `newTestRootCmd(t).SetArgs(...)`.
 func sessionsTestConfigPath(t *testing.T) (configPath, dbPath string) {
 	t.Helper()
 	root := t.TempDir()
@@ -63,7 +63,7 @@ func TestSessionsShowCmd_SanitizesUntrustedContent(t *testing.T) {
 	}))
 	require.NoError(t, st.Close())
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -93,7 +93,7 @@ func TestSessionsListCmd_ListsSessionWithMessageCount(t *testing.T) {
 	}))
 	require.NoError(t, st.Close())
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)
@@ -121,7 +121,7 @@ func TestSessionsListCmd_LimitFlagBoundsResults(t *testing.T) {
 	}
 	require.NoError(t, st.Close())
 
-	root := newRootCmd(&state{})
+	root := newTestRootCmd(t)
 	var out bytes.Buffer
 	root.SetOut(&out)
 	root.SetErr(&out)

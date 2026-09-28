@@ -53,6 +53,9 @@ func TestString_ResolvesFromBuildInfoInARealBuild(t *testing.T) {
 	repoRoot := filepath.Join(filepath.Dir(thisFile), "..", "..")
 
 	bin := filepath.Join(t.TempDir(), "mtclaw-version-test")
+	if runtime.GOOS == "windows" {
+		bin += ".exe"
+	}
 	build := exec.Command("go", "build", "-o", bin, ".")
 	build.Dir = repoRoot
 	if out, err := build.CombinedOutput(); err != nil {
