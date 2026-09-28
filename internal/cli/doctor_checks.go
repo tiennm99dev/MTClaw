@@ -16,8 +16,12 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/gateway"
 	"github.com/tiennm99/MTClaw/internal/provider/openai"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	"github.com/tiennm99/MTClaw/internal/store"
 	"github.com/tiennm99/MTClaw/internal/tools"
+
+	// Blank import: see root.go's identical import for why store.Open
+	// cannot resolve "sqlite" without it.
+	_ "github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
 // doctorNetworkTimeout bounds every check that makes an outbound call
@@ -114,32 +118,36 @@ func checkDirWritable(label, dir string) Result {
 	return Result{StatusOK, fmt.Sprintf("%s exists and is writable", dir)}
 }
 
-// checkDatabase opens storage.path the same way a real process would: a
-// database that already exists is opened read-only (never disturbing a
-// live gateway's connection), falling back to read-write only when the
-// file does not exist yet at all (a fresh install, which is the one case
-// actually worth creating and migrating a database for). A read-only open
-// that fails for any other reason - most notably a database left behind a
-// pending migration, which a read-only connection refuses rather than
-// silently apply - is reported as-is, never retried read-write: retrying
-// unconditionally would let `doctor` migrate a database out from under a
-// gateway that is still running against it, exactly what a read-only-first
-// open is meant to avoid.
+// checkDatabase opens storage.dsn (via store.Open) the same way a real
+// process would: a database that already exists is opened read-only
+// (never disturbing a live gateway's connection), falling back to
+// read-write only when the file does not exist yet at all (a fresh
+// install, which is the one case actually worth creating and migrating a
+// database for). A read-only open that fails for any other reason - most
+// notably a database left behind a pending migration, which a read-only
+// connection refuses rather than silently apply - is reported as-is,
+// never retried read-write: retrying unconditionally would let `doctor`
+// migrate a database out from under a gateway that is still running
+// against it, exactly what a read-only-first open is meant to avoid.
+// os.Stat(dsn) assumes a filesystem-path DSN, true of every backend
+// registered today (sqlite is the only one); a future non-file backend
+// would need its own existence probe here.
 func checkDatabase(ctx context.Context, cfg *config.Config) Result {
-	db, err := sqlite.Open(ctx, cfg.Storage.Path, true)
+	dsn := cfg.Storage.EffectiveDSN()
+	st, err := store.Open(ctx, cfg.Storage, true)
 	if err != nil {
-		if _, statErr := os.Stat(cfg.Storage.Path); os.IsNotExist(statErr) {
-			db, err = sqlite.Open(ctx, cfg.Storage.Path, false)
+		if _, statErr := os.Stat(dsn); os.IsNotExist(statErr) {
+			st, err = store.Open(ctx, cfg.Storage, false)
 			if err != nil {
-				return Result{StatusFail, fmt.Sprintf("cannot create database %s: %v - check storage.path's parent directory permissions", cfg.Storage.Path, err)}
+				return Result{StatusFail, fmt.Sprintf("cannot create database %s: %v - check storage.dsn's parent directory permissions", dsn, err)}
 			}
-			defer db.Close()
-			return Result{StatusOK, fmt.Sprintf("%s created and migrated", cfg.Storage.Path)}
+			defer st.Close()
+			return Result{StatusOK, fmt.Sprintf("%s created and migrated", dsn)}
 		}
-		return Result{StatusFail, fmt.Sprintf("cannot open database %s read-only: %v - if this is a schema-behind database left by an older binary, restart the gateway (or run any command that opens it for writing) once to migrate it; doctor itself never migrates a database it only opened to inspect", cfg.Storage.Path, err)}
+		return Result{StatusFail, fmt.Sprintf("cannot open database %s read-only: %v - if this is a schema-behind database left by an older binary, restart the gateway (or run any command that opens it for writing) once to migrate it; doctor itself never migrates a database it only opened to inspect", dsn, err)}
 	}
-	defer db.Close()
-	return Result{StatusOK, fmt.Sprintf("%s opens and is at the current schema version", cfg.Storage.Path)}
+	defer st.Close()
+	return Result{StatusOK, fmt.Sprintf("%s opens and is at the current schema version", dsn)}
 }
 
 // checkInstanceLock reports a currently-held lock as INFO, not FAIL: a
@@ -245,7 +253,7 @@ func checkTelegramGetMe(ctx context.Context, cfg *config.Config) Result {
 	}
 	gctx, cancel := context.WithTimeout(ctx, doctorNetworkTimeout)
 	defer cancel()
-	username, err := telegram.GetMe(gctx, tg.Token())
+	username, err := telegram.GetMe(gctx, tg.Token(), tg.APIBaseURL)
 	if err != nil {
 		return Result{StatusFail, fmt.Sprintf("Telegram getMe failed: %v - check the bot token", err)}
 	}

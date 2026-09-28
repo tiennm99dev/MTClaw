@@ -240,7 +240,18 @@ func (e *execTool) ask(ctx context.Context, meta agent.Meta, rawCmd, redactedCmd
 		Reason:    sanitizeReason(reason),
 		MessageID: meta.MessageID,
 	}
-	approved, askErr := e.approver.Ask(ctx, req)
+	// A missing approver must refuse, not panic. Every VerdictAsk path -
+	// including the fail-closed one taken when a command cannot even be
+	// tokenized - reaches this call, so a nil approver turns "I could not
+	// evaluate this safely" into a process crash, which is the opposite of
+	// failing closed. DenyAllApprover is the same fallback registry.New
+	// uses when a caller supplies none, so an absent approver and an
+	// explicitly deny-all one produce an identical ErrNoApprover result.
+	approver := e.approver
+	if approver == nil {
+		approver = DenyAllApprover{}
+	}
+	approved, askErr := approver.Ask(ctx, req)
 
 	var label, modelMsg string
 	switch {

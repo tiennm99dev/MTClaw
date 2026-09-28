@@ -1,7 +1,8 @@
-package sqlite
+package sqlite_test
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -11,17 +12,28 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/tiennm99/MTClaw/internal/store"
+	"github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
-// newTestStore opens a fresh writer *Store at a temp path.
-func newTestStore(t *testing.T) *Store {
+// newTestStore opens a fresh writer store.Store at a temp path.
+func newTestStore(t *testing.T) store.Store {
+	t.Helper()
+	st, _ := newTestStoreWithDB(t)
+	return st
+}
+
+// newTestStoreWithDB is newTestStore plus the raw *sql.DB backing it, for
+// tests that need to plant a row directly (e.g. a colliding updated_at)
+// rather than through the store interfaces - production code never needs
+// to bypass those interfaces this way.
+func newTestStoreWithDB(t *testing.T) (store.Store, *sql.DB) {
 	t.Helper()
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "test.db")
-	db, err := Open(ctx, path, false)
+	db, dia, _, err := sqlite.Open(ctx, path, false)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = db.Close() })
-	return New(db)
+	return store.New(db, dia), db
 }
 
 func TestSessions_EnsureIsIdempotent(t *testing.T) {
@@ -60,15 +72,14 @@ func TestSessions_GetAndListNotFound(t *testing.T) {
 // same pattern), so the assertion is deterministic on a loaded box.
 func TestSessions_List_OrderedByUpdatedAtDesc(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	st, dbHandle := newTestStoreWithDB(t)
 
 	a, err := st.Sessions().Ensure(ctx, "telegram", "chat-a", "")
 	require.NoError(t, err)
 	b, err := st.Sessions().Ensure(ctx, "telegram", "chat-b", "")
 	require.NoError(t, err)
 
-	dbHandle := storeDB(t, st)
-	past := toMillis(time.Now().Add(-time.Hour))
+	past := time.Now().Add(-time.Hour).UnixMilli()
 	_, err = dbHandle.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id = ?`, past, a.ID)
 	require.NoError(t, err)
 
@@ -86,15 +97,14 @@ func TestSessions_List_OrderedByUpdatedAtDesc(t *testing.T) {
 // happens to return them.
 func TestSessions_List_TiesBrokenByIDDesc(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	st, dbHandle := newTestStoreWithDB(t)
 
 	a, err := st.Sessions().Ensure(ctx, "telegram", "chat-a", "")
 	require.NoError(t, err)
 	b, err := st.Sessions().Ensure(ctx, "telegram", "chat-b", "")
 	require.NoError(t, err)
 
-	dbHandle := storeDB(t, st)
-	tied := toMillis(time.Now())
+	tied := time.Now().UnixMilli()
 	_, err = dbHandle.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id IN (?, ?)`, tied, a.ID, b.ID)
 	require.NoError(t, err)
 
@@ -119,13 +129,12 @@ func TestSessions_List_TiesBrokenByIDDesc(t *testing.T) {
 // deterministic instead of racing the clock on a loaded box.
 func TestMessages_Append_BumpsSessionUpdatedAt(t *testing.T) {
 	ctx := context.Background()
-	st := newTestStore(t)
+	st, dbHandle := newTestStoreWithDB(t)
 
 	sess, err := st.Sessions().Ensure(ctx, "telegram", "chat-1", "")
 	require.NoError(t, err)
 
-	dbHandle := storeDB(t, st)
-	sentinel := toMillis(time.Now().Add(-time.Hour))
+	sentinel := time.Now().Add(-time.Hour).UnixMilli()
 	_, err = dbHandle.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id = ?`, sentinel, sess.ID)
 	require.NoError(t, err)
 
@@ -135,7 +144,7 @@ func TestMessages_Append_BumpsSessionUpdatedAt(t *testing.T) {
 
 	got, err := st.Sessions().Get(ctx, sess.ID)
 	require.NoError(t, err)
-	assert.True(t, got.UpdatedAt.After(fromMillis(sentinel)), "Append must bump updated_at even when it records no usage")
+	assert.True(t, got.UpdatedAt.After(time.UnixMilli(sentinel).UTC()), "Append must bump updated_at even when it records no usage")
 }
 
 func TestMessages_AppendIsAtomicAndGaplessUnderConcurrency(t *testing.T) {
@@ -199,8 +208,19 @@ func TestMessages_Append_ATurnIsAtomicallyVisible(t *testing.T) {
 	// a sentinel content value, standing in for whatever real error
 	// (disk full, cancelled context, ...) could interrupt persisting a
 	// turn partway through.
+	//
+	// This needs the raw *sql.DB handle to plant the trigger, so it opens
+	// its own store rather than going through newTestStore: store.Store
+	// is deliberately opaque about the handle underneath it (see
+	// internal/store/store_impl.go), and reaching into it from outside
+	// internal/store is no longer possible now that this package is
+	// sqlite_test.
 	ctx := context.Background()
-	st := newTestStore(t)
+	path := filepath.Join(t.TempDir(), "trigger-test.db")
+	db, dia, _, err := sqlite.Open(ctx, path, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = db.Close() })
+	st := store.New(db, dia)
 
 	sess, err := st.Sessions().Ensure(ctx, "cli", "local", "")
 	require.NoError(t, err)
@@ -211,8 +231,7 @@ func TestMessages_Append_ATurnIsAtomicallyVisible(t *testing.T) {
 		{Role: "user", Content: "hello"},
 	}))
 
-	dbHandle := storeDB(t, st)
-	_, err = dbHandle.ExecContext(ctx, `
+	_, err = db.ExecContext(ctx, `
 		CREATE TEMP TRIGGER fail_forced_content BEFORE INSERT ON messages
 		WHEN NEW.content = 'forced-failure-sentinel'
 		BEGIN SELECT RAISE(ABORT, 'forced test failure'); END`)
@@ -556,19 +575,19 @@ func TestConcurrentReaderWhileWritingSucceedsUnderWAL(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "wal.db")
 
-	writerDB, err := Open(ctx, path, false)
+	writerDB, writerDia, _, err := sqlite.Open(ctx, path, false)
 	require.NoError(t, err)
 	defer writerDB.Close()
-	writer := New(writerDB)
+	writer := store.New(writerDB, writerDia)
 
 	sess, err := writer.Sessions().Ensure(ctx, "telegram", "chat-1", "")
 	require.NoError(t, err)
 
-	readerDB, err := Open(ctx, path, true)
+	readerDB, readerDia, effectiveReadOnly, err := sqlite.Open(ctx, path, true)
 	require.NoError(t, err)
 	defer readerDB.Close()
-	assert.True(t, readerDB.ReadOnly)
-	reader := New(readerDB)
+	assert.True(t, effectiveReadOnly)
+	reader := store.New(readerDB, readerDia)
 
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -604,13 +623,4 @@ func TestConcurrentReaderWhileWritingSucceedsUnderWAL(t *testing.T) {
 	for err := range readErrs {
 		require.NoError(t, err)
 	}
-}
-
-// storeDB reaches into a *Store to get its underlying *DB for test-only raw
-// SQL setup (planting a colliding row). Kept in the test file rather than
-// exported, since production code never needs to bypass the store
-// interfaces this way.
-func storeDB(t *testing.T, st *Store) *DB {
-	t.Helper()
-	return st.db
 }

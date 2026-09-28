@@ -53,7 +53,7 @@ func newCronListCmd(s *state) *cobra.Command {
 			// because there is nothing to report yet, not because anything
 			// is broken.
 			var st store.Store
-			if _, statErr := os.Stat(s.cfg.Storage.Path); statErr == nil {
+			if _, statErr := os.Stat(s.cfg.Storage.EffectiveDSN()); statErr == nil {
 				st, err = s.openStore(ctx, true)
 				if err != nil {
 					return err

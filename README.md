@@ -74,6 +74,13 @@ the new lock path, so it cannot see an old gateway still holding the old
 the same time. The stale `~/.mtclaw/gateway.lock` left behind by the old
 process is no longer read by anything and can be deleted.
 
+**Upgrading, then wanting to go back?** Once you have run `mtclaw onboard`
+(or edited your config by hand) with a version that writes `storage.driver`/
+`storage.dsn`, an older binary will refuse to start against that config file
+at all - it rejects unrecognized keys, not just ignore them. Your database
+is unaffected either way; see `docs/configuration.md`'s storage section for
+the two-line edit that restores an older binary's compatibility.
+
 ## 5-minute quickstart
 
 ```sh

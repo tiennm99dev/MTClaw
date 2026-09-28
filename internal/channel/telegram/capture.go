@@ -23,7 +23,9 @@ type Sender struct {
 // later sender is exactly the case onboard needs to surface, not race
 // past. The caller is responsible for getting explicit on-screen
 // confirmation before writing anything to config; CaptureSenders itself
-// never touches disk.
+// never touches disk. apiBaseURL is normally cfg.Channels.Telegram.APIBaseURL;
+// onboard has no config to read one from yet, so it always passes "".
+
 // captureWindowGrace absorbs ordinary clock skew between this host and
 // Telegram's servers when comparing a message's second-resolution Date
 // against windowStart's cutoff - see captureWindowStart. A few seconds is
@@ -48,8 +50,8 @@ func captureWindowStart(now time.Time) time.Time {
 	return now.Truncate(time.Second).Add(-captureWindowGrace)
 }
 
-func CaptureSenders(ctx context.Context, token string, window time.Duration) ([]Sender, error) {
-	bot, err := oneShotBot(token)
+func CaptureSenders(ctx context.Context, token, apiBaseURL string, window time.Duration) ([]Sender, error) {
+	bot, err := oneShotBot(token, apiBaseURL)
 	if err != nil {
 		return nil, err
 	}

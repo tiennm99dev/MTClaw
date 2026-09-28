@@ -51,9 +51,9 @@ storage:
 func TestSessionsShowCmd_SanitizesUntrustedContent(t *testing.T) {
 	configPath, dbPath := sessionsTestConfigPath(t)
 
-	db, err := sqlite.Open(context.Background(), dbPath, false)
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, false)
 	require.NoError(t, err)
-	st := sqlite.New(db)
+	st := store.New(db, dia)
 	sess, err := st.Sessions().Ensure(context.Background(), "cli", "local", "")
 	require.NoError(t, err)
 	require.NoError(t, st.Messages().Append(context.Background(), sess.ID, []store.Message{
@@ -83,9 +83,9 @@ func TestSessionsShowCmd_SanitizesUntrustedContent(t *testing.T) {
 func TestSessionsListCmd_ListsSessionWithMessageCount(t *testing.T) {
 	configPath, dbPath := sessionsTestConfigPath(t)
 
-	db, err := sqlite.Open(context.Background(), dbPath, false)
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, false)
 	require.NoError(t, err)
-	st := sqlite.New(db)
+	st := store.New(db, dia)
 	sess, err := st.Sessions().Ensure(context.Background(), "cli", "local", "")
 	require.NoError(t, err)
 	require.NoError(t, st.Messages().Append(context.Background(), sess.ID, []store.Message{
@@ -112,9 +112,9 @@ func TestSessionsListCmd_ListsSessionWithMessageCount(t *testing.T) {
 func TestSessionsListCmd_LimitFlagBoundsResults(t *testing.T) {
 	configPath, dbPath := sessionsTestConfigPath(t)
 
-	db, err := sqlite.Open(context.Background(), dbPath, false)
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, false)
 	require.NoError(t, err)
-	st := sqlite.New(db)
+	st := store.New(db, dia)
 	for _, chatID := range []string{"a", "b", "c"} {
 		_, err := st.Sessions().Ensure(context.Background(), "cli", chatID, "")
 		require.NoError(t, err)

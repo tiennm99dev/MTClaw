@@ -58,11 +58,13 @@ func processEnv() map[string]string {
 
 // Load decodes YAML bytes onto Default(), normalizes a couple of
 // intentionally-duplicated spellings, resolves secret indirection, expands
-// paths relative to baseDir (the config file's directory), and validates
-// the result. env stands in for the process environment; this is still not
-// a pure function of (data, baseDir, env) alone, since resolving a *_file
-// secret reads that file from disk when one is set - see resolveSecret and
-// LoadFile, its impure os.ReadFile-based shim.
+// paths relative to baseDir (the config file's directory) - folding the
+// deprecated storage.path alias into storage.dsn along the way, see
+// expandStorage - and validates the result. env stands in for the process
+// environment; this is still not a pure function of (data, baseDir, env)
+// alone, since resolving a *_file secret reads that file from disk when
+// one is set - see resolveSecret and LoadFile, its impure
+// os.ReadFile-based shim.
 func Load(data []byte, baseDir string, env map[string]string) (*Config, error) {
 	cfg := Default()
 
@@ -229,7 +231,7 @@ func expandConfigPaths(cfg *Config, baseDir string) error {
 	if err := expand(&cfg.Tools.Exec.CWD); err != nil {
 		return err
 	}
-	if err := expand(&cfg.Storage.Path); err != nil {
+	if err := expandStorage(cfg, baseDir); err != nil {
 		return err
 	}
 	if err := expand(&cfg.Log.File); err != nil {
@@ -238,9 +240,79 @@ func expandConfigPaths(cfg *Config, baseDir string) error {
 	return nil
 }
 
-// ensureDirCreatable verifies storage.path's parent directory - or, if it
-// does not exist yet, its nearest existing ancestor - exists as a
-// directory, without creating anything on disk and without inspecting
+// expandStorage resolves storage.dsn / storage.path and folds the
+// deprecated storage.path alias into storage.dsn, but only when
+// cfg.Storage.Driver is "sqlite" - a DSN is a filesystem path for this
+// driver and nothing here has a defined meaning for any other (a second
+// driver's DSN would be a connection string, not a path to expand).
+// validateStorage's driver whitelist rejects anything but "sqlite"
+// regardless, so an unsupported driver is simply left untouched here and
+// reported there instead.
+//
+// The fold - and the deprecation warning it prints - must happen here,
+// before ExpandPath ever touches either field, not in validateStorage:
+// Load always decodes the user's YAML onto Default()'s already-populated
+// Storage.DSN, so a config that sets only storage.path is
+// indistinguishable, by field emptiness alone, from one that also
+// explicitly repeats DSN's own default value - comparing the still-literal,
+// unexpanded DSN against defaultStorageDSN is what makes that distinction
+// possible. This is also why validateStorage's own both-set check can
+// afford to be the simple, unambiguous "both fields are non-empty" test:
+// by the time it runs (via Load), a legitimate path-only config already
+// had Path folded away and cleared.
+//
+// The one case this cannot resolve: a user who sets storage.dsn to
+// exactly its own default value while also setting storage.path is
+// treated as path-only, not as a conflict. Accepted deliberately, in
+// exchange for never false-positiving on the vastly more common case this
+// whole alias exists for: an untouched, pre-existing config that only
+// ever set storage.path.
+func expandStorage(cfg *Config, baseDir string) error {
+	if cfg.Storage.Driver != "sqlite" {
+		return nil
+	}
+
+	if cfg.Storage.Path != "" {
+		dsnExplicitlySet := cfg.Storage.DSN != "" && cfg.Storage.DSN != defaultStorageDSN
+		if !dsnExplicitlySet {
+			warnStoragePathDeprecated()
+			cfg.Storage.DSN = cfg.Storage.Path
+			cfg.Storage.Path = ""
+		}
+		// dsnExplicitlySet: leave both fields set. validateStorage reports
+		// the conflict naming both keys; expanding both below keeps that
+		// error's paths absolute either way.
+	} else if cfg.Storage.DSN == "" {
+		cfg.Storage.DSN = defaultStorageDSN
+	}
+
+	dsn, err := ExpandPath(cfg.Storage.DSN, baseDir)
+	if err != nil {
+		return err
+	}
+	cfg.Storage.DSN = dsn
+
+	path, err := ExpandPath(cfg.Storage.Path, baseDir)
+	if err != nil {
+		return err
+	}
+	cfg.Storage.Path = path
+	return nil
+}
+
+// warnStoragePathDeprecated prints storage.path's deprecation notice once
+// per Load call that actually uses the alias, via the same
+// fmt.Fprintf(os.Stderr, ...) mechanism warnIfWorldReadable already uses
+// for a load-time warning that must not depend on a logger existing yet
+// (the logger itself is built from the config this function is helping to
+// load).
+func warnStoragePathDeprecated() {
+	fmt.Fprintln(os.Stderr, "warning: storage.path is deprecated; use storage.dsn instead (storage.path keeps working, with no removal planned)")
+}
+
+// ensureDirCreatable verifies storage.EffectiveDSN()'s parent directory -
+// or, if it does not exist yet, its nearest existing ancestor - exists as
+// a directory, without creating anything on disk and without inspecting
 // permission bits. A directory's owner-write bit says nothing about
 // whether this process can actually write into it: a group/ACL-writable
 // but not owner-writable directory would be a false reject, and an
@@ -248,7 +320,7 @@ func expandConfigPaths(cfg *Config, baseDir string) error {
 // The fallible case (a directory that stats fine here but still refuses a
 // later write) is handled correctly either way by the read-write caller
 // that actually needs it to exist (state.openStore in internal/cli, via
-// sqlite.Open's MkdirAll). Load must stay side-effect-free for read-only
+// the backend's own Open). Load must stay side-effect-free for read-only
 // commands like `config show` and `config validate`.
 func ensureDirCreatable(dir string) error {
 	d := filepath.Clean(dir)

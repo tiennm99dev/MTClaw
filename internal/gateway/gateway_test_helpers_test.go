@@ -12,8 +12,11 @@ import (
 
 	"github.com/tiennm99/MTClaw/internal/agent"
 	"github.com/tiennm99/MTClaw/internal/channel"
+	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/store"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	// This package's own gateway.go already carries the blank import that
+	// registers "sqlite" with store.Open's driver registry, so this test
+	// file - package gateway, not gateway_test - does not need its own.
 )
 
 // newTestStore opens a fresh sqlite-backed store.Store at a temp path - the
@@ -23,10 +26,11 @@ import (
 func newTestStore(t *testing.T) store.Store {
 	t.Helper()
 	ctx := context.Background()
-	db, err := sqlite.Open(ctx, filepath.Join(t.TempDir(), "gateway-test.db"), false)
+	dbPath := filepath.Join(t.TempDir(), "gateway-test.db")
+	st, err := store.Open(ctx, config.StorageConfig{Driver: "sqlite", DSN: dbPath}, false)
 	require.NoError(t, err)
-	t.Cleanup(func() { _ = db.Close() })
-	return sqlite.New(db)
+	t.Cleanup(func() { _ = st.Close() })
+	return st
 }
 
 // newTestDispatcher builds a dispatcher against a real temp store, with

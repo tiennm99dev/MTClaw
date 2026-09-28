@@ -22,9 +22,9 @@ import (
 func TestApprovalsListCmd_SanitizesEmbeddedControlCharsAndNewlines(t *testing.T) {
 	configPath, dbPath := sessionsTestConfigPath(t)
 
-	db, err := sqlite.Open(context.Background(), dbPath, false)
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, false)
 	require.NoError(t, err)
-	st := sqlite.New(db)
+	st := store.New(db, dia)
 	sess, err := st.Sessions().Ensure(context.Background(), "cli", "local", "")
 	require.NoError(t, err)
 	require.NoError(t, st.Audit().Append(context.Background(), &store.ExecAudit{

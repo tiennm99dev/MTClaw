@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"os"
 	osexec "os/exec"
@@ -16,6 +17,12 @@ import (
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/gateway"
 	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	// This package's own root.go/doctor_checks.go already carry the
+	// blank import that registers "sqlite" with store.Open's driver
+	// registry - which transitively pulls in the pure-Go SQLite driver,
+	// so its database/sql driver name "sqlite" is available process-wide
+	// by the time TestCheckDatabase below opens a raw *sql.DB with it
+	// directly.
 )
 
 // testConfig returns a *config.Config that satisfies config.Validate, with
@@ -33,7 +40,7 @@ func testConfig(t *testing.T) *config.Config {
 	cfg.Tools.Filesystem.Roots = []string{root}
 	cfg.Tools.Exec.CWD = root
 	cfg.Tools.Exec.Deny = []string{`\brm\s+-rf\b`}
-	cfg.Storage.Path = filepath.Join(root, "mtclaw.db")
+	cfg.Storage.DSN = filepath.Join(root, "mtclaw.db")
 	cfg.Cron.Timezone = "UTC"
 	return cfg
 }
@@ -81,10 +88,19 @@ func TestCheckDatabase(t *testing.T) {
 	assert.Equal(t, StatusOK, res.Status)
 
 	// A schema newer than this binary understands must FAIL, not silently
-	// truncate or corrupt.
-	db, err := sqlite.Open(context.Background(), cfg.Storage.Path, false)
+	// truncate or corrupt. The ledger cutover (see internal/store/
+	// migrate.go) means "newer than this binary" is now recorded in
+	// schema_migrations, not PRAGMA user_version, so simulating it means
+	// inserting an out-of-range ledger row rather than poking the pragma.
+	// A bare database/sql.Open under the driver name "sqlite" (registered
+	// by the pure-Go SQLite driver's own init, already loaded
+	// transitively via this package's blank import) is enough for that
+	// one INSERT - no need to go through store.Open (which would re-run
+	// Migrate, a no-op here) or directly import the sqlite backend
+	// package.
+	db, err := sql.Open("sqlite", "file:"+filepath.ToSlash(cfg.Storage.EffectiveDSN()))
 	require.NoError(t, err)
-	_, err = db.ExecContext(context.Background(), "PRAGMA user_version = 999999")
+	_, err = db.ExecContext(context.Background(), "INSERT INTO schema_migrations (version, name, applied_at) VALUES (999999, 'future_migration', 0)")
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -96,14 +112,14 @@ func TestCheckDatabase(t *testing.T) {
 // database left behind a pending migration (an older binary's schema) is
 // never migrated by doctor's own read-only-then-write fallback - only a
 // database that does not exist at all gets the write-mode retry. Simulated
-// here by setting a schema version below the latest embedded migration, so
-// the read-only open's own "behind the latest migration" check fires.
+// here by deleting the ledger's highest-version row, so the read-only
+// open's own "behind the latest migration" check fires.
 func TestCheckDatabase_BehindSchemaIsReportedNotSilentlyMigrated(t *testing.T) {
 	cfg := testConfig(t)
 
-	db, err := sqlite.Open(context.Background(), cfg.Storage.Path, false)
+	db, _, _, err := sqlite.Open(context.Background(), cfg.Storage.EffectiveDSN(), false)
 	require.NoError(t, err)
-	_, err = db.ExecContext(context.Background(), "PRAGMA user_version = 0")
+	_, err = db.ExecContext(context.Background(), "DELETE FROM schema_migrations WHERE version = (SELECT MAX(version) FROM schema_migrations)")
 	require.NoError(t, err)
 	require.NoError(t, db.Close())
 
@@ -111,9 +127,10 @@ func TestCheckDatabase_BehindSchemaIsReportedNotSilentlyMigrated(t *testing.T) {
 	assert.Equal(t, StatusFail, res.Status)
 	assert.Contains(t, res.Message, "restart the gateway")
 
-	// The important invariant: user_version must be untouched by doctor's
-	// check - a second, independent read confirms nothing migrated it.
-	db2, err := sqlite.Open(context.Background(), cfg.Storage.Path, true)
+	// The important invariant: the ledger must be untouched by doctor's
+	// check - a second, independent read-only open confirms nothing
+	// migrated it.
+	db2, _, _, err := sqlite.Open(context.Background(), cfg.Storage.EffectiveDSN(), true)
 	require.Error(t, err, "a behind-schema database still refuses even a second read-only open")
 	if db2 != nil {
 		db2.Close()
@@ -312,13 +329,17 @@ func TestCheckCron(t *testing.T) {
 	assert.Equal(t, StatusFail, res.Status)
 }
 
-// minimalYAML renders a config's storage.path (the only field the
+// minimalYAML renders cfg's effective storage DSN (the only field the
 // OpenAI-key-resolution test below needs to satisfy config.Load's parent
 // directory check) into a minimal, otherwise-defaulted document with
-// telegram disabled so it also satisfies config.Validate.
+// telegram disabled so it also satisfies config.Validate. It deliberately
+// writes the deprecated storage.path key, not storage.dsn, so this test
+// doubles as coverage of the alias actually loading through the real
+// config.Load pipeline - TestRunDoctor_FullRunOnLoadableButBrokenConfig
+// below exercises the canonical storage.dsn key instead.
 func minimalYAML(t *testing.T, cfg *config.Config) []byte {
 	t.Helper()
-	doc := "version: 1\nagent:\n  model: gpt-4o-mini\nchannels:\n  telegram:\n    enabled: false\nstorage:\n  path: \"" + filepath.ToSlash(cfg.Storage.Path) + "\"\n"
+	doc := "version: 1\nagent:\n  model: gpt-4o-mini\nchannels:\n  telegram:\n    enabled: false\nstorage:\n  path: \"" + filepath.ToSlash(cfg.Storage.EffectiveDSN()) + "\"\n"
 	return []byte(doc)
 }
 
@@ -350,7 +371,7 @@ func TestRunDoctor_FullRunOnLoadableButBrokenConfig_ExitsNonZero(t *testing.T) {
 		"  exec:\n" +
 		"    cwd: \"" + filepath.ToSlash(missing) + "\"\n" +
 		"storage:\n" +
-		"  path: \"" + filepath.ToSlash(filepath.Join(root, "mtclaw.db")) + "\"\n"
+		"  dsn: \"" + filepath.ToSlash(filepath.Join(root, "mtclaw.db")) + "\"\n"
 	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
 
 	rows := runDoctor(context.Background(), configPath)

@@ -16,8 +16,11 @@ import (
 	"github.com/tiennm99/MTClaw/internal/cron"
 	"github.com/tiennm99/MTClaw/internal/provider/openai"
 	"github.com/tiennm99/MTClaw/internal/store"
-	"github.com/tiennm99/MTClaw/internal/store/sqlite"
 	"github.com/tiennm99/MTClaw/internal/tools"
+
+	// Blank import: see internal/cli/root.go's identical import for why
+	// store.Open cannot resolve "sqlite" without it.
+	_ "github.com/tiennm99/MTClaw/internal/store/sqlite"
 )
 
 // gatewayChannel is the full surface Run needs from the channel it pumps:
@@ -71,12 +74,11 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 		return nil, err
 	}
 
-	db, err := sqlite.Open(context.Background(), cfg.Storage.Path, false)
+	st, err := store.Open(context.Background(), cfg.Storage, false)
 	if err != nil {
 		release()
 		return nil, fmt.Errorf("gateway: open store: %w", err)
 	}
-	st := sqlite.New(db)
 
 	// A cron_runs row still "started" from a prior process (a SIGKILL, an
 	// OOM, a dropped dispatch - anything that skipped OnDone) would

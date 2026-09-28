@@ -1,3 +1,9 @@
+-- Frozen copy of what MTClaw v1 wrote (internal/store/sqlite/migrations/
+-- 001_init.sql before the migration-ledger cutover). Never edit this file:
+-- it is the fixed definition of "what a v1 database's schema looks like",
+-- used by the legacy-adoption test to build a v1-shaped database by hand
+-- and prove adoption seeds schema_migrations without ever re-running this
+-- DDL against tables that already exist.
 CREATE TABLE sessions (
   id                TEXT PRIMARY KEY,          -- ulid-ish, sortable
   channel           TEXT NOT NULL,             -- 'telegram' | 'cli' | 'cron'
@@ -62,7 +68,7 @@ CREATE TABLE cron_runs (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   job_name    TEXT NOT NULL,
   session_id  TEXT NOT NULL DEFAULT '',
-  status      TEXT NOT NULL,                   -- started|ok|error|skipped|interrupted
+  status      TEXT NOT NULL,                   -- ok|error|skipped
   error       TEXT NOT NULL DEFAULT '',
   started_at  INTEGER NOT NULL,
   finished_at INTEGER

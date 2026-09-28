@@ -16,6 +16,7 @@ import (
 
 	"github.com/tiennm99/MTClaw/internal/config"
 	"github.com/tiennm99/MTClaw/internal/gateway"
+	"github.com/tiennm99/MTClaw/internal/store"
 	"github.com/tiennm99/MTClaw/internal/store/sqlite"
 	"github.com/tiennm99/MTClaw/internal/tools"
 )
@@ -188,10 +189,10 @@ func TestCronRunCmd_RecordsRunWithStartedBeforeFinished(t *testing.T) {
 	require.NoError(t, root.ExecuteContext(context.Background()))
 	assert.Contains(t, out.String(), "hello from the job")
 
-	db, err := sqlite.Open(context.Background(), dbPath, true)
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, true)
 	require.NoError(t, err)
 	defer db.Close()
-	st := sqlite.New(db)
+	st := store.New(db, dia)
 	runs, err := st.CronRuns().List(context.Background(), "daily", 1)
 	require.NoError(t, err)
 	require.Len(t, runs, 1)
