@@ -92,6 +92,9 @@ func TestFinishRecovery_ReturnsReadOnlyHandleWithoutMigrating(t *testing.T) {
 func TestDSN_EscapesURIMetacharactersInPath(t *testing.T) {
 	for _, dir := range []string{"a#1", "b?x", "c%41", "d%2Fe"} {
 		t.Run(dir, func(t *testing.T) {
+			if runtime.GOOS == "windows" && strings.Contains(dir, "?") {
+				t.Skip("'?' is not a legal path character on Windows")
+			}
 			ctx := context.Background()
 			path := filepath.Join(t.TempDir(), dir, "mtclaw.db")
 
