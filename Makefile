@@ -22,11 +22,16 @@ test:
 race:
 	go test -race ./...
 
+# golangci-lint's linter set and exclusions live in .golangci.yml; CI runs
+# the same command on its ubuntu leg. Install it with
+# `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`.
 lint:
 	go vet ./...
+	golangci-lint run ./...
 
-# fmt rewrites every unformatted file in place; use fmt-check (what CI runs)
-# to only report a problem and fail without touching anything.
+# fmt rewrites every unformatted file in place; use fmt-check (the same gofmt -l
+# check CI inlines, not a call to this target) to only report a problem and
+# fail without touching anything.
 fmt:
 	gofmt -w .
 

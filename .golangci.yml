@@ -1,0 +1,20 @@
+version: "2"
+
+# Default linter set plus errcheck tuned for this codebase: a discarded
+# error from a deferred Close, a diagnostic print, or a cleanup-path unlock
+# has no better handling than ignoring it, so those are excluded rather
+# than decorated with "_ =" everywhere.
+linters:
+  default: standard
+  settings:
+    errcheck:
+      exclude-functions:
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        - os.Remove
+        - syscall.Flock
+  exclusions:
+    rules:
+      - linters: [errcheck]
+        text: 'Error return value of `.*\.Close` is not checked'
