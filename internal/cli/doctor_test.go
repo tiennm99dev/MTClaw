@@ -67,13 +67,49 @@ func TestCheckConfigFilePermissions(t *testing.T) {
 	assert.Equal(t, StatusFail, res.Status)
 }
 
-func TestCheckStateDirWritable(t *testing.T) {
-	dir := filepath.Join(t.TempDir(), "state")
-	res := checkStateDirWritable(dir, nil)(context.Background(), nil)
-	assert.Equal(t, StatusOK, res.Status)
+func TestCheckStorageDirWritable(t *testing.T) {
+	t.Run("missing directory is judged by its ancestor and not created", func(t *testing.T) {
+		cfg := testConfig(t)
+		root := t.TempDir()
+		cfg.Storage.DSN = filepath.Join(root, "new", "sub", "mtclaw.db")
+		res := checkStorageDirWritable(context.Background(), cfg)
+		assert.Equal(t, StatusOK, res.Status, res.Message)
+		assert.Contains(t, res.Message, "does not exist yet")
+		_, err := os.Stat(filepath.Join(root, "new"))
+		assert.True(t, os.IsNotExist(err), "doctor must not create the storage directory")
+	})
 
-	res = checkStateDirWritable("", assert.AnError)(context.Background(), nil)
-	assert.Equal(t, StatusFail, res.Status)
+	t.Run("does not touch the home state dir", func(t *testing.T) {
+		home := useFakeHome(t)
+		cfg := testConfig(t)
+		res := checkStorageDirWritable(context.Background(), cfg)
+		assert.Equal(t, StatusOK, res.Status, res.Message)
+		_, err := os.Stat(filepath.Join(home, ".mtclaw"))
+		assert.True(t, os.IsNotExist(err), "the check must not create ~/.mtclaw")
+	})
+
+	t.Run("unwritable storage directory fails", func(t *testing.T) {
+		if runtime.GOOS == "windows" || os.Geteuid() == 0 {
+			t.Skip("directory mode bits do not block writes on Windows or for root")
+		}
+		cfg := testConfig(t)
+		dir := t.TempDir()
+		cfg.Storage.DSN = filepath.Join(dir, "mtclaw.db")
+		require.NoError(t, os.Chmod(dir, 0o500))
+		t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+		res := checkStorageDirWritable(context.Background(), cfg)
+		assert.Equal(t, StatusFail, res.Status)
+	})
+
+	t.Run("log directory is checked when log.file is set", func(t *testing.T) {
+		cfg := testConfig(t)
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		require.NoError(t, os.WriteFile(blocker, nil, 0o600))
+		cfg.Log.File = filepath.Join(blocker, "mtclaw.log")
+		res := checkStorageDirWritable(context.Background(), cfg)
+		assert.Equal(t, StatusFail, res.Status)
+		assert.Contains(t, res.Message, "log directory")
+	})
 }
 
 func TestCheckDatabase(t *testing.T) {
@@ -352,7 +388,7 @@ func TestRunDoctor_MissingConfigIsSoleFailRow(t *testing.T) {
 }
 
 func TestRunDoctor_FullRunOnLoadableButBrokenConfig_ExitsNonZero(t *testing.T) {
-	useFakeHome(t) // isolates the "State dir writable" check from the real ~/.mtclaw
+	useFakeHome(t)
 	root := t.TempDir()
 	missing := filepath.Join(root, "does-not-exist")
 	configPath := filepath.Join(root, "config.yaml")

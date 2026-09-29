@@ -9,7 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/spf13/cobra"
@@ -52,25 +52,60 @@ type state struct {
 // (`prompt`, `cron run`) reaches the agent loop's own flush-on-cancel path
 // instead of the process dying outright. A second signal must still kill
 // the process outright - e.g. a command stuck in a loop that never observes
-// ctx - so once ctx is done, the background goroutine calls stop() itself,
-// which un-registers the handler and restores Go's default disposition
-// (process death) for any further SIGINT/SIGTERM.
-func newRootContext() (context.Context, func()) {
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+// ctx - so after the first signal the handler is un-registered, restoring
+// Go's default disposition (process death) for any further SIGINT/SIGTERM.
+// The returned func reports the number of the signal that cancelled ctx (0
+// if none did), for the conventional 128+signal exit code.
+func newRootContext() (context.Context, func(), func() int) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, os.Interrupt, syscall.SIGTERM)
+
+	var received atomic.Int32
 	go func() {
-		<-ctx.Done()
-		stop()
+		defer signal.Stop(sigs)
+		select {
+		case sig := <-sigs:
+			if num, ok := sig.(syscall.Signal); ok {
+				received.Store(int32(num))
+			}
+			cancel()
+		case <-ctx.Done():
+		}
 	}()
-	return ctx, stop
+	return ctx, cancel, func() int { return int(received.Load()) }
 }
 
 // ErrInterrupted wraps whatever error a command returned after the root
 // context was cancelled by a signal (see newRootContext), so main can exit
-// 130 (128+SIGINT) - the conventional "killed by signal" code - instead of
-// the generic 1 an ordinary command failure gets. cobra has already printed
-// the underlying error (SilenceErrors is left at its default, false), so
+// 128+signal - the conventional "killed by signal" code - instead of the
+// generic 1 an ordinary command failure gets. cobra has already printed the
+// underlying error (SilenceErrors is left at its default, false), so
 // nothing here needs to preserve or re-print its text.
 var ErrInterrupted = errors.New("interrupted")
+
+// interruptedError is ErrInterrupted plus the signal that caused it.
+type interruptedError struct{ signal int }
+
+func (e *interruptedError) Error() string        { return ErrInterrupted.Error() }
+func (e *interruptedError) Is(target error) bool { return target == ErrInterrupted }
+
+// ExitCode maps the error Execute returned to the process exit status: 0
+// for nil, 128 plus the signal number for an interrupted run (130 for
+// SIGINT, 143 for SIGTERM), and 1 for any other failure.
+func ExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, ErrInterrupted) {
+		var ie *interruptedError
+		if errors.As(err, &ie) && ie.signal > 0 {
+			return 128 + ie.signal
+		}
+		return 128 + int(syscall.SIGINT)
+	}
+	return 1
+}
 
 // Execute builds and runs the mtclaw command tree, returning any error so
 // main can set the process exit code. See newRootContext for the signal
@@ -80,7 +115,7 @@ var ErrInterrupted = errors.New("interrupted")
 // returns an error, which would leak the handle on every failing command
 // that had opened one.
 func Execute() error {
-	ctx, stop := newRootContext()
+	ctx, stop, lastSignal := newRootContext()
 	defer stop()
 
 	s := &state{}
@@ -93,14 +128,18 @@ func Execute() error {
 	if s.closeLog != nil {
 		_ = s.closeLog()
 	}
-	return finalizeExecuteError(err, ctx.Err())
+	err = finalizeExecuteError(err, ctx.Err())
+	if errors.Is(err, ErrInterrupted) {
+		return &interruptedError{signal: lastSignal()}
+	}
+	return err
 }
 
 // finalizeExecuteError applies Execute's interrupted-exit-code override: a
 // failing command whose failure is explained by the root context itself
 // having ended (a signal) is reported as ErrInterrupted instead of its own
-// error text, which main.go maps to exit code 130 - see ErrInterrupted's
-// doc comment. A command that fails for its own reason while ctx is still
+// error text, which main.go maps to 128+signal via ExitCode - see
+// ErrInterrupted's doc comment. A command that fails for its own reason while ctx is still
 // healthy, or one that succeeds despite ctx having ended in the meantime,
 // is untouched.
 func finalizeExecuteError(err, ctxErr error) error {
@@ -127,8 +166,8 @@ func (s *state) openStore(ctx context.Context, readOnly bool) (store.Store, erro
 		return nil, fmt.Errorf("open store: config not loaded")
 	}
 	if readOnly {
-		if _, err := os.Stat(s.cfg.Storage.EffectiveDSN()); errors.Is(err, os.ErrNotExist) {
-			return nil, fmt.Errorf("no database yet at %s; run `mtclaw gateway` or `mtclaw prompt` first", s.cfg.Storage.EffectiveDSN())
+		if err := s.requireExistingDatabase(); err != nil {
+			return nil, err
 		}
 	}
 	st, err := store.Open(ctx, s.cfg.Storage, readOnly)
@@ -137,6 +176,19 @@ func (s *state) openStore(ctx context.Context, readOnly bool) (store.Store, erro
 	}
 	s.store = st
 	return s.store, nil
+}
+
+// requireExistingDatabase fails when the configured database file has not
+// been created yet. Read-only commands need it because there is nothing to
+// read; a command that only operates on existing rows (`sessions rm`) needs
+// it so a mistyped storage.dsn is reported instead of silently creating a
+// new directory tree and an empty database at the wrong place.
+func (s *state) requireExistingDatabase() error {
+	dsn := s.cfg.Storage.EffectiveDSN()
+	if _, err := os.Stat(dsn); errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("no database yet at %s; run `mtclaw gateway` or `mtclaw prompt` first", dsn)
+	}
+	return nil
 }
 
 // newLoop builds the same store/provider/registry/loop wiring both `prompt`
@@ -273,7 +325,7 @@ func (s *state) prepare(cmd *cobra.Command) error {
 		return err
 	}
 	if s.logLevelFlag != "" {
-		if !isValidLogLevel(s.logLevelFlag) {
+		if !config.IsValidLogLevel(s.logLevelFlag) {
 			return fmt.Errorf("--log-level: must be one of debug, info, warn, error; got %q", s.logLevelFlag)
 		}
 		cfg.Log.Level = s.logLevelFlag
@@ -299,25 +351,6 @@ func (s *state) prepare(cmd *cobra.Command) error {
 	slog.SetDefault(logger)
 
 	return nil
-}
-
-// isValidLogLevel mirrors config.Validate's own log.level enum (see
-// validateLog), applied a second time here because --log-level overwrites
-// cfg.Log.Level after LoadFile has already validated the file's own value -
-// an invalid flag value must not silently degrade to logging's own info
-// fallback the way an invalid file value no longer does. Trimmed and
-// lowercased, with "warning" accepted as an alias of "warn", the same as
-// logging.parseLevel itself already treats a config file's log.level - a
-// case or whitespace difference here is not the kind of typo this check
-// exists to catch, and rejecting it would be a stricter, newly-introduced
-// break from what always worked.
-func isValidLogLevel(level string) bool {
-	switch strings.ToLower(strings.TrimSpace(level)) {
-	case "debug", "info", "warn", "warning", "error":
-		return true
-	default:
-		return false
-	}
 }
 
 // configLevel resolves cmd's declared config-loading requirement: an

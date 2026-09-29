@@ -70,7 +70,19 @@ func Load(data []byte, baseDir string, env map[string]string) (*Config, error) {
 
 	dec := yaml.NewDecoder(bytes.NewReader(data), yaml.DisallowUnknownField(), yaml.Strict())
 	if err := dec.Decode(cfg); err != nil {
+		if errors.Is(err, io.EOF) {
+			return nil, errors.New("parse config: config file is empty")
+		}
 		return nil, fmt.Errorf("parse config: %w", err)
+	}
+	// Decode reads one YAML document at a time; a second document would
+	// otherwise be skipped unread, bypassing unknown-key rejection.
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		if err != nil {
+			return nil, fmt.Errorf("parse config: %w", err)
+		}
+		return nil, errors.New("parse config: multiple YAML documents are not supported; keep the config in a single document")
 	}
 
 	normalizeExecMode(cfg)
@@ -125,10 +137,11 @@ func resolveSecrets(cfg *Config, baseDir string, env map[string]string) error {
 // resolveSecret resolves one secret via *_env / *_file indirection: the
 // named env var (falling back to defaultEnvName when envName is empty)
 // wins if set to a non-empty value; otherwise the *_file path is read and
-// trimmed of a trailing newline. Neither being set is not an error at load
+// stripped of surrounding whitespace. Neither being set is not an error at load
 // time - `mtclaw doctor` and provider construction are what decide whether
 // the assistant can actually run without it. The file read
-// is capped at maxSecretFileBytes and refuses anything that is not a
+// is capped at maxSecretFileBytes (a longer file is an error, never a
+// truncated key) and refuses anything that is not a
 // regular file, so a *_file pointed at a FIFO or an endless device
 // (/dev/zero, a pipe nothing ever closes) cannot hang or exhaust memory
 // loading a value that is never more than a short line of text in practice.
@@ -165,12 +178,15 @@ func resolveSecret(defaultEnvName, envName, filePath, baseDir string, env map[st
 	}
 	defer f.Close()
 
-	data, err := io.ReadAll(io.LimitReader(f, maxSecretFileBytes))
+	data, err := io.ReadAll(io.LimitReader(f, maxSecretFileBytes+1))
 	if err != nil {
 		return "", "", fmt.Errorf("read secret file %s: %w", filePath, err)
 	}
+	if len(data) > maxSecretFileBytes {
+		return "", "", fmt.Errorf("read secret file %s: larger than %d bytes", filePath, maxSecretFileBytes)
+	}
 
-	trimmed := strings.TrimRight(string(data), "\r\n")
+	trimmed := strings.TrimSpace(string(data))
 	if trimmed == "" {
 		// An empty (or all-newline) secret file is the same as none set: a
 		// non-empty apiKeySource of "file:..." would otherwise render as

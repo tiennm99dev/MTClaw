@@ -624,3 +624,37 @@ func TestConcurrentReaderWhileWritingSucceedsUnderWAL(t *testing.T) {
 		require.NoError(t, err)
 	}
 }
+
+// TestAuditAndCronRuns_ListTiesBrokenByIDDesc proves rows written in the
+// same millisecond come back newest-id-first, so "the last run" is stable.
+func TestAuditAndCronRuns_ListTiesBrokenByIDDesc(t *testing.T) {
+	ctx := context.Background()
+	st, dbHandle := newTestStoreWithDB(t)
+
+	for i := 0; i < 3; i++ {
+		require.NoError(t, st.Audit().Append(ctx, &store.ExecAudit{Command: "ls", Decision: "allowed_rule"}))
+		require.NoError(t, st.CronRuns().Append(ctx, &store.CronRun{JobName: "daily", Status: "ok"}))
+	}
+	// The timestamp indexes happen to yield rowid order for ties; dropping
+	// them makes the test depend on the query's own tie-break instead.
+	for _, stmt := range []string{`DROP INDEX idx_exec_audit_created`, `DROP INDEX idx_cron_runs_job`} {
+		_, err := dbHandle.ExecContext(ctx, stmt)
+		require.NoError(t, err)
+	}
+	_, err := dbHandle.ExecContext(ctx, `UPDATE exec_audit SET created_at = 1000`)
+	require.NoError(t, err)
+	_, err = dbHandle.ExecContext(ctx, `UPDATE cron_runs SET started_at = 1000`)
+	require.NoError(t, err)
+
+	audits, err := st.Audit().List(ctx, 0)
+	require.NoError(t, err)
+	require.Len(t, audits, 3)
+	assert.Greater(t, audits[0].ID, audits[1].ID)
+	assert.Greater(t, audits[1].ID, audits[2].ID)
+
+	runs, err := st.CronRuns().List(ctx, "daily", 0)
+	require.NoError(t, err)
+	require.Len(t, runs, 3)
+	assert.Greater(t, runs[0].ID, runs[1].ID)
+	assert.Greater(t, runs[1].ID, runs[2].ID)
+}

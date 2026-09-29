@@ -233,8 +233,8 @@ func TestOpen_LegacyDatabaseAdoptsExistingSchemaVersion(t *testing.T) {
 // internal/store/migrations/001_init.sql, rendered through the sqlite
 // dialect's DDL tokens, is DDL-equivalent to the frozen
 // testdata/v1_legacy_schema.sql - the two are compared per-column rather
-// than byte-for-byte, since "DDL-equivalent" is the actual guarantee this
-// phase depends on (a legacy database opens cleanly against a freshly
+// than byte-for-byte, since "DDL-equivalent" is the actual guarantee that
+// matters (a legacy database opens cleanly against a freshly
 // migrated schema).
 func TestFreshSchemaMatchesFrozenLegacyFixture(t *testing.T) {
 	ctx := context.Background()
@@ -285,7 +285,7 @@ func tableInfo(t *testing.T, db *sql.DB, table string) []columnInfo {
 }
 
 // TestPragmasAndPoolAreSetOnWriterAndReader extends the writer/reader
-// pragma coverage this phase must preserve verbatim: WAL,
+// pragma coverage that must be preserved verbatim: WAL,
 // busy_timeout=5000, and foreign_keys=ON on both handles, plus the
 // writer connection pool capped at exactly one connection (see
 // dialect.go's Open doc comment for why each of these is a correctness
@@ -322,4 +322,41 @@ func assertPragmas(t *testing.T, ctx context.Context, db *sql.DB) {
 	var fk int
 	require.NoError(t, db.QueryRowContext(ctx, "PRAGMA foreign_keys").Scan(&fk))
 	assert.Equal(t, 1, fk)
+}
+
+// countingAfterMigrate wraps a Dialect and counts AfterMigrate calls, to
+// observe whether a write-mode migrate touched the driver bookkeeping.
+type countingAfterMigrate struct {
+	store.Dialect
+	calls int
+}
+
+func (c *countingAfterMigrate) AfterMigrate(ctx context.Context, db *sql.DB, applied int) error {
+	c.calls++
+	return c.Dialect.AfterMigrate(ctx, db, applied)
+}
+
+// TestMigrate_SkipsDriverBookkeepingWhenNothingChanged proves reopening an
+// up-to-date database does not rewrite user_version (a needless write
+// lock), while a database whose user_version drifted is still re-synced.
+func TestMigrate_SkipsDriverBookkeepingWhenNothingChanged(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "sync.db")
+
+	db, dia, _, err := sqlite.Open(ctx, path, false)
+	require.NoError(t, err)
+	defer db.Close()
+
+	counter := &countingAfterMigrate{Dialect: dia}
+	require.NoError(t, store.Migrate(ctx, db, counter, true))
+	assert.Zero(t, counter.calls, "an up-to-date database must not be re-synced")
+
+	_, err = db.ExecContext(ctx, `PRAGMA user_version = 0`)
+	require.NoError(t, err)
+	require.NoError(t, store.Migrate(ctx, db, counter, true))
+	assert.Equal(t, 1, counter.calls, "a drifted user_version must be re-synced")
+
+	var v int
+	require.NoError(t, db.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&v))
+	assert.Equal(t, currentSchemaVersion, v)
 }

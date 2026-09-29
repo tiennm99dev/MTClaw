@@ -61,7 +61,7 @@ func (m *messageStore) Append(ctx context.Context, sessionID string, msgs []Mess
 	// in `sessions list`'s ORDER BY updated_at DESC despite active
 	// traffic. Same tx as the inserts above, so this can never observably
 	// land without them.
-	if _, err := tx.ExecContext(ctx, `UPDATE sessions SET updated_at = ? WHERE id = ?`, now, sessionID); err != nil {
+	if _, err := tx.ExecContext(ctx, m.d.Rebind(`UPDATE sessions SET updated_at = ? WHERE id = ?`), now, sessionID); err != nil {
 		return fmt.Errorf("append messages: bump session updated_at: %w", err)
 	}
 

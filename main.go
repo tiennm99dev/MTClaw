@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"os"
 
 	// Embeds the IANA timezone database (~450 KB) so cron.timezone loads on
@@ -14,15 +13,5 @@ import (
 )
 
 func main() {
-	err := cli.Execute()
-	if err == nil {
-		return
-	}
-	if errors.Is(err, cli.ErrInterrupted) {
-		// 128 + SIGINT(2), the conventional "killed by signal" exit code -
-		// distinguishable from an ordinary command failure (1) by anything
-		// scripting mtclaw and checking $?.
-		os.Exit(130)
-	}
-	os.Exit(1)
+	os.Exit(cli.ExitCode(cli.Execute()))
 }

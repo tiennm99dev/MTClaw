@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	sqlitedriver "modernc.org/sqlite"
 
@@ -24,6 +25,10 @@ import (
 // driverName is the name modernc.org/sqlite registers itself under via its
 // package init().
 const driverName = "sqlite"
+
+// uriPathEscaper percent-escapes the three characters that change meaning
+// inside a "file:" URI path.
+var uriPathEscaper = strings.NewReplacer("%", "%25", "?", "%3F", "#", "%23")
 
 // init registers this package as internal/store's "sqlite" backend, the
 // database/sql-style pattern the factory (internal/store/factory.go) uses
@@ -109,8 +114,10 @@ func (dialect) AfterMigrate(ctx context.Context, db *sql.DB, applied int) error 
 // readOnly is for CLI read commands (`sessions list`, `sessions show`);
 // the writer (gateway, `sessions rm`, `prompt`, `cron run`) must pass
 // false. When a read-only open fails with SQLITE_READONLY_RECOVERY, Open
-// transparently retries read-write, since only a writer can finish that
-// recovery; the returned bool reports which mode actually won.
+// briefly opens the file read-write, since only a writer can finish that
+// recovery, then reopens it read-only: a read-only caller never migrates
+// the schema, whatever state the file was left in. The returned bool
+// reports whether the handle is read-only.
 //
 // A schema newer than this binary's highest embedded migration - an
 // older binary opened a database written by a newer one - is refused in
@@ -125,11 +132,7 @@ func Open(ctx context.Context, dsn string, readOnly bool) (*sql.DB, store.Dialec
 
 	db, err := openHandle(ctx, dsn, readOnly)
 	if err != nil && readOnly && isReadOnlyRecovery(err) {
-		readOnly = false
-		if mkErr := os.MkdirAll(filepath.Dir(dsn), 0o700); mkErr != nil {
-			return nil, nil, false, fmt.Errorf("create db directory: %w", mkErr)
-		}
-		db, err = openHandle(ctx, dsn, readOnly)
+		db, err = finishRecovery(ctx, dsn)
 	}
 	if err != nil {
 		return nil, nil, false, err
@@ -164,6 +167,21 @@ func Open(ctx context.Context, dsn string, readOnly bool) (*sql.DB, store.Dialec
 	return db, dia, readOnly, nil
 }
 
+// finishRecovery opens dsn read-write just long enough for SQLite to roll
+// the WAL forward, closes that handle without touching the schema, and
+// returns a fresh read-only handle. The file must already exist (recovery
+// implies a crashed writer left it behind), so no directory is created.
+func finishRecovery(ctx context.Context, dsn string) (*sql.DB, error) {
+	rw, err := openHandle(ctx, dsn, false)
+	if err != nil {
+		return nil, err
+	}
+	if err := rw.Close(); err != nil {
+		return nil, fmt.Errorf("close recovered sqlite database: %w", err)
+	}
+	return openHandle(ctx, dsn, true)
+}
+
 // chmodOwnerOnly narrows the database file and its WAL sidecars to 0600.
 // The database holds conversation history and exec output, so it must not
 // be readable by other local users. Under WAL mode the freshest rows live
@@ -191,6 +209,10 @@ func chmodOwnerOnly(path string) {
 // fast under busy_timeout instead of silently upgrading to a write
 // mid-transaction - which fails SQLITE_BUSY at upgrade time without
 // honoring busy_timeout at all.
+//
+// path is percent-escaped for the URI form: '%', '?' and '#' would
+// otherwise be read as an escape, the query start and a fragment, and
+// silently relocate the database to a truncated path.
 func dsn(path string, readOnly bool) string {
 	q := "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)&_pragma=synchronous(NORMAL)"
 	if readOnly {
@@ -198,7 +220,7 @@ func dsn(path string, readOnly bool) string {
 	} else {
 		q += "&_txlock=immediate"
 	}
-	return "file:" + filepath.ToSlash(path) + "?" + q
+	return "file:" + uriPathEscaper.Replace(filepath.ToSlash(path)) + "?" + q
 }
 
 func openHandle(ctx context.Context, path string, readOnly bool) (*sql.DB, error) {

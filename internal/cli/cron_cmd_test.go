@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -18,6 +19,7 @@ import (
 	"github.com/tiennm99/MTClaw/internal/gateway"
 	"github.com/tiennm99/MTClaw/internal/store"
 	"github.com/tiennm99/MTClaw/internal/store/sqlite"
+	"github.com/tiennm99/MTClaw/internal/testsupport/fakeapi"
 	"github.com/tiennm99/MTClaw/internal/tools"
 )
 
@@ -216,7 +218,7 @@ func TestCronRunCmd_RefusesWhilePersistentJobsGatewayLockIsHeld(t *testing.T) {
 	require.NoError(t, err)
 	release, err := gateway.Acquire(gateway.LockPath(*cfg))
 	require.NoError(t, err)
-	defer release()
+	defer func() { _ = release() }()
 
 	root := newTestRootCmd(t)
 	var out bytes.Buffer
@@ -234,4 +236,148 @@ func TestCronRunCmd_RefusesWhilePersistentJobsGatewayLockIsHeld(t *testing.T) {
 	root2.SetErr(&out)
 	root2.SetArgs([]string{"--config", configPath, "cron", "run", "daily", "--ephemeral"})
 	assert.NoError(t, root2.ExecuteContext(context.Background()))
+}
+
+// cronDeliverConfigPath writes a loadable config whose single cron job is
+// disabled (and cron itself off), with Telegram enabled and reachable only
+// for user 111, so `cron run --deliver` is the only thing that can reach a
+// chat. openaiURL and telegramURL are the fakes' base URLs.
+func cronDeliverConfigPath(t *testing.T, openaiURL, telegramURL, chatID string) string {
+	t.Helper()
+	root := t.TempDir()
+	configPath := filepath.Join(root, "config.yaml")
+	doc := fmt.Sprintf(`version: 1
+agent:
+  model: gpt-4o-mini
+  workspace: %q
+openai:
+  base_url: %q
+channels:
+  telegram:
+    enabled: true
+    allow_from: [111]
+    api_base_url: %q
+tools:
+  filesystem:
+    roots: [%q]
+  exec:
+    cwd: %q
+cron:
+  enabled: false
+  timezone: UTC
+  jobs:
+    - name: daily
+      schedule: "0 9 * * *"
+      prompt: "say hi"
+      enabled: false
+      session: ephemeral
+      timeout: 30s
+      deliver_to:
+        channel: telegram
+        chat_id: %q
+storage:
+  path: %q
+`, root, openaiURL, telegramURL, root, root, chatID, filepath.Join(root, "mtclaw.db"))
+	require.NoError(t, os.WriteFile(configPath, []byte(doc), 0o600))
+	t.Setenv("OPENAI_API_KEY", "sk-test-not-a-real-key")
+	return configPath
+}
+
+// TestCronRunCmd_DeliverValidatesTargetBeforeAnyAPICall proves `cron run
+// --deliver` applies config validation's deliver_to rule even when cron and
+// the job are disabled, and does so before any model call: an unreachable
+// or empty chat_id sends nothing anywhere.
+func TestCronRunCmd_DeliverValidatesTargetBeforeAnyAPICall(t *testing.T) {
+	for _, tc := range []struct {
+		name, chatID, wantErr string
+	}{
+		{"unlisted chat", "999999", "is not in channels.telegram.allow_from"},
+		{"empty chat id", "", "must set both channel and chat_id"},
+		{"wildcard group key", "*", "is not in channels.telegram.allow_from"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			openai := fakeapi.NewOpenAI(fakeapi.Step{Content: "hi"})
+			t.Cleanup(openai.Close)
+			tg := fakeapi.NewTelegram()
+			t.Cleanup(tg.Close)
+			configPath := cronDeliverConfigPath(t, openai.BaseURL(), tg.URL(), tc.chatID)
+			t.Setenv("TELEGRAM_BOT_TOKEN", tg.Token())
+
+			root := newTestRootCmd(t)
+			var out bytes.Buffer
+			root.SetOut(&out)
+			root.SetErr(&out)
+			root.SetArgs([]string{"--config", configPath, "cron", "run", "daily", "--deliver"})
+			err := root.ExecuteContext(context.Background())
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), tc.wantErr)
+			assert.Empty(t, openai.Requests(), "validation must fail before any model call")
+			for _, c := range tg.Calls() {
+				assert.NotEqual(t, "sendMessage", c.Method)
+			}
+		})
+	}
+}
+
+// TestCronRunCmd_DeliverToReachableChatOfDisabledJobSucceeds keeps the
+// other half honest: a manual run of a disabled job stays allowed when its
+// target is reachable.
+func TestCronRunCmd_DeliverToReachableChatOfDisabledJobSucceeds(t *testing.T) {
+	openai := fakeapi.NewOpenAI(fakeapi.Step{Content: "hello there"})
+	t.Cleanup(openai.Close)
+	tg := fakeapi.NewTelegram()
+	t.Cleanup(tg.Close)
+	configPath := cronDeliverConfigPath(t, openai.BaseURL(), tg.URL(), "111")
+	t.Setenv("TELEGRAM_BOT_TOKEN", tg.Token())
+
+	root := newTestRootCmd(t)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"--config", configPath, "cron", "run", "daily", "--deliver"})
+	require.NoError(t, root.ExecuteContext(context.Background()))
+	assert.Contains(t, out.String(), "delivered to chat 111")
+	assert.Equal(t, []string{"hello there"}, tg.SentTexts(111))
+}
+
+// TestCronRunCmd_HonorsJobTimeout proves a manual run is bounded by the
+// job's timeout like a scheduled fire: a model call that never answers ends
+// the run near the timeout instead of hanging, and the failed run is still
+// recorded.
+func TestCronRunCmd_HonorsJobTimeout(t *testing.T) {
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+	}))
+	t.Cleanup(func() {
+		close(release)
+		srv.Close()
+	})
+	configPath, dbPath := cronTestConfigPath(t, srv)
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "timeout: 30s")
+	require.NoError(t, os.WriteFile(configPath, []byte(strings.Replace(string(data), "timeout: 30s", "timeout: 1s", 1)), 0o600))
+
+	root := newTestRootCmd(t)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"--config", configPath, "cron", "run", "daily", "--ephemeral"})
+
+	start := time.Now()
+	err = root.ExecuteContext(context.Background())
+	require.Error(t, err)
+	assert.Less(t, time.Since(start), 15*time.Second, "the run must end near the 1s job timeout")
+
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, true)
+	require.NoError(t, err)
+	defer db.Close()
+	runs, err := store.New(db, dia).CronRuns().List(context.Background(), "daily", 1)
+	require.NoError(t, err)
+	require.Len(t, runs, 1)
+	assert.Equal(t, "error", runs[0].Status)
 }

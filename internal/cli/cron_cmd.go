@@ -120,6 +120,17 @@ func newCronRunCmd(s *state) *cobra.Command {
 				return fmt.Errorf("cron job %q not found in %s", name, s.configPath)
 			}
 
+			// Checked up front, before any model call, with the same rule
+			// config validation applies to a job the scheduler can fire -
+			// but unconditionally, since a manual run of a disabled job is
+			// allowed and must not become a way to message a chat the
+			// config would have refused.
+			if deliverFlag {
+				if err := config.ValidateCronDeliverTo(s.cfg, *job); err != nil {
+					return err
+				}
+			}
+
 			ephemeral := ephemeralFlag || job.Session == "ephemeral"
 			if !ephemeral {
 				if err := refuseIfGatewayLocked(*s.cfg, name); err != nil {
@@ -153,8 +164,14 @@ func newCronRunCmd(s *state) *cobra.Command {
 				}()
 			}
 
+			// The scheduled path bounds each fire by the job's timeout; a
+			// manual run gets the same bound. Recording below uses the
+			// parent ctx, so a timed-out turn is still logged.
+			runCtx, cancel := context.WithTimeout(ctx, job.Timeout.Std())
+			defer cancel()
+
 			started := time.Now()
-			result := loop.Run(ctx, sess.ID, job.Prompt, "", nil)
+			result := loop.Run(runCtx, sess.ID, job.Prompt, "", nil)
 
 			recordManualRun(ctx, cmd, st.CronRuns(), job.Name, sess.ID, started, result.Err)
 

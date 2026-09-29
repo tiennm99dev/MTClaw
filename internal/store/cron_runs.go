@@ -75,7 +75,7 @@ func (c *cronRunStore) List(ctx context.Context, jobName string, limit int) ([]*
 		query += ` WHERE job_name = ?`
 		args = append(args, jobName)
 	}
-	query += ` ORDER BY started_at DESC`
+	query += ` ORDER BY started_at DESC, id DESC`
 	if limit > 0 {
 		query += ` LIMIT ?`
 		args = append(args, limit)

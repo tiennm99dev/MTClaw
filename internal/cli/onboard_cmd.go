@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -424,12 +425,13 @@ func writeStarterAgentsFile(out io.Writer, configPath string) (string, error) {
 // `omitempty` tag, and the file contains only the env/file indirection
 // keys - never a secret.
 //
-// The write itself uses O_EXCL, not a plain create-or-truncate: runOnboard
-// already checked configPath does not exist before running the rest of its
-// interactive sequence, but that check and this write are not atomic with
-// each other, so a second onboard run started in the gap between them would
-// otherwise silently overwrite the first one's result. O_EXCL turns that
-// race into errConfigAlreadyExists instead.
+// The file is published with publishExclusive, not a plain
+// create-or-truncate: runOnboard already checked configPath does not exist
+// before running the rest of its interactive sequence, but that check and
+// this write are not atomic with each other, so a second onboard run
+// started in the gap between them would otherwise silently overwrite the
+// first one's result. Exclusive publication turns that race into
+// errConfigAlreadyExists instead.
 func writeOnboardConfig(path string, cfg *config.Config) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
@@ -438,16 +440,38 @@ func writeOnboardConfig(path string, cfg *config.Config) error {
 	if err != nil {
 		return fmt.Errorf("render config: %w", err)
 	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	return publishExclusive(path, data)
+}
+
+// publishExclusive writes data to a private temp file next to path and then
+// hard-links it into place. Link fails with "exists" instead of replacing an
+// existing path, which keeps the no-overwrite guarantee, and the config
+// only ever appears complete: a failed or partial write (disk full) leaves
+// no config file behind to block the next onboard run and break every load.
+func publishExclusive(path string, data []byte) error {
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".config-*.tmp")
 	if err != nil {
-		if os.IsExist(err) {
-			return errConfigAlreadyExists
-		}
 		return fmt.Errorf("write config %s: %w", path, err)
 	}
-	defer f.Close()
-	if _, err := f.Write(data); err != nil {
+	defer os.Remove(tmp.Name())
+
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
 		return fmt.Errorf("write config %s: %w", path, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("write config %s: %w", path, err)
+	}
+	if err := os.Link(tmp.Name(), path); err != nil {
+		if errors.Is(err, fs.ErrExist) {
+			return errConfigAlreadyExists
+		}
+		// A filesystem without hard links (some FUSE mounts, FAT/exFAT)
+		// fails the link outright; a rename is still atomic there, and the
+		// no-overwrite check at the top of onboard already ran.
+		if err := os.Rename(tmp.Name(), path); err != nil {
+			return fmt.Errorf("write config %s: %w", path, err)
+		}
 	}
 	return nil
 }

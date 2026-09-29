@@ -6,6 +6,7 @@ import (
 	"embed"
 	"errors"
 	"fmt"
+	"io/fs"
 	"regexp"
 	"sort"
 	"strconv"
@@ -44,7 +45,14 @@ type migration struct {
 }
 
 func loadMigrations() ([]migration, error) {
-	entries, err := migrationFiles.ReadDir("migrations")
+	return readMigrations(migrationFiles)
+}
+
+// readMigrations parses every NNN_name.sql file under migrations/ in fsys.
+// It exists apart from loadMigrations so a test can feed it a synthetic
+// file set.
+func readMigrations(fsys fs.FS) ([]migration, error) {
+	entries, err := fs.ReadDir(fsys, "migrations")
 	if err != nil {
 		return nil, fmt.Errorf("read embedded migrations: %w", err)
 	}
@@ -62,7 +70,7 @@ func loadMigrations() ([]migration, error) {
 		if err != nil {
 			return nil, fmt.Errorf("migration file %q: %w", e.Name(), err)
 		}
-		content, err := migrationFiles.ReadFile("migrations/" + e.Name())
+		content, err := fs.ReadFile(fsys, "migrations/"+e.Name())
 		if err != nil {
 			return nil, fmt.Errorf("read migration %q: %w", e.Name(), err)
 		}
@@ -70,6 +78,11 @@ func loadMigrations() ([]migration, error) {
 	}
 
 	sort.Slice(migrations, func(i, j int) bool { return migrations[i].version < migrations[j].version })
+	for i := 1; i < len(migrations); i++ {
+		if migrations[i].version == migrations[i-1].version {
+			return nil, fmt.Errorf("migration files %q and %q share version %d", migrations[i-1].name, migrations[i].name, migrations[i].version)
+		}
+	}
 	return migrations, nil
 }
 
@@ -106,6 +119,7 @@ func migrateWrite(ctx context.Context, db *sql.DB, dialect Dialect, migrations [
 		return err
 	}
 
+	applied := false
 	for _, m := range migrations {
 		if m.version <= current {
 			continue
@@ -114,6 +128,20 @@ func migrateWrite(ctx context.Context, db *sql.DB, dialect Dialect, migrations [
 			return fmt.Errorf("apply migration %s: %w", m.name, err)
 		}
 		current = m.version
+		applied = true
+	}
+
+	// With nothing applied and the driver's own bookkeeping already at
+	// the ledger's version, syncing it again would only take the write
+	// lock for no change.
+	if !applied {
+		legacy, err := dialect.LegacyVersion(ctx, db)
+		if err != nil {
+			return err
+		}
+		if legacy == current {
+			return nil
+		}
 	}
 
 	if err := dialect.AfterMigrate(ctx, db, current); err != nil {

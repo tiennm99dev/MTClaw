@@ -343,7 +343,7 @@ openai:
 		assert.Equal(t, "unset", cfg.OpenAI.APIKeySource(), "an empty file must report as unset, not file:<path>, so config show never renders <set:file:...> for a secret that resolved to nothing")
 	})
 
-	t.Run("secret file longer than the read cap is truncated, not hung on", func(t *testing.T) {
+	t.Run("secret file longer than the read cap is rejected, not truncated", func(t *testing.T) {
 		secretPath := filepath.Join(baseDir, "openai-key-huge.secret")
 		huge := make([]byte, maxSecretFileBytes+4096)
 		for i := range huge {
@@ -361,9 +361,51 @@ channels:
 openai:
   api_key_file: %q
 `, secretPath)
+		_, err := Load([]byte(yaml), baseDir, map[string]string{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "larger than")
+	})
+
+	t.Run("secret file exactly at the read cap loads", func(t *testing.T) {
+		secretPath := filepath.Join(baseDir, "openai-key-max.secret")
+		body := make([]byte, maxSecretFileBytes)
+		for i := range body {
+			body[i] = 'a'
+		}
+		require.NoError(t, os.WriteFile(secretPath, body, 0o600))
+
+		yaml := fmt.Sprintf(`
+version: 1
+agent:
+  model: gpt-5
+channels:
+  telegram:
+    enabled: false
+openai:
+  api_key_file: %q
+`, secretPath)
 		cfg, err := Load([]byte(yaml), baseDir, map[string]string{})
 		require.NoError(t, err)
-		assert.Len(t, cfg.OpenAI.APIKey(), maxSecretFileBytes, "a secret file over the cap must be read only up to maxSecretFileBytes, never the whole file")
+		assert.Len(t, cfg.OpenAI.APIKey(), maxSecretFileBytes)
+	})
+
+	t.Run("secret file trailing spaces and tabs are trimmed", func(t *testing.T) {
+		secretPath := filepath.Join(baseDir, "openai-key-padded.secret")
+		require.NoError(t, os.WriteFile(secretPath, []byte("  sk-padded \t\r\n"), 0o600))
+
+		yaml := fmt.Sprintf(`
+version: 1
+agent:
+  model: gpt-5
+channels:
+  telegram:
+    enabled: false
+openai:
+  api_key_file: %q
+`, secretPath)
+		cfg, err := Load([]byte(yaml), baseDir, map[string]string{})
+		require.NoError(t, err)
+		assert.Equal(t, "sk-padded", cfg.OpenAI.APIKey())
 	})
 
 }
@@ -450,8 +492,7 @@ func TestConfigPath_DefaultAliasPrecedence(t *testing.T) {
 	}
 }
 
-// TestConfigPath_ExplicitFlagNeverAliasResolved is requirement 2 of phase
-// 4: an explicit --config value is used byte-for-byte, whether it ends in
+// TestConfigPath_ExplicitFlagNeverAliasResolved proves an explicit --config value is used byte-for-byte, whether it ends in
 // .yml (the alias exists) or names a file that does not exist on disk at
 // all (ConfigPath never stats an explicit value - only the default branch
 // does). Neither case touches the real home directory.
@@ -642,4 +683,25 @@ func TestMarshalRedacted_UnsetSecretsShownAsUnset(t *testing.T) {
 	rendered := string(out)
 
 	assert.True(t, strings.Contains(rendered, "<unset>"))
+}
+
+func TestLoad_RejectsEmptyAndMultiDocumentYAML(t *testing.T) {
+	baseDir := t.TempDir()
+
+	t.Run("empty file", func(t *testing.T) {
+		_, err := Load([]byte(""), baseDir, map[string]string{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "config file is empty")
+	})
+
+	t.Run("second document is not silently ignored", func(t *testing.T) {
+		_, err := Load([]byte(validMinimalYAML+"---\nversion: 99\nnotakey: 1\n"), baseDir, map[string]string{})
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "multiple YAML documents")
+	})
+
+	t.Run("single document with a leading marker still loads", func(t *testing.T) {
+		_, err := Load([]byte("---\n"+validMinimalYAML), baseDir, map[string]string{})
+		assert.NoError(t, err)
+	})
 }

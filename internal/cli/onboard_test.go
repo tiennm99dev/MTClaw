@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -331,4 +332,32 @@ func TestRunOnboard_PreservesExistingCustomizedAgentsMD(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, cfg.Agent.SystemPromptFiles, 1)
 	assert.Equal(t, agentsPath, cfg.Agent.SystemPromptFiles[0], "the fresh config must still reference the preserved file")
+}
+
+// TestPublishExclusive covers the config publication onboard relies on:
+// the file appears complete with owner-only permissions, an existing file
+// is never replaced, and no temp file is left behind in either case.
+func TestPublishExclusive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+
+	require.NoError(t, publishExclusive(path, []byte("version: 1\n")))
+	got, err := os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "version: 1\n", string(got))
+	if runtime.GOOS != "windows" {
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		assert.Equal(t, os.FileMode(0o600), info.Mode().Perm())
+	}
+
+	err = publishExclusive(path, []byte("replacement"))
+	assert.ErrorIs(t, err, errConfigAlreadyExists)
+	got, err = os.ReadFile(path)
+	require.NoError(t, err)
+	assert.Equal(t, "version: 1\n", string(got), "an existing config must never be replaced")
+
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "no temp file may remain next to the config")
 }

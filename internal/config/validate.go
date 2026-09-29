@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -195,6 +196,9 @@ func validateTools(cfg *Config, errs *ValidationErrors) {
 			errs.add(fmt.Sprintf("tools.exec.allow[%d]", i), "invalid regex %q: %v", pattern, err)
 		}
 	}
+	if len(exec.Shell) == 1 {
+		errs.add("tools.exec.shell", "must list the shell and its flag that takes the command (for example [/bin/bash, -lc]), or be empty for the OS default; got only %q", exec.Shell[0])
+	}
 	if exec.Enabled && exec.Timeout.Std() <= 0 {
 		errs.add("tools.exec.timeout", "must be greater than 0, got %s", exec.Timeout.Std())
 	}
@@ -304,11 +308,25 @@ func validateCronDeliverTo(cfg *Config, path, ref string, d CronDeliverTo, errs 
 	}
 }
 
+// ValidateCronDeliverTo applies the same deliver_to reachability rules that
+// Validate applies to a job that can fire, for a caller that delivers a
+// job's result outside the scheduler (`mtclaw cron run --deliver`): a manual
+// run must not reach a chat the scheduled path would have refused to load.
+func ValidateCronDeliverTo(cfg *Config, job CronJob) error {
+	errs := &ValidationErrors{}
+	validateCronDeliverTo(cfg, "cron.jobs", strings.TrimSpace(job.Name), job.DeliverTo, errs)
+	if errs.Len() == 0 {
+		return nil
+	}
+	return errs
+}
+
 // cronChatIDReachable reports whether chatID is either an explicit group
 // key in tg.Groups or a numeric id present in tg.AllowFrom - the same two
 // ways a real inbound message is allowed through today.
 func cronChatIDReachable(tg TelegramConfig, chatID string) bool {
-	if _, ok := tg.Groups[chatID]; ok {
+	// "*" is the default-group template, not a chat: sendMessage to it fails.
+	if _, ok := tg.Groups[chatID]; ok && chatID != "*" {
 		return true
 	}
 	id, err := strconv.ParseInt(chatID, 10, 64)
@@ -335,15 +353,33 @@ func cronChatIDReachable(tg TelegramConfig, chatID string) bool {
 // worked before this validation existed; only a genuine typo is new to
 // this.
 func validateLog(cfg *Config, errs *ValidationErrors) {
-	switch normalizeLogWord(cfg.Log.Level) {
-	case "debug", "info", "warn", "warning", "error":
-	default:
+	if !IsValidLogLevel(cfg.Log.Level) {
 		errs.add("log.level", `must be one of "debug", "info", "warn", "error" (case-insensitive; "warning" also accepted), got %q`, cfg.Log.Level)
 	}
 	switch normalizeLogWord(cfg.Log.Format) {
 	case "text", "json":
 	default:
 		errs.add("log.format", `must be one of "text", "json" (case-insensitive), got %q`, cfg.Log.Format)
+	}
+	if file := cfg.Log.File; file != "" {
+		if info, err := os.Stat(file); err == nil && info.IsDir() {
+			errs.add("log.file", "%q is a directory, not a file", file)
+		} else if err := ensureDirCreatable(filepath.Dir(file)); err != nil {
+			errs.add("log.file", "parent directory of %q is not creatable: %v", file, err)
+		}
+	}
+}
+
+// IsValidLogLevel reports whether level is a recognized log.level spelling:
+// trimmed and case-insensitive, with "warning" accepted as an alias of
+// "warn". The --log-level flag is checked with the same rule, since it
+// overwrites cfg.Log.Level after the file's own value was validated.
+func IsValidLogLevel(level string) bool {
+	switch normalizeLogWord(level) {
+	case "debug", "info", "warn", "warning", "error":
+		return true
+	default:
+		return false
 	}
 }
 

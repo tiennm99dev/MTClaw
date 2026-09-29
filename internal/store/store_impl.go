@@ -17,8 +17,8 @@ type sqlStore struct {
 // New wraps an already-migrated db (see a backend package's own Open,
 // e.g. sqlite.Open) and its Dialect as a Store. It is exported so backend
 // packages and the tests that construct a store directly can call it;
-// the driver-dispatching, config-aware entry point (store.Open, added in
-// a later phase) is built on top of this, not a replacement for it.
+// the driver-dispatching, config-aware entry point (store.Open) is built
+// on top of this, not a replacement for it.
 func New(db *sql.DB, d Dialect) Store {
 	return &sqlStore{db: db, d: d}
 }

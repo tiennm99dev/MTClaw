@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -17,8 +18,8 @@ func TestNew_InvalidLevelFallsBackToInfo(t *testing.T) {
 	logger, closeLog, err := New(config.LogConfig{Level: "not-a-level"})
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = closeLog() })
-	assert.False(t, logger.Enabled(nil, slog.LevelDebug), "debug must be filtered out under the info fallback")
-	assert.True(t, logger.Enabled(nil, slog.LevelInfo))
+	assert.False(t, logger.Enabled(context.Background(), slog.LevelDebug), "debug must be filtered out under the info fallback")
+	assert.True(t, logger.Enabled(context.Background(), slog.LevelInfo))
 }
 
 func TestNew_JSONFormat(t *testing.T) {

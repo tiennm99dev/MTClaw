@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -135,4 +136,45 @@ func TestSessionsListCmd_LimitFlagBoundsResults(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 2, lines, "one header line plus exactly one session row")
+}
+
+// TestSessionsRmCmd_MissingDatabaseIsReportedNotCreated proves a mistyped
+// storage.dsn does not make `sessions rm` create a directory tree and an
+// empty database at the wrong place.
+func TestSessionsRmCmd_MissingDatabaseIsReportedNotCreated(t *testing.T) {
+	configPath, dbPath := sessionsTestConfigPath(t)
+	typoDir := filepath.Join(filepath.Dir(dbPath), "typo", "sub")
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+	typoDB := filepath.Join(typoDir, "mtclaw.db")
+	require.NoError(t, os.WriteFile(configPath, []byte(strings.Replace(string(data), dbPath, typoDB, 1)), 0o600))
+
+	root := newTestRootCmd(t)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"--config", configPath, "sessions", "rm", "abc"})
+	err = root.ExecuteContext(context.Background())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "no database yet")
+
+	_, statErr := os.Stat(filepath.Dir(typoDir))
+	assert.True(t, os.IsNotExist(statErr), "sessions rm must not create the storage directory")
+}
+
+func TestSessionsRmCmd_DeletesExistingSession(t *testing.T) {
+	configPath, dbPath := sessionsTestConfigPath(t)
+	db, dia, _, err := sqlite.Open(context.Background(), dbPath, false)
+	require.NoError(t, err)
+	sess, err := store.New(db, dia).Sessions().Ensure(context.Background(), "cli", "local", "")
+	require.NoError(t, err)
+	require.NoError(t, db.Close())
+
+	root := newTestRootCmd(t)
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&out)
+	root.SetArgs([]string{"--config", configPath, "sessions", "rm", sess.ID})
+	require.NoError(t, root.ExecuteContext(context.Background()))
+	assert.Contains(t, out.String(), "deleted session "+sess.ID)
 }

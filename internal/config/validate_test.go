@@ -406,6 +406,92 @@ func TestValidate_CronDeliverTo(t *testing.T) {
 		cfg.Cron.Jobs[0].DeliverTo = CronDeliverTo{Channel: "telegram", ChatID: "42"}
 		assert.NoError(t, Validate(cfg))
 	})
+
+	t.Run("wildcard group key is not a deliverable chat", func(t *testing.T) {
+		cfg := base(t)
+		cfg.Channels.Telegram.Enabled = true
+		cfg.Channels.Telegram.AllowFrom = []int64{42}
+		cfg.Cron.Jobs[0].DeliverTo = CronDeliverTo{Channel: "telegram", ChatID: "*"}
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), `job "job-a": chat_id "*" is not in channels.telegram.allow_from`)
+	})
+}
+
+// TestValidateCronDeliverTo_AppliesRegardlessOfEnabledFlags proves the
+// exported check is unconditional: unlike Validate, it does not consult
+// cron.enabled or the job's own enabled flag, since a manual run delivers
+// even for a job the scheduler would never fire.
+func TestValidateCronDeliverTo_AppliesRegardlessOfEnabledFlags(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Cron.Enabled = false
+	cfg.Channels.Telegram.Enabled = true
+	cfg.Channels.Telegram.AllowFrom = []int64{111}
+
+	job := CronJob{Name: "j1", Enabled: false, DeliverTo: CronDeliverTo{Channel: "telegram", ChatID: "999999"}}
+	require.NoError(t, Validate(cfg), "sanity: Validate skips a job that cannot fire")
+
+	err := ValidateCronDeliverTo(cfg, job)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), `job "j1": chat_id "999999"`)
+
+	job.DeliverTo.ChatID = "111"
+	assert.NoError(t, ValidateCronDeliverTo(cfg, job))
+
+	job.DeliverTo.ChatID = ""
+	err = ValidateCronDeliverTo(cfg, job)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must set both channel and chat_id")
+}
+
+func TestValidate_ExecShell(t *testing.T) {
+	cfg := validConfig(t)
+	cfg.Tools.Exec.Shell = []string{"/bin/bash"}
+	err := Validate(cfg)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tools.exec.shell: must list the shell and its flag")
+
+	cfg.Tools.Exec.Shell = []string{"/bin/bash", "-lc"}
+	assert.NoError(t, Validate(cfg))
+
+	cfg.Tools.Exec.Shell = nil
+	assert.NoError(t, Validate(cfg))
+}
+
+func TestValidate_LogFile(t *testing.T) {
+	t.Run("existing directory is rejected", func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.Log.File = t.TempDir()
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "log.file")
+		assert.Contains(t, err.Error(), "is a directory")
+	})
+
+	t.Run("parent that is a regular file is rejected", func(t *testing.T) {
+		cfg := validConfig(t)
+		blocker := filepath.Join(t.TempDir(), "blocker")
+		require.NoError(t, os.WriteFile(blocker, nil, 0o600))
+		cfg.Log.File = filepath.Join(blocker, "mtclaw.log")
+		err := Validate(cfg)
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "log.file: parent directory")
+	})
+
+	t.Run("new file under a creatable directory passes", func(t *testing.T) {
+		cfg := validConfig(t)
+		cfg.Log.File = filepath.Join(t.TempDir(), "sub", "mtclaw.log")
+		assert.NoError(t, Validate(cfg))
+	})
+}
+
+func TestIsValidLogLevel(t *testing.T) {
+	for _, ok := range []string{"debug", "INFO", " warn ", "warning", "Error"} {
+		assert.True(t, IsValidLogLevel(ok), ok)
+	}
+	for _, bad := range []string{"", "debgu", "trace"} {
+		assert.False(t, IsValidLogLevel(bad), bad)
+	}
 }
 
 func TestValidate_StorageParentDirCreatable(t *testing.T) {

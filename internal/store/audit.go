@@ -43,7 +43,7 @@ func (au *auditStore) Append(ctx context.Context, a *ExecAudit) error {
 // LIMIT clause entirely (see sessions.go's List for why).
 func (au *auditStore) List(ctx context.Context, limit int) ([]*ExecAudit, error) {
 	query := `SELECT id, session_id, command, cwd, decision, rule, exit_code, duration_ms, truncated, created_at
-		FROM exec_audit ORDER BY created_at DESC`
+		FROM exec_audit ORDER BY created_at DESC, id DESC`
 	args := []any{}
 	if limit > 0 {
 		query += ` LIMIT ?`

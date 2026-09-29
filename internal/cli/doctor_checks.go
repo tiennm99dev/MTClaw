@@ -34,10 +34,9 @@ const doctorNetworkTimeout = 15 * time.Second
 // that needs the config file's own path rather than anything inside the
 // loaded *config.Config.
 func doctorChecks(configPath string) []Check {
-	stateDir, stateDirErr := config.StateDir()
 	return []Check{
 		{Name: "Config file permissions", Run: checkConfigFilePermissions(configPath)},
-		{Name: "State dir writable", Run: checkStateDirWritable(stateDir, stateDirErr)},
+		{Name: "Storage dir writable", Run: checkStorageDirWritable},
 		{Name: "DB opens at current schema", Run: checkDatabase},
 		{Name: "Instance lock", Run: checkInstanceLock},
 		{Name: "OpenAI key resolves", Run: checkOpenAIKeyResolves},
@@ -78,29 +77,53 @@ func checkConfigFilePermissions(configPath string) func(context.Context, *config
 	}
 }
 
-// checkStateDirWritable verifies ~/.mtclaw (internal/config.StateDir) can be
-// created and written to - the database and the instance lock live there by
-// default, since storage.path and the lock path both default under it. The
-// starter AGENTS.md onboard writes does not: it lives next to whatever
-// --config path was used (see writeStarterAgentsFile in onboard_cmd.go), so
-// it is only under ~/.mtclaw when --config itself defaulted there.
-// stateDir/resolveErr are resolved once by doctorChecks and passed in
-// (rather than calling config.StateDir() again here) purely so tests can
-// point this check at a t.TempDir() instead of the real, machine-wide
-// ~/.mtclaw.
-func checkStateDirWritable(stateDir string, resolveErr error) func(context.Context, *config.Config) Result {
-	return func(_ context.Context, _ *config.Config) Result {
-		if resolveErr != nil {
-			return Result{StatusFail, fmt.Sprintf("cannot resolve the state directory: %v", resolveErr)}
+// checkStorageDirWritable verifies the directories this install actually
+// writes to: the one holding the database and its instance lock (the parent
+// of storage.dsn) and, when log.file is set, the log file's directory. A
+// directory that does not exist yet is judged by its nearest existing
+// ancestor, which is what the first write-mode command would create it
+// under; the check itself creates nothing, so running doctor on a fresh
+// install leaves the filesystem untouched.
+func checkStorageDirWritable(_ context.Context, cfg *config.Config) Result {
+	dirs := []struct{ label, dir string }{{"storage directory", filepath.Dir(cfg.Storage.EffectiveDSN())}}
+	if cfg.Log.File != "" {
+		dirs = append(dirs, struct{ label, dir string }{"log directory", filepath.Dir(cfg.Log.File)})
+	}
+
+	msgs := make([]string, 0, len(dirs))
+	for _, d := range dirs {
+		probeDir, missing := nearestExistingDir(d.dir)
+		res := checkDirWritable(d.label, probeDir)
+		if res.Status != StatusOK {
+			return res
 		}
-		if err := os.MkdirAll(stateDir, 0o700); err != nil {
-			return Result{StatusFail, fmt.Sprintf("cannot create state directory %s: %v - check permissions on its parent", stateDir, err)}
+		if missing {
+			msgs = append(msgs, fmt.Sprintf("%s does not exist yet; it will be created under %s, which is writable", d.dir, probeDir))
+		} else {
+			msgs = append(msgs, res.Message)
 		}
-		return checkDirWritable("state directory", stateDir)
+	}
+	return Result{StatusOK, strings.Join(msgs, "; ")}
+}
+
+// nearestExistingDir walks up from dir to the first path that exists (or
+// the root), reporting whether dir itself was missing. A non-directory hit
+// is returned as-is so checkDirWritable reports it.
+func nearestExistingDir(dir string) (path string, missing bool) {
+	d := filepath.Clean(dir)
+	for {
+		if _, err := os.Stat(d); err == nil {
+			return d, d != filepath.Clean(dir)
+		}
+		parent := filepath.Dir(d)
+		if parent == d {
+			return d, d != filepath.Clean(dir)
+		}
+		d = parent
 	}
 }
 
-// checkDirWritable is the shared existence+write-probe used by the state
+// checkDirWritable is the shared existence+write-probe used by the storage
 // dir, workspace, and (indirectly) exec.cwd checks.
 func checkDirWritable(label, dir string) Result {
 	info, err := os.Stat(dir)

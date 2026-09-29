@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -109,14 +110,15 @@ storage:
 	_, err = os.Stat(storageDir)
 	assert.True(t, os.IsNotExist(err), "a read-only store open must not create the storage directory")
 
-	// `cron run` (via openStore(ctx, false)) is a write open and must
-	// create the directory. sessions list above didn't need one; prompt
-	// exercises the same openStore(ctx, false) path more directly.
+	// `prompt` opens the store with openStore(ctx, false), a write open
+	// that must create the directory; it then fails on the missing API key,
+	// which is irrelevant here.
+	t.Setenv("OPENAI_API_KEY", "")
 	s2 := &state{}
 	writeCmd := newRootCmd(s2)
 	writeCmd.SetOut(&out)
 	writeCmd.SetErr(&out)
-	writeCmd.SetArgs([]string{"--config", configPath, "sessions", "rm", "does-not-exist"})
+	writeCmd.SetArgs([]string{"--config", configPath, "prompt", "hi"})
 	_ = writeCmd.ExecuteContext(context.Background())
 	_ = s2.closeStore()
 	info, err := os.Stat(storageDir)
@@ -218,7 +220,7 @@ storage:
 // is not stricter than the config file's own log.level: "WARN" and
 // "warning" always worked as a config value (see
 // TestValidate_LogFields_AcceptsMixedCaseWhitespaceAndWarningAlias) and
-// isValidLogLevel must accept the same spellings from the flag.
+// config.IsValidLogLevel must accept the same spellings from the flag.
 func TestPrepare_LogLevelFlagAcceptsMixedCaseAndWarningAlias(t *testing.T) {
 	useFakeHome(t)
 	root := t.TempDir()
@@ -254,7 +256,7 @@ storage:
 
 // TestFinalizeExecuteError proves main.go can tell "a command failed
 // because the process was interrupted" apart from "a command failed on its
-// own", so it can exit 130 instead of the generic 1 only for the former.
+// own", so it can exit 128+signal instead of the generic 1 only for the former.
 func TestFinalizeExecuteError(t *testing.T) {
 	boom := fmt.Errorf("boom")
 	interrupted := context.Canceled
@@ -323,4 +325,13 @@ log:
 
 	_, err := os.Stat(logDir)
 	assert.True(t, os.IsNotExist(err), "config validate must not create the log directory")
+}
+
+func TestExitCode(t *testing.T) {
+	assert.Equal(t, 0, ExitCode(nil))
+	assert.Equal(t, 1, ExitCode(fmt.Errorf("boom")))
+	assert.Equal(t, 130, ExitCode(&interruptedError{signal: int(syscall.SIGINT)}))
+	assert.Equal(t, 143, ExitCode(&interruptedError{signal: int(syscall.SIGTERM)}))
+	assert.Equal(t, 130, ExitCode(ErrInterrupted), "an interrupt with no recorded signal defaults to SIGINT")
+	assert.Equal(t, 143, ExitCode(fmt.Errorf("wrapped: %w", &interruptedError{signal: int(syscall.SIGTERM)})))
 }

@@ -125,6 +125,9 @@ func newSessionsRmCmd(s *state) *cobra.Command {
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			id := args[0]
+			if err := s.requireExistingDatabase(); err != nil {
+				return err
+			}
 			st, err := s.openStore(ctx, false)
 			if err != nil {
 				return err
