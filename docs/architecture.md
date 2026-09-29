@@ -12,7 +12,7 @@ flowchart TD
     TG[Telegram Bot API] -->|long poll getUpdates| CH[channel/telegram]
     CH -->|gating: allowlist + mention| Q[gateway inbound queue]
     Q -->|serialize per session| DISP[gateway dispatcher]
-    CRON[cron scheduler] -->|scheduled prompt| Q
+    CRON[cron scheduler] -->|scheduled prompt| DISP
 
     DISP --> LOOP[agent loop<br/>think / act / observe]
     LOOP <-->|chat.completions + tools| PROV[provider/openai]
@@ -68,9 +68,9 @@ internal/
               sqlite/ is the only registered driver: it holds every SQLite-
               specific quirk (pragmas, connection pooling, the legacy
               PRAGMA user_version adoption path) behind Dialect, and
-              registers itself via a blank import - internal/cli's two
-              production wiring sites (root.go, doctor_checks.go) import it
-              only as `_ "…/internal/store/sqlite"`, never by name. Adding a
+              registers itself via a blank import - the three production
+              wiring sites (internal/cli/root.go, internal/cli/doctor_checks.go,
+              internal/gateway/gateway.go) import it only as `_ "…/internal/store/sqlite"`, never by name. Adding a
               second backend is one new package implementing Dialect below
               this same, unchanged Store interface.
   provider/   Provider interface + Request/Response/ToolSpec types,
@@ -104,7 +104,7 @@ internal/
               this package's own fakeapi subpackage - nothing in a
               non-test build depends on it.
 docs/         this file, configuration.md, security.md, telegram-setup.md,
-              verification.md
+              verification.md; journals/ holds historical notes only
 ```
 
 Dependency direction is strictly inward: `channel` and `tools` depend on
@@ -143,7 +143,7 @@ A Telegram direct message, end to end:
 
 1. **Long poll.** `channel/telegram` receives a `telego.Update` from
    `UpdatesViaLongPolling`.
-2. **Gating.** `telegram.Decide` (a pure function of config + message)
+2. **Gating.** `telegram`'s `decide` (a pure function of config + message)
    checks the sender against `allow_from` (DM) or the group's effective
    allowlist plus `require_mention` (group/supergroup). A rejection is
    silent - no reply, no reaction - so a non-allowlisted sender gets no
@@ -174,9 +174,25 @@ A Telegram direct message, end to end:
    inside an HTML-escaped `<pre><code>` span so the command's own text can
    never break out of it.
 
+   Reply delivery has a few guarantees worth knowing (the owners are
+   `internal/gateway/dispatch.go` and `internal/channel/telegram/send.go`):
+   replies within one chat and thread arrive strictly in turn order, though
+   approval prompts and busy or slow-tool notices sit outside that ordering;
+   a Telegram HTTP 5xx on send is retried once after 1 s (network-level
+   errors are not); a 429 `retry_after` of up to 60 s is honored, and a
+   longer wait fails at once; and if a multi-chunk reply fails part-way, the
+   chat gets a one-line "the reply above is incomplete" notice. Telegram API
+   calls carry a 60 s client timeout and abort on shutdown or `/stop`, so
+   shutdown does not wait out an in-flight long poll. A `/new` or `/stop`
+   sent right after a message does not queue behind that message's turn: the
+   turn is cancelled and a queued message is dropped rather than run against
+   history that is being reset. A model refusal is delivered as the reply
+   text; a `content_filter` finish reason appends a "response withheld or
+   cut short" notice to the reply.
+
 A cron-triggered turn follows the same agent-loop/policy/store path from
-step 5 onward; it enters at the queue (step 3) via the scheduler instead of
-a Telegram update, and its exec tool is always wired to `DenyAllApprover` -
+step 5 onward; it enters at the dispatcher (step 4) via the scheduler,
+bypassing the inbound queue, instead of a Telegram update, and its exec tool is always wired to `DenyAllApprover` -
 see `docs/security.md` for why cron is allow-list-only.
 
 ## What we deliberately did not build

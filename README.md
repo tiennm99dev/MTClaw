@@ -30,7 +30,10 @@ you download a release binary.
 **From a release** (no Go toolchain needed): download the `mtclaw` binary for
 your OS/arch from the [releases page](https://github.com/tiennm99dev/MTClaw/releases)
 (bare binaries, not archives), verify it against the accompanying
-`SHA256SUMS`, and put it on your `PATH`.
+`SHA256SUMS`, and put it on your `PATH`. Release files are named
+`mtclaw-<tag>-<os>-<arch>` (`.exe` on Windows); rename yours to `mtclaw` and
+make it executable for the commands below. If the releases page lists
+nothing yet, build from source.
 
 **From source:**
 
@@ -65,7 +68,7 @@ inherits whatever `CGO_ENABLED` your own environment defaults to.
 ## Upgrading
 
 The gateway's instance lock lives next to the database
-(`storage.path + ".lock"`, see `docs/configuration.md`'s `storage.path`
+(`storage.dsn + ".lock"`, see `docs/configuration.md`'s `storage.dsn`
 row) - not at a fixed path under `~/.mtclaw/`. If you are upgrading from a
 version that predates this, stop the old gateway process before starting
 the new binary: a new `mtclaw gateway`, `cron run`, or `doctor` checks only
@@ -81,6 +84,25 @@ at all - it rejects unrecognized keys, not just ignore them. Your database
 is unaffected either way; see `docs/configuration.md`'s storage section for
 the two-line edit that restores an older binary's compatibility.
 
+**Existing configs keep their old deny list.** `onboard` writes the starter
+`tools.exec.deny` list once, when it creates the config; upgrading the binary
+never rewrites it, and `doctor` does not flag an outdated list. The current
+defaults (`internal/tools/deny_defaults.go`) additionally catch:
+
+- `rm` with an uppercase `-R`, and `rm` glued to a separator with no space
+  (`ls;rm -rf ~`, `a&&rm -rf ~`, `ls|rm -rf ~`, a backtick before `rm`);
+- force pushes as `git push -fu ...`, `git push origin +main`, and
+  `git -C . push -f`, alongside `--force` and `--force-with-lease`;
+- `chmod 777 -R /` (flags after `777`) and pipe-to-shell into a
+  path-qualified shell (`curl x | /bin/bash`);
+- on Windows, `Remove-Item` and its aliases (`ri`, `rm`, `rmdir`, `rd`,
+  `del`, `erase`) with any `-r*` or `-fo*` parameter, abbreviated or not,
+  and `irm` / `Invoke-RestMethod` piped to `iex`.
+
+To adopt them, run `mtclaw onboard --config <fresh path>` and copy the
+`tools.exec.deny` block into your config, or copy the patterns from
+`deny_defaults.go` directly.
+
 ## 5-minute quickstart
 
 ```sh
@@ -93,8 +115,13 @@ mtclaw gateway    # start the long-running process; message your bot on Telegram
 `api_key_env: OPENAI_API_KEY` / `token_env: TELEGRAM_BOT_TOKEN` (pointing at
 environment variables) and prints the exact `export`/`setx` line you need to
 add to your shell profile. It also captures your numeric Telegram user ID
-interactively - with an explicit on-screen confirmation before writing it -
-so the bot's allowlist is never left empty.
+interactively - with an explicit on-screen confirmation before writing it.
+If no id is confirmed (nobody messaged the bot, several people did and you
+declined to pick one, or you left the manual prompt blank), `onboard` writes
+`channels.telegram.enabled: false` and leaves `allow_from` empty instead of
+an unloadable config; `mtclaw gateway` will not start until you add your id
+(`/whoami` shows it) and set `enabled: true`. `onboard` refuses to overwrite
+an existing config and never overwrites `prompts/AGENTS.md`.
 
 No Telegram bot yet? See `docs/telegram-setup.md` for the BotFather
 walkthrough. Prefer the terminal first? `mtclaw prompt "list files in my
@@ -115,21 +142,45 @@ workspace"` runs one full tool-using agent turn with no Telegram involved.
 | `mtclaw cron list\|run` | Lists configured cron jobs and their next-due times, or fires one manually. |
 | `mtclaw version` | Prints the build-stamped version. |
 
+Every command accepts two global flags: `--config <path>` (see
+`docs/configuration.md` for how the path is resolved) and `--log-level
+<level>`, which overrides `log.level` from the config file and is validated
+the same way. Run `mtclaw <command> --help` for a command's own flags; two
+are worth knowing up front:
+
+- `mtclaw prompt --session <id>` reuses a specific session instead of the
+  default `cli`/`local` one, and `--new` starts a fresh one (the two are
+  mutually exclusive).
+- `mtclaw cron run <name>` prints the result by default. `--deliver` actually
+  sends it to the job's `deliver_to` chat, so it is a real message to a real
+  chat; `--ephemeral` runs against a throwaway session instead of the job's
+  persistent one. A persistent job refuses to run while the gateway holds the
+  instance lock.
+
+Exit codes: `0` on success; `1` on any error; `128 + signal` when a run is
+interrupted (`130` for SIGINT, `143` for SIGTERM). `doctor` exits non-zero if
+any row is `FAIL` (a `WARN` does not), and `onboard` exits `1` if a config
+already exists.
+
 ## Documentation
 
 - [`docs/configuration.md`](docs/configuration.md) - every config key: type, default, effect, what breaks if it's wrong.
 - [`docs/security.md`](docs/security.md) - the threat model, the exec decision pipeline, deny-list limits, why `auto` mode is beta, why cron is allow-list-only.
 - [`docs/telegram-setup.md`](docs/telegram-setup.md) - BotFather, privacy mode, finding user/group IDs, `require_mention`.
 - [`docs/architecture.md`](docs/architecture.md) - component diagram, package boundaries, request lifecycle, what was deliberately not built.
+- [`docs/verification.md`](docs/verification.md) - what CI proves versus what still needs live credentials, and how to run the local checks (`make lint`, `make test`).
+- `docs/journals/` - historical implementation notes, not current documentation.
 
 ## Windows support: honesty note
 
 MTClaw builds and its test suite passes on Windows, and the `exec` tool
 defaults to PowerShell there with its own OS-appropriate deny-list. A
 runaway command's whole process tree is killed on timeout or turn
-cancellation there too, via `taskkill /F /T` (Windows has no POSIX process
-group to signal, so this is a different mechanism than the `setpgid`+
-`SIGKILL` the POSIX build uses, not a gap). That said, Windows is still the
+cancellation there too, by assigning the command to a Job Object that is
+closed on kill (Windows has no POSIX process group to signal, so this is a
+different mechanism than the `setpgid`+`SIGKILL` the POSIX build uses, not a
+gap; a grandchild spawned in the short window before the shell is assigned
+to the job is outside it). That said, Windows is still the
 least battle-tested target: file-permission checks that matter on POSIX
 (world-readable secrets, `chmod 600` on the config file) are documented
 no-ops on Windows because ACL-based permissions are not the mode bits those

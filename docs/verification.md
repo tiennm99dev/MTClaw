@@ -72,15 +72,29 @@ live-upstream half (real model behavior, real Telegram rendering, a real
 | `--config foo.yml` and `MTCLAW_CONFIG=foo.yml` are used byte-for-byte, never extension-rewritten, whether or not the named file exists on disk | `internal/config/load_test.go::TestConfigPath_ExplicitFlagNeverAliasResolved` |
 | Every config key (including `storage.driver`/`storage.dsn`/`storage.path` and `channels.telegram.api_base_url`) has a documentation row | `internal/config/docs_coverage_test.go::TestConfigFieldsAreDocumented` |
 
+### Local checks and lint
+
+`make lint` runs `go vet ./...` and then `golangci-lint run ./...`; the
+linter set and its exclusions live in `.golangci.yml`, and CI's ubuntu leg
+runs the same linter through `golangci/golangci-lint-action`. Install it once
+with `go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@latest`.
+`make fmt-check` reports unformatted files without touching them (CI runs
+the equivalent `gofmt -l .` inline rather than calling the target), and
+`make test` and `make race` run the suite without and with the race detector.
+
 ### A note on `go test -race` and CI
 
-`.github/workflows/ci.yml` runs `go vet`, a CGO-free `go build`/`go test`,
-`go mod tidy -diff`, and a separate CGO-enabled `go test -race ./...` leg
-across the `ubuntu-latest`/`macos-latest`/`windows-latest` matrix (with LF
-line endings pinned on checkout so `gofmt`, which is line-ending sensitive,
-agrees with a POSIX checkout) on every push and pull request, plus
-`govulncheck` and a release build gated on the whole suite passing. That
-configuration is real and current; the two failure modes an earlier
+`.github/workflows/ci.yml` runs on pushes to `main` and on every pull
+request. Its `test` job runs `go vet`, a CGO-free `go build`/`go test`, and a
+separate CGO-enabled `go test -race ./...` leg across the
+`ubuntu-latest`/`macos-latest`/`windows-latest` matrix (with LF line endings
+pinned on checkout so `gofmt`, which is line-ending sensitive, agrees with a
+POSIX checkout); `go mod tidy -diff` and `golangci-lint` run on the ubuntu
+leg only. A separate `test-stable` job repeats vet/build/test on the latest
+stable Go, and `govulncheck` is its own job. The release workflow
+(`.github/workflows/release.yml`) is independent of CI: it gates on `go vet`
+and `go test` only, then cross-compiles. That configuration is real and
+current; the two failure modes an earlier
 revision of this document tracked here are both fixed:
 
 - `internal/tools.TestExec_TimeoutKillsWholeProcessTree` and its sibling
@@ -169,14 +183,14 @@ mtclaw cron list # confirm next-due time, then watch Telegram
 ```
 
 Expected: a message arrives in the target chat within a few seconds of the
-minute rolling over, and `mtclaw approvals list` / a `sessions` inspection
-(or a direct look via `sqlite3 ~/.mtclaw/mtclaw.db 'select * from cron_runs'`)
-shows a `cron_runs` row for `manual-check` with `status = ok`.
+minute rolling over, and `mtclaw cron list` (LAST STATUS / LAST RUN, read
+from `cron_runs`; or a direct look via `sqlite3 ~/.mtclaw/mtclaw.db 'select *
+from cron_runs'`) shows a `cron_runs` row for `manual-check` with `status = ok`.
 
 ### 4. `onboard` on a clean machine, including the Telegram ID capture window
 
 **Why it can't be faked:** `internal/cli/onboard_test.go` exercises the
-capture logic (`internal/channel/telegram/capture.go:26-40`) against a
+capture logic (`CaptureSenders` in `internal/channel/telegram/capture.go`) against a
 scripted fake poller - it proves the branching (single sender, multiple
 senders, manual fallback) but never a real 60-second window racing against
 a real person actually messaging the bot on a real phone.

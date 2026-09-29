@@ -14,7 +14,7 @@ jobs:
     env:
       CGO_ENABLED: "0" # cross-compiling this matrix stays a plain loop, no
                         # cross-toolchain problem, because modernc.org/sqlite
-                        # is pure Go (see docs/architecture.md).
+                        # is pure Go (rationale: internal/store/sqlite/dialect.go).
     steps:
       - name: Check out
         uses: actions/checkout@v7
@@ -41,8 +41,9 @@ jobs:
           check-latest: true
 
       # A tag pushed from a local branch that never ran CI must not publish
-      # a release built from untested code: gate the build on the same
-      # checks CI runs, against this exact tagged commit.
+      # a release built from untested code: gate the build on go vet and
+      # go test against this exact tagged commit. This is a subset of CI (no
+      # gofmt, go mod tidy, golangci-lint, -race, or govulncheck).
       - name: go vet
         run: go vet ./...
 

@@ -1,3 +1,5 @@
+> Historical record, not current documentation.
+
 # MTClaw Core System: Nine-Phase Implementation Complete
 
 **Date**: 2026-08-01  
