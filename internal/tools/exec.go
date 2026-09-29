@@ -130,7 +130,7 @@ func registerExecTool(r *Registry, cfg config.Config, st store.Store, approver A
 
 	et := &execTool{
 		cfg:            execCfg,
-		shell:          ResolveShell(execCfg.Shell),
+		shell:          policy.shell,
 		policy:         policy,
 		approver:       approver,
 		audit:          st.Audit(),
@@ -283,10 +283,12 @@ func (e *execTool) ask(ctx context.Context, meta agent.Meta, rawCmd, redactedCmd
 
 // execute runs rawCmd under e.shell, bounded by e.cfg.Timeout as an
 // additional bound derived from ctx (not a replacement for it). It always
-// kills rawCmd's whole process tree once the command finishes, regardless
+// kills rawCmd's whole process group once the command finishes, regardless
 // of how it finished, so a command that backgrounds a child (`sleep 30 &`)
-// never leaves that child running past this call - see trackProcessTree and
-// the unconditional call below. A non-zero exit code is a normal result;
+// does not leave that child running past this call - see trackProcessTree
+// and the unconditional call below. A child that leaves the group (`setsid`,
+// a double fork into a new session) is outside that guarantee: this is not
+// a sandbox. A non-zero exit code is a normal result;
 // only the caller's own ctx ending mid-run is surfaced as a Go error, so
 // the agent loop's cancellation handling can flush and abort the turn
 // instead of the exec tool silently swallowing it.
@@ -347,10 +349,11 @@ func (e *execTool) execute(ctx context.Context, meta agent.Meta, rawCmd, redacte
 	// itself has exited; cmd.WaitDelay bounds how long Wait waits for that
 	// before force-closing the pipe (see the ErrWaitDelay case below), but
 	// nothing about a normal, on-time exit stops that child from
-	// continuing to run afterward. Killing the whole process tree here,
+	// continuing to run afterward. Killing the whole process group here,
 	// unconditionally, after every return path from Start/Wait - not only
 	// on timeout or cancellation, where cmd.Cancel above already does it -
-	// is what guarantees a backgrounded child never outlives this call.
+	// is what stops a backgrounded child from outliving this call (unless
+	// it moved itself into a new session with setsid).
 	// tracked.kill is a no-op once the tree is already gone, so calling it
 	// again when cmd.Cancel already fired costs nothing.
 	tracked.kill()

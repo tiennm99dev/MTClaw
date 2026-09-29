@@ -207,3 +207,57 @@ func TestFromSDK_UsagePopulated(t *testing.T) {
 	assert.Equal(t, 5, resp.Usage.Completion)
 	assert.Equal(t, "stop", resp.FinishReason)
 }
+
+// TestFromSDK_MalformedToolArgumentsStayValidJSON proves model-emitted
+// arguments that are not JSON (a reply cut off by the token cap, single-quoted
+// pseudo-JSON, an empty string) leave fromSDK as valid JSON, so the store can
+// persist the turn; well-formed arguments pass through byte for byte.
+func TestFromSDK_MalformedToolArgumentsStayValidJSON(t *testing.T) {
+	for _, args := range []string{`{"command": "ls`, ``, `{'command': 'ls'}`} {
+		completion := &openaisdk.ChatCompletion{
+			Choices: []openaisdk.ChatCompletionChoice{{
+				Message: openaisdk.ChatCompletionMessage{ToolCalls: []openaisdk.ChatCompletionMessageToolCallUnion{
+					{ID: "c1", Function: openaisdk.ChatCompletionMessageFunctionToolCallFunction{Name: "exec", Arguments: args}},
+				}},
+				FinishReason: "tool_calls",
+			}},
+		}
+		resp, err := fromSDK(completion)
+		require.NoError(t, err)
+		require.Len(t, resp.Message.ToolCalls, 1)
+		got := resp.Message.ToolCalls[0].Args
+		assert.True(t, json.Valid(got), "arguments %q must leave the provider as valid JSON, got %q", args, got)
+		var text string
+		require.NoError(t, json.Unmarshal(got, &text))
+		assert.Equal(t, args, text, "the original text must stay recoverable")
+	}
+
+	good := `{"command":"ls"}`
+	completion := &openaisdk.ChatCompletion{
+		Choices: []openaisdk.ChatCompletionChoice{{
+			Message: openaisdk.ChatCompletionMessage{ToolCalls: []openaisdk.ChatCompletionMessageToolCallUnion{
+				{ID: "c1", Function: openaisdk.ChatCompletionMessageFunctionToolCallFunction{Name: "exec", Arguments: good}},
+			}},
+		}},
+	}
+	resp, err := fromSDK(completion)
+	require.NoError(t, err)
+	assert.JSONEq(t, good, string(resp.Message.ToolCalls[0].Args))
+}
+
+// TestFromSDK_RefusalBecomesContent proves a refusal (which the API delivers
+// in its own field with Content empty) is not lost as an empty reply, and
+// that real Content still wins when both are present.
+func TestFromSDK_RefusalBecomesContent(t *testing.T) {
+	resp, err := fromSDK(&openaisdk.ChatCompletion{Choices: []openaisdk.ChatCompletionChoice{
+		{Message: openaisdk.ChatCompletionMessage{Refusal: "I can't help with that."}, FinishReason: "stop"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "I can't help with that.", resp.Message.Content)
+
+	resp, err = fromSDK(&openaisdk.ChatCompletion{Choices: []openaisdk.ChatCompletionChoice{
+		{Message: openaisdk.ChatCompletionMessage{Content: "real", Refusal: "no"}, FinishReason: "stop"},
+	}})
+	require.NoError(t, err)
+	assert.Equal(t, "real", resp.Message.Content)
+}

@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/tiennm99/MTClaw/internal/agent"
@@ -228,13 +230,24 @@ func (f *fsTools) writeFile(ctx context.Context, args json.RawMessage, _ agent.M
 		}
 		return fmt.Sprintf("write_file: %v", err), nil
 	}
-	defer file.Close()
 
-	n, err := file.WriteString(a.Content)
+	n, err := writeAndClose(file, a.Content)
 	if err != nil {
 		return fmt.Sprintf("write_file: %v", err), nil
 	}
 	return fmt.Sprintf("write_file: wrote %d bytes to %q (mode: %s)", n, a.Path, mode), nil
+}
+
+// writeAndClose writes content to w and closes it, returning the first
+// error. Close's error must reach the caller: on network filesystems and
+// quota-limited volumes a failed write-back is only reported at close, and
+// reporting "wrote N bytes" past that would be a false success.
+func writeAndClose(w io.WriteCloser, content string) (int, error) {
+	n, err := io.WriteString(w, content)
+	if closeErr := w.Close(); err == nil {
+		err = closeErr
+	}
+	return n, err
 }
 
 func listDirSpec() provider.ToolSpec {
@@ -316,13 +329,24 @@ func walkDir(ctx context.Context, dir string, depth int, prefix string, out *[]s
 		return true
 	}
 
-	// os.ReadDir already returns entries sorted by filename, so no separate
-	// sort is needed here.
-	entries, err := os.ReadDir(dir)
+	// Read at most one entry past the remaining budget so a huge directory
+	// is never loaded whole just to be cut at the cap; the extra entry is
+	// what lets the loop below see that the cap was actually exceeded.
+	// File.ReadDir does not sort (os.ReadDir does), so sort what was read.
+	d, err := os.Open(dir)
+	var entries []os.DirEntry
+	if err == nil {
+		entries, err = d.ReadDir(listDirEntryCap - *count + 1)
+		_ = d.Close()
+		if errors.Is(err, io.EOF) {
+			err = nil // empty directory
+		}
+	}
 	if err != nil {
 		*out = append(*out, prefix+fmt.Sprintf("[error reading directory: %v]", err))
 		return false
 	}
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 
 	for _, entry := range entries {
 		if *count >= listDirEntryCap || ctx.Err() != nil {

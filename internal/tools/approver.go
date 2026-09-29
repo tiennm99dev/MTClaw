@@ -41,11 +41,11 @@ type Approver interface {
 	// same as a denial and must not run the command, but should record it
 	// under a distinct audit label ("expired") rather than "denied_user" so
 	// the audit trail distinguishes a human saying no from nobody being
-	// asked. context.Canceled specifically (as opposed to
-	// context.DeadlineExceeded from the approver's own timeout) means the
-	// caller's ctx ended first - typically the turn itself being canceled -
-	// and callers should propagate that instead of treating it as a
-	// same-as-denial outcome.
+	// asked. When the caller's ctx ends first (typically the turn itself
+	// being canceled) the exec tool does not propagate context.Canceled from
+	// here: it treats the outcome like any other no-decision refusal, and
+	// Registry.Run reports the ended ctx itself. An Approver therefore only
+	// needs to return promptly once ctx is done.
 	Ask(ctx context.Context, req Request) (approved bool, err error)
 }
 
@@ -84,9 +84,10 @@ type TerminalApprover struct {
 	out     io.Writer
 	timeout time.Duration
 
-	// lines is buffered so readLines is never parked mid-send holding a
-	// line no Ask has consumed yet; a parked send could not be drained
-	// non-blockingly by Ask's stale-input guard below.
+	// lines is buffered so readLines is rarely parked mid-send holding a
+	// line no Ask has consumed yet. The drain in Ask's stale-input guard is
+	// best-effort: once more lines are queued than the buffer holds, the
+	// reader can park with one more line the drain cannot see.
 	lines chan string
 
 	mu      sync.Mutex
@@ -372,13 +373,18 @@ type redactRule struct {
 var redactPatterns = []redactRule{
 	// "Bearer <token>", case-insensitive, stops at the first character
 	// outside credentialValue (space, quote, or any shell metacharacter).
-	{regexp.MustCompile(`(?i)(bearer\s+)(` + credentialValue + `)`), `${1}[REDACTED]`},
-	// "Authorization: <value>"
-	{regexp.MustCompile(`(?i)(authorization:\s*)(` + credentialValue + `)`), `${1}[REDACTED]`},
+	// The keyword and its separator are bounded too: only spaces and tabs
+	// may sit between them and the value, and --secret* only spans flag-name
+	// characters, so a keyword at the end of a line or before ";" can never
+	// reach across a command boundary and redact the next command's name.
+	{regexp.MustCompile(`(?i)(bearer[ \t]+)(` + credentialValue + `)`), `${1}[REDACTED]`},
+	// "Authorization: <value>" and "X-Api-Key: <value>" headers
+	{regexp.MustCompile(`(?i)(x-api-key:[ \t]*)(` + credentialValue + `)`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(authorization:[ \t]*)(` + credentialValue + `)`), `${1}[REDACTED]`},
 	// --token, --password, --secret* flags, "=value" or " value" form
 	{regexp.MustCompile(`(?i)(--token[= ])(` + credentialValue + `)`), `${1}[REDACTED]`},
 	{regexp.MustCompile(`(?i)(--password[= ])(` + credentialValue + `)`), `${1}[REDACTED]`},
-	{regexp.MustCompile(`(?i)(--secret\S*[= ])(` + credentialValue + `)`), `${1}[REDACTED]`},
+	{regexp.MustCompile(`(?i)(--secret[A-Za-z0-9_-]*[= ])(` + credentialValue + `)`), `${1}[REDACTED]`},
 	// "-p<value>" glued together (mysql/psql style), e.g. -pSecret123.
 	// Deliberately over-broad: it also matches an unrelated "-pfoo" style
 	// flag on some other tool. Over-redaction is the safe failure
@@ -399,7 +405,12 @@ var redactPatterns = []redactRule{
 	{regexp.MustCompile(`(?i)(^|[^A-Za-z0-9_])([A-Za-z0-9_]*(?:KEY|TOKEN|SECRET|PASSWD|PASSWORD))=(` + credentialValue + `)`), `${1}${2}=[REDACTED]`},
 	// Common credential shapes: OpenAI sk-..., GitHub ghp_..., AWS AKIA...
 	{regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}\b`), "[REDACTED]"},
-	{regexp.MustCompile(`\bghp_[A-Za-z0-9]{20,}\b`), "[REDACTED]"},
+	{regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{20,}\b`), "[REDACTED]"},
+	{regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}\b`), "[REDACTED]"},
+	// URL userinfo, https://user:password@host - the most common inline
+	// credential in git clone and curl. The password stops at the first
+	// shell metacharacter or quote, like every other captured value.
+	{regexp.MustCompile("(://[^/\\s:@]+:)([^\\s/@;|&$()<>`'\"]+)(@)"), `${1}[REDACTED]${3}`},
 	{regexp.MustCompile(`\bAKIA[0-9A-Z]{12,}\b`), "[REDACTED]"},
 }
 

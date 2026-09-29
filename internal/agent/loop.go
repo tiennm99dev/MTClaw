@@ -215,7 +215,7 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 					// failures report no output at all (result == "").
 					content := fmt.Sprintf("tool %q failed: %v", call.Name, runErr)
 					if ctx.Err() != nil && result != "" {
-						content = fmt.Sprintf("%s\n\n[turn canceled right after this tool call completed - the result above is real and already happened]", result)
+						content = fmt.Sprintf("%s\n\n[the turn was canceled as this tool call returned; the text above is what the tool reported]", result)
 					}
 
 					// Always buffer exactly one tool message per call id,
@@ -266,13 +266,18 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 		}
 
 		// No ToolCalls payload ends the turn, regardless of FinishReason.
-		// FinishReason only still drives the "length" notice below, since
-		// that is what it is actually reliable for.
+		// FinishReason only still drives the "length" and "content_filter"
+		// notices below, since that is what it is actually reliable for.
 		text := resp.Message.Content
 		noReply := strings.TrimSpace(text) == noReplySentinel
 		resultText := text
-		if resp.FinishReason == "length" {
+		switch resp.FinishReason {
+		case "length":
 			resultText += "\n\n[response truncated: the model's output hit the token limit]"
+		case "content_filter":
+			// Without a notice a filtered reply is an empty string, which the
+			// channel layer sends as nothing at all.
+			resultText += "\n\n[response withheld or cut short: the provider's content filter stopped it]"
 		}
 
 		// This branch is only reached when resp.Message.ToolCalls is
@@ -297,25 +302,43 @@ func (l *Loop) Run(ctx context.Context, sessionID, userText, messageID string, o
 // of current OpenAI chat models.
 const maxHistoryBytes = 256 * 1024
 
+// historyFetchMaxDoublings bounds how many times loadHistory widens its raw
+// window (each time doubling it) when one turn is larger than the window.
+const historyFetchMaxDoublings = 5
+
 // loadHistory fetches a generous raw window (max_history_turns*8 messages,
 // a heuristic covering typical turn sizes), hard-trims it to whole turns,
-// then trims again to maxHistoryBytes.
+// then trims again to maxHistoryBytes. A window that came back full but
+// holds fewer than max_history_turns whole turns (the oldest turn in it is
+// cut off mid-way, or a single huge turn fills it) is widened by doubling,
+// a bounded number of times, so one very long turn cannot make the next
+// request forget everything before it: the cut-off prefix is unusable on
+// its own and HardTrim would otherwise leave nothing at all.
 func (l *Loop) loadHistory(ctx context.Context, sessionID string) ([]provider.Message, error) {
 	maxTurns := l.cfg.Agent.MaxHistoryTurns
-	raw, err := l.store.Messages().Recent(ctx, sessionID, maxTurns*8)
-	if err != nil {
-		return nil, fmt.Errorf("agent: load history for session %s: %w", sessionID, err)
-	}
-	msgs := make([]provider.Message, 0, len(raw))
-	for _, m := range raw {
-		pm, err := m.ToProviderMessage()
+	limit := maxTurns * 8
+	for widen := 0; ; widen++ {
+		raw, err := l.store.Messages().Recent(ctx, sessionID, limit)
 		if err != nil {
-			return nil, fmt.Errorf("agent: convert stored history for session %s: %w", sessionID, err)
+			return nil, fmt.Errorf("agent: load history for session %s: %w", sessionID, err)
 		}
-		msgs = append(msgs, pm)
+		msgs := make([]provider.Message, 0, len(raw))
+		for _, m := range raw {
+			pm, err := m.ToProviderMessage()
+			if err != nil {
+				return nil, fmt.Errorf("agent: convert stored history for session %s: %w", sessionID, err)
+			}
+			msgs = append(msgs, pm)
+		}
+
+		full := limit > 0 && len(raw) >= limit
+		short := maxTurns > 0 && len(SegmentTurns(dropLeadingNonUser(msgs))) < maxTurns
+		if full && short && widen < historyFetchMaxDoublings {
+			limit *= 2
+			continue
+		}
+		return TrimToByteBudget(HardTrim(msgs, maxTurns), maxHistoryBytes), nil
 	}
-	trimmed := HardTrim(msgs, maxTurns)
-	return TrimToByteBudget(trimmed, maxHistoryBytes), nil
 }
 
 // assembleMessages builds one request's message list: system prompt, then

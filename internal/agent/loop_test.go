@@ -2,6 +2,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -834,4 +835,121 @@ func TestRun_ReusedCallID_RecordsTheToolNameActuallyDeclared(t *testing.T) {
 	assert.Equal(t, "tool", msgs[4].Role)
 	assert.Equal(t, "call_0", msgs[4].ToolCallID)
 	assert.Equal(t, "fs_read", msgs[4].ToolName, "the second call_0 row must use the later declaration's name, not the first")
+}
+
+// TestRun_MalformedToolArguments_TurnStillPersists proves a tool call whose
+// arguments are not valid JSON (a reply cut off by the token cap) does not
+// cost the turn its persistence: the tool row, including side effects of
+// calls that already ran earlier in the turn, must reach the store.
+func TestRun_MalformedToolArguments_TurnStillPersists(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(
+		mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "exec", Args: json.RawMessage(`{"command": "ls`)}}},
+		mock.Step{Content: "sorry, fixed"},
+	)
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			return "exec: invalid arguments", nil
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(context.Background(), sessionID, "list files", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Equal(t, "sorry, fixed", result.Text)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 4, "user, assistant(tool_calls), tool, assistant(final)")
+}
+
+// TestRun_CanceledToolResult_NoteDoesNotClaimCompletion proves the note
+// added when the turn is canceled as a tool call returns only says what the
+// tool reported: an exec killed mid-run also returns a non-empty result, and
+// the durable history must not claim that command completed.
+func TestRun_CanceledToolResult_NoteDoesNotClaimCompletion(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	prov := mock.New(mock.Step{ToolCalls: []provider.ToolCall{{ID: "call_1", Name: "exec"}}})
+	tools := &fakeToolRunner{
+		fn: func(ctx context.Context, call provider.ToolCall, meta Meta) (string, error) {
+			cancel()
+			return "exec: command canceled because the turn ended", ctx.Err()
+		},
+	}
+
+	loop := New(testAgentConfig(), prov, st, tools, nil)
+	result := loop.Run(ctx, sessionID, "run something", "", nil)
+	require.Error(t, result.Err)
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 3)
+	assert.Contains(t, msgs[2].Content, "command canceled because the turn ended")
+	assert.NotContains(t, msgs[2].Content, "already happened")
+	assert.NotContains(t, msgs[2].Content, "is real")
+}
+
+// TestRun_ContentFilterStop_ExplainsEmptyReply proves a reply stopped by the
+// provider's content filter surfaces a notice instead of an empty string
+// (which the channel layer would send as nothing), and that the notice is
+// not persisted as model content.
+func TestRun_ContentFilterStop_ExplainsEmptyReply(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	prov := mock.New(mock.Step{Content: "", FinishReason: "content_filter"})
+	loop := New(testAgentConfig(), prov, st, &fakeToolRunner{}, nil)
+	result := loop.Run(context.Background(), sessionID, "hello", "", nil)
+
+	require.NoError(t, result.Err)
+	assert.Contains(t, result.Text, "content filter")
+
+	msgs, err := st.Messages().Recent(context.Background(), sessionID, 0)
+	require.NoError(t, err)
+	require.Len(t, msgs, 2)
+	assert.Equal(t, "", msgs[1].Content)
+}
+
+// TestRun_LoadHistory_OneTurnLargerThanWindowKeepsEarlierHistory proves a
+// single turn with more messages than the raw fetch window does not wipe
+// history: the window would start mid-turn with no user message at all, so
+// loadHistory must widen it instead of handing the model nothing.
+func TestRun_LoadHistory_OneTurnLargerThanWindowKeepsEarlierHistory(t *testing.T) {
+	st := newTestStore(t)
+	sessionID := newTestSession(t, st)
+
+	cfg := testAgentConfig()
+	cfg.Agent.MaxHistoryTurns = 2 // raw window: 16 messages
+
+	ctx := context.Background()
+	require.NoError(t, st.Messages().Append(ctx, sessionID, []store.Message{
+		{Role: "user", Content: "old-fact-marker"},
+		{Role: "assistant", Content: "noted"},
+	}))
+	big := []store.Message{{Role: "user", Content: "big-turn-marker"}}
+	for i := 0; i < 30; i++ {
+		big = append(big, store.Message{Role: "assistant", Content: fmt.Sprintf("step %d", i)})
+	}
+	require.NoError(t, st.Messages().Append(ctx, sessionID, big))
+
+	prov := mock.New(mock.Step{Content: "ok"})
+	loop := New(cfg, prov, st, &fakeToolRunner{}, nil)
+	result := loop.Run(ctx, sessionID, "what was the fact?", "", nil)
+	require.NoError(t, result.Err)
+
+	requests := prov.Requests()
+	require.Len(t, requests, 1)
+	var sent strings.Builder
+	for _, m := range requests[0].Messages {
+		sent.WriteString(m.Content)
+		sent.WriteByte('\n')
+	}
+	assert.Contains(t, sent.String(), "old-fact-marker")
+	assert.Contains(t, sent.String(), "big-turn-marker")
 }

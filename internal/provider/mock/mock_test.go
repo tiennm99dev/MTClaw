@@ -102,3 +102,13 @@ func TestComplete_DefaultFinishReasonForTextStep(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "stop", resp.FinishReason)
 }
+
+// TestComplete_NormalizesMalformedToolArgs proves the mock honors the same
+// contract real providers do: tool-call arguments leave Complete as valid
+// JSON even when the script supplies malformed text.
+func TestComplete_NormalizesMalformedToolArgs(t *testing.T) {
+	p := New(Step{ToolCalls: []provider.ToolCall{{ID: "c1", Name: "exec", Args: json.RawMessage(`{"command": "ls`)}}})
+	resp, err := p.Complete(context.Background(), provider.Request{})
+	require.NoError(t, err)
+	assert.True(t, json.Valid(resp.Message.ToolCalls[0].Args))
+}

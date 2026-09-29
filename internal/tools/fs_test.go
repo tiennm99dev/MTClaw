@@ -243,6 +243,45 @@ func TestListDir_EntryCapAndCounts(t *testing.T) {
 	assert.Contains(t, out, "dir")
 }
 
+func TestListDir_CapsEntriesAndKeepsNamesSorted(t *testing.T) {
+	f, root := newFSTools(t, 1024, 1024)
+	for i := 0; i < listDirEntryCap+5; i++ {
+		require.NoError(t, os.WriteFile(filepath.Join(root, fmt.Sprintf("f%05d.txt", i)), nil, 0o644))
+	}
+	out, err := f.listDir(context.Background(), mustArgs(t, listDirArgs{Path: "."}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Contains(t, out, "entry cap of")
+	assert.Equal(t, listDirEntryCap, strings.Count(out, ".txt"))
+
+	// Below the cap the listing is complete and sorted by name.
+	f2, root2 := newFSTools(t, 1024, 1024)
+	for _, n := range []string{"c", "a", "b"} {
+		require.NoError(t, os.WriteFile(filepath.Join(root2, n), nil, 0o644))
+	}
+	out, err = f2.listDir(context.Background(), mustArgs(t, listDirArgs{Path: "."}), agent.Meta{})
+	require.NoError(t, err)
+	assert.Less(t, strings.Index(out, "a\tfile"), strings.Index(out, "b\tfile"))
+	assert.Less(t, strings.Index(out, "b\tfile"), strings.Index(out, "c\tfile"))
+	assert.NotContains(t, out, "entry cap")
+}
+
+type closeFailWriter struct{ closeErr error }
+
+func (closeFailWriter) Write(p []byte) (int, error) { return len(p), nil }
+func (w closeFailWriter) Close() error              { return w.closeErr }
+
+// TestWriteAndClose_SurfacesCloseError proves a write-back failure reported
+// only at close is returned, not swallowed into a "wrote N bytes" success.
+func TestWriteAndClose_SurfacesCloseError(t *testing.T) {
+	boom := fmt.Errorf("disk quota exceeded")
+	_, err := writeAndClose(closeFailWriter{closeErr: boom}, "data")
+	assert.ErrorIs(t, err, boom)
+
+	n, err := writeAndClose(closeFailWriter{}, "data")
+	require.NoError(t, err)
+	assert.Equal(t, 4, n)
+}
+
 func TestListDir_NeverFollowsSymlinks(t *testing.T) {
 	f, root := newFSTools(t, 1024, 1024)
 	outside := t.TempDir()

@@ -2,7 +2,6 @@ package openai
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"time"
 
@@ -154,13 +153,19 @@ func fromSDK(completion *openaisdk.ChatCompletion) (*provider.Response, error) {
 		Role:    provider.RoleAssistant,
 		Content: choice.Message.Content,
 	}
+	if msg.Content == "" && choice.Message.Refusal != "" {
+		// A refusal arrives in its own field with Content empty; without
+		// this the reply would be an empty string the channel sends as
+		// nothing at all.
+		msg.Content = choice.Message.Refusal
+	}
 	if len(choice.Message.ToolCalls) > 0 {
 		msg.ToolCalls = make([]provider.ToolCall, 0, len(choice.Message.ToolCalls))
 		for _, tc := range choice.Message.ToolCalls {
 			msg.ToolCalls = append(msg.ToolCalls, provider.ToolCall{
 				ID:   tc.ID,
 				Name: tc.Function.Name,
-				Args: json.RawMessage(tc.Function.Arguments),
+				Args: provider.NormalizeToolArgs([]byte(tc.Function.Arguments)),
 			})
 		}
 	}

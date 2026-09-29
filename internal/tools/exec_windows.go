@@ -29,7 +29,10 @@ type windowsProcessTree struct {
 
 // trackProcessTree must be called after cmd.Start succeeds, once
 // cmd.Process is populated - a process handle has to exist before it can be
-// assigned to a job. On any failure it returns nil: the caller then has
+// assigned to a job. The job is assigned only
+// after Start returns, so a grandchild the shell manages to spawn before
+// that assignment is outside the job and is not killed with it: a known,
+// best-effort limit (closing it would need CREATE_SUSPENDED plus a resume). On any failure it returns nil: the caller then has
 // nothing to kill through the job, same as if cmd.Process were nil, which
 // is the pre-existing fallback behaviour for a process that could not be
 // tracked.

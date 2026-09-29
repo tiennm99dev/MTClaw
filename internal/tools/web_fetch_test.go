@@ -13,6 +13,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -275,6 +276,35 @@ func TestWebFetch_MaxBytesCapTruncates(t *testing.T) {
 	assert.Contains(t, out, "[truncated to 10 bytes]")
 }
 
+// TestWebFetch_TruncationIsRuneSafeAndDropsPartialTag proves the byte cap
+// never splits a multi-byte rune and never leaks the fragment of a tag it cut.
+func TestWebFetch_TruncationIsRuneSafeAndDropsPartialTag(t *testing.T) {
+	cases := []struct {
+		name, contentType, body string
+		maxBytes                int
+		notContains             string
+	}{
+		{"rune", "text/plain", strings.Repeat("あ", 10), 10, "\ufffd"},
+		{"partial tag", "text/html", "<p>hello</p><div class=\"secret", 20, "<div"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			wf := &webFetchTool{client: srv.Client(), maxBytes: tc.maxBytes}
+			out, err := wf.run(context.Background(), mustArgs(t, webFetchArgs{URL: srv.URL}), agent.Meta{})
+			require.NoError(t, err)
+			assert.Contains(t, out, "[truncated to")
+			assert.NotContains(t, out, tc.notContains)
+			assert.True(t, utf8.ValidString(out))
+		})
+	}
+}
+
 // TestWebFetch_FollowsRedirectThenRefusesDifferentTarget proves web_fetch
 // follows a redirect through the real production client (CheckRedirect
 // deciding to follow, then Dialer.Control firing again on the resulting
@@ -297,8 +327,7 @@ func TestWebFetch_FollowsRedirectThenRefusesDifferentTarget(t *testing.T) {
 	}))
 	defer target.Close()
 
-	var redirectSrv *httptest.Server
-	redirectSrv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	redirectSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		atomic.AddInt32(&redirectHits, 1)
 		http.Redirect(w, r, target.URL, http.StatusFound)
 	}))

@@ -229,7 +229,8 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 	}
 	truncated := len(body) > w.maxBytes
 	if truncated {
-		body = body[:w.maxBytes]
+		// Cut on a rune boundary, like exec and read_file.
+		body = body[:runeSafeLen(body[:w.maxBytes])]
 	}
 
 	// htmlToText's tag-stripping and entity-decoding only makes sense for
@@ -238,6 +239,9 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 	// other textual type is returned exactly as fetched.
 	text := string(body)
 	if isHTMLContentType(contentType) {
+		if truncated {
+			text = dropPartialTag(text)
+		}
 		text = htmlToText(text)
 	}
 
@@ -250,6 +254,16 @@ func (w *webFetchTool) run(ctx context.Context, args json.RawMessage, _ agent.Me
 	b.WriteString("\n")
 	b.WriteString(text)
 	return b.String(), nil
+}
+
+// dropPartialTag removes a trailing, unterminated tag ("<div cla") left by a
+// byte-cap cut. tagRe only strips complete tags, so without this the tag's
+// fragment would be returned as page text.
+func dropPartialTag(s string) string {
+	if i := strings.LastIndexByte(s, '<'); i > strings.LastIndexByte(s, '>') {
+		return s[:i]
+	}
+	return s
 }
 
 // mediaTypeOf parses contentType down to its bare media type (dropping

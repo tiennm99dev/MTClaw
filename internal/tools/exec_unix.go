@@ -15,7 +15,9 @@ func setProcessGroup(cmd *exec.Cmd) {
 }
 
 // unixProcessTree kills the process group setProcessGroup placed cmd's
-// child into. The negative pid is the POSIX convention for "the process
+// child into. Only that group is signaled: a descendant that calls setsid
+// (or otherwise changes its process group) is out of reach, which is an
+// accepted limit of a non-sandboxed exec tool. The negative pid is the POSIX convention for "the process
 // group led by this pid".
 type unixProcessTree struct {
 	pid int

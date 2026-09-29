@@ -70,11 +70,22 @@ func (p *Provider) Complete(ctx context.Context, req provider.Request) (*provide
 		}
 	}
 
+	// Honor the Provider contract real backends do: tool-call arguments
+	// leave a Provider as valid JSON.
+	var calls []provider.ToolCall
+	if len(step.ToolCalls) > 0 {
+		calls = make([]provider.ToolCall, len(step.ToolCalls))
+		for i, tc := range step.ToolCalls {
+			tc.Args = provider.NormalizeToolArgs(tc.Args)
+			calls[i] = tc
+		}
+	}
+
 	return &provider.Response{
 		Message: provider.Message{
 			Role:      provider.RoleAssistant,
 			Content:   step.Content,
-			ToolCalls: step.ToolCalls,
+			ToolCalls: calls,
 		},
 		Usage:        step.Usage,
 		FinishReason: finish,

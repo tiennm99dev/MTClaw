@@ -29,10 +29,32 @@ const (
 // field rename does not silently zero out every historical row (encoding/
 // json still matches these tags case-insensitively against data written
 // before the tags existed).
+//
+// Args is always valid JSON when it comes out of a Provider: model output
+// is not trusted to be (a reply cut off by the token cap, or a backend that
+// emits pseudo-JSON, produces malformed arguments), and one invalid value
+// makes the store refuse to persist the whole turn. Providers must run raw
+// model arguments through NormalizeToolArgs.
 type ToolCall struct {
 	ID   string          `json:"id"`
 	Name string          `json:"name"`
 	Args json.RawMessage `json:"args"`
+}
+
+// NormalizeToolArgs returns raw unchanged when it is nil (no arguments at
+// all) or valid JSON, and
+// otherwise a valid JSON string holding raw's text. The tool registry then
+// reports "invalid arguments" back to the model as usual, while the turn -
+// including side effects of tool calls that already ran - stays persistable.
+func NormalizeToolArgs(raw []byte) json.RawMessage {
+	if raw == nil || json.Valid(raw) {
+		return json.RawMessage(raw)
+	}
+	quoted, err := json.Marshal(string(raw))
+	if err != nil { // unreachable: marshaling a string cannot fail
+		return json.RawMessage(`""`)
+	}
+	return quoted
 }
 
 // Message is MTClaw's single representation of one turn of a conversation.
