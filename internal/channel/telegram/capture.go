@@ -14,18 +14,6 @@ type Sender struct {
 	Username string
 }
 
-// CaptureSenders long-polls token's bot for the full window and returns
-// every distinct sender who messaged it during that window, in first-seen
-// order. It is `mtclaw onboard`'s Telegram user-ID capture step: whoever
-// messages the bot during this window is a candidate owner of
-// channels.telegram.allow_from, so this collects every sender across the
-// whole window rather than returning on the first message - a second,
-// later sender is exactly the case onboard needs to surface, not race
-// past. The caller is responsible for getting explicit on-screen
-// confirmation before writing anything to config; CaptureSenders itself
-// never touches disk. apiBaseURL is normally cfg.Channels.Telegram.APIBaseURL;
-// onboard has no config to read one from yet, so it always passes "".
-
 // captureWindowGrace absorbs ordinary clock skew between this host and
 // Telegram's servers when comparing a message's second-resolution Date
 // against windowStart's cutoff - see captureWindowStart. A few seconds is
@@ -50,6 +38,17 @@ func captureWindowStart(now time.Time) time.Time {
 	return now.Truncate(time.Second).Add(-captureWindowGrace)
 }
 
+// CaptureSenders long-polls token's bot for the full window and returns
+// every distinct sender who messaged it during that window, in first-seen
+// order. It is `mtclaw onboard`'s Telegram user-ID capture step: whoever
+// messages the bot during this window is a candidate owner of
+// channels.telegram.allow_from, so this collects every sender across the
+// whole window rather than returning on the first message - a second,
+// later sender is exactly the case onboard needs to surface, not race
+// past. The caller is responsible for getting explicit on-screen
+// confirmation before writing anything to config; CaptureSenders itself
+// never touches disk. apiBaseURL is normally cfg.Channels.Telegram.APIBaseURL;
+// onboard has no config to read one from yet, so it always passes "".
 func CaptureSenders(ctx context.Context, token, apiBaseURL string, window time.Duration) ([]Sender, error) {
 	bot, err := oneShotBot(token, apiBaseURL)
 	if err != nil {

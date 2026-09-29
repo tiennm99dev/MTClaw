@@ -167,8 +167,8 @@ func TestScheduler_MissedRun_NotReplayed(t *testing.T) {
 // process whose own ticker fires late counts as a missed tick) -----------
 
 // TestScheduler_TickWithCatchUp_SmallGapFiresOnlyTheArrivingTick proves
-// ordinary ticker jitter (well under missedTickThreshold) never triggers
-// catch-up - only the arriving tick's own minute fires.
+// ordinary wake jitter (the very next minute) never triggers catch-up - only
+// the arriving tick's own minute fires.
 func TestScheduler_TickWithCatchUp_SmallGapFiresOnlyTheArrivingTick(t *testing.T) {
 	st := newTestStore(t)
 	fe := &fakeEnqueue{autoComplete: true}
@@ -182,7 +182,7 @@ func TestScheduler_TickWithCatchUp_SmallGapFiresOnlyTheArrivingTick(t *testing.T
 }
 
 // TestScheduler_TickWithCatchUp_LargeGapFiresSkippedMinutes proves a gap
-// past missedTickThreshold evaluates every whole minute skipped in between,
+// of several minutes evaluates every whole minute skipped in between,
 // not just the arriving tick's own minute - the actual catch-up behavior a
 // delayed ticker (host suspend, a long GC pause) needs.
 func TestScheduler_TickWithCatchUp_LargeGapFiresSkippedMinutes(t *testing.T) {
@@ -228,10 +228,10 @@ func TestScheduler_TickWithCatchUp_LogsAWarningOnlyWhenCatchingUp(t *testing.T) 
 
 	t0 := time.Date(2024, 6, 1, 8, 0, 0, 0, time.UTC)
 	s.tickWithCatchUp(t0, t0.Add(-10*time.Second))
-	assert.NotContains(t, buf.String(), "missed tick")
+	assert.NotContains(t, buf.String(), "missed minutes")
 
 	s.tickWithCatchUp(t0.Add(5*time.Minute), t0)
-	assert.Contains(t, buf.String(), "missed tick")
+	assert.Contains(t, buf.String(), "missed minutes")
 }
 
 // TestScheduler_TickWithCatchUp_MonotonicReadingsStillDetectTheGap proves
@@ -286,6 +286,55 @@ func TestScheduler_TickWithCatchUp_ReplaysRecentMinutesNotOldestOnes(t *testing.
 	}
 	assert.True(t, fired["job:recent"], "the minute due 3 minutes ago must fire")
 	assert.False(t, fired["job:stale"], "the minute due 2 hours ago must stay outside the bounded catch-up window")
+}
+
+// TestScheduler_TickWithCatchUp_MinuteStraddledByWakePhaseIsEvaluated proves
+// a wake phase sitting just before a minute boundary cannot swallow a whole
+// minute: 10:00:59.999 to 10:02:00.003 is only 60.004s apart, but minute
+// 10:01 lies between them and its job must still fire.
+func TestScheduler_TickWithCatchUp_MinuteStraddledByWakePhaseIsEvaluated(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("ten-oh-one", "1 10 * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	last := time.Date(2024, 6, 1, 10, 0, 59, 999_000_000, time.UTC)
+	now := time.Date(2024, 6, 1, 10, 2, 0, 3_000_000, time.UTC)
+	got := s.tickWithCatchUp(now, last)
+
+	assert.Equal(t, 1, fe.count(), "minute 10:01 was never woken on, but it must still be evaluated")
+	assert.Equal(t, time.Date(2024, 6, 1, 10, 2, 0, 0, time.UTC), got, "the new last-evaluated marker is the arriving minute")
+}
+
+// TestScheduler_TickWithCatchUp_LateWakeWithinMinuteStillFires proves a wake
+// a few seconds into its minute (a slow previous evaluation) still finds
+// that minute's job due.
+func TestScheduler_TickWithCatchUp_LateWakeWithinMinuteStillFires(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("ten-oh-two", "2 10 * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	last := time.Date(2024, 6, 1, 10, 1, 0, 0, time.UTC)
+	s.tickWithCatchUp(time.Date(2024, 6, 1, 10, 2, 3, 0, time.UTC), last)
+
+	assert.Equal(t, 1, fe.count())
+}
+
+// TestScheduler_TickWithCatchUp_NotPastLastEvaluatedDoesNothing proves an
+// early wake, or a wall clock stepped backwards, evaluates nothing and
+// keeps the marker where it was.
+func TestScheduler_TickWithCatchUp_NotPastLastEvaluatedDoesNothing(t *testing.T) {
+	st := newTestStore(t)
+	fe := &fakeEnqueue{autoComplete: true}
+	jobs := []Job{testJob("every-minute", "* * * * *")}
+	s := New(jobs, time.UTC, st.CronRuns(), st.Sessions(), fe.enqueue, discardLogger(), nil)
+
+	last := time.Date(2024, 6, 1, 10, 5, 0, 0, time.UTC)
+	got := s.tickWithCatchUp(time.Date(2024, 6, 1, 10, 4, 59, 900_000_000, time.UTC), last)
+
+	assert.Equal(t, 0, fe.count())
+	assert.Equal(t, last, got)
 }
 
 // --- overlap guard -----------------------------------------------------------

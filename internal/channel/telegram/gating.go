@@ -43,14 +43,7 @@ func decide(cfg config.TelegramConfig, botUsername string, botID int64, msg *tel
 			return false, "", "no group entry for this chat"
 		}
 
-		allow := group.AllowFrom
-		if len(allow) == 0 {
-			// An empty group allow_from inherits the channel-level list
-			// rather than granting access to everyone (see
-			// TelegramGroupConfig's doc comment).
-			allow = cfg.AllowFrom
-		}
-		if !containsID(allow, fromID) {
+		if !containsID(groupAllowFrom(cfg, group), fromID) {
 			return false, "", "sender not in group (or channel) allow_from"
 		}
 
@@ -103,6 +96,18 @@ func lookupGroup(groups map[string]config.TelegramGroupConfig, chatID int64) (co
 		return g, true
 	}
 	return config.TelegramGroupConfig{}, false
+}
+
+// groupAllowFrom is the allowlist that gates group: its own allow_from, or
+// the channel-level list when its own is empty - an empty group list
+// inherits rather than granting access to everyone (see
+// TelegramGroupConfig's doc comment). The message gate and the approval
+// gate both resolve through this, so they cannot drift apart.
+func groupAllowFrom(cfg config.TelegramConfig, group config.TelegramGroupConfig) []int64 {
+	if len(group.AllowFrom) == 0 {
+		return cfg.AllowFrom
+	}
+	return group.AllowFrom
 }
 
 // detectMention reports whether msg addresses the bot: a reply to one of

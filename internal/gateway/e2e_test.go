@@ -162,8 +162,8 @@ func e2eExecConfig(mode, workspace string) config.ExecConfig {
 // approval addressed to chatID, returning its nonce id and the message id
 // holding its inline buttons. There is no store.ApprovalStore method for
 // "the current pending row for this chat" (by design: it is Approver's own
-// bookkeeping, not a query production code needs), so this is the "direct
-// query" the phase's own spec calls for - never the inline keyboard, which
+// bookkeeping, not a query production code needs), so the test queries the
+// database directly - never the inline keyboard, which
 // stays test-inspectable separately via extractCallbackData for the
 // two-buttons assertion.
 func waitForPendingApproval(t *testing.T, dbPath string, chatID int64) (id string, promptMessageID int) {

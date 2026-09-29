@@ -144,6 +144,16 @@ func TestSplit_ShortTextWithFenceIsUntouched(t *testing.T) {
 	assert.Equal(t, text, chunks[0])
 }
 
+// TestSplit_FencesSeparatedByBlankLineShareOneChunk proves a blank line
+// between two short fenced blocks is not a chunk boundary: nothing needs
+// the split, and every extra message costs a send and rate-limit headroom.
+func TestSplit_FencesSeparatedByBlankLineShareOneChunk(t *testing.T) {
+	text := "```a\nx\n```\n\n```b\ny\n```"
+	chunks := split(text, DefaultChunkLimit)
+	require.Len(t, chunks, 1)
+	assert.Equal(t, text, chunks[0], "the blank line must survive inside the shared chunk")
+}
+
 // TestSafeRuneCut_NeverSplitsMultibyteRune proves a limit landing anywhere
 // inside a multi-byte rune rounds down to a full-rune boundary, never
 // emitting an incomplete (invalid) rune prefix, however far back that

@@ -76,15 +76,23 @@ type worker struct {
 	// fn will not race a turn already in flight.
 	control chan func()
 
-	// closing is set, under dispatcher.mu, by the worker itself right
-	// before it deletes itself from dispatcher.workers and returns. The
-	// dispatcher checks it (also under dispatcher.mu) to tell an about-to-
-	// exit worker apart from a live one - see dispatch's doc comment for
-	// why this must be one mutex, not two independent decisions.
-	closing bool
-	// cancel is the in-flight turn's CancelFunc, non-nil only while a turn
-	// is actually running. /stop reads and calls it under dispatcher.mu.
+	// cancel is the in-flight turn's CancelFunc, non-nil from the moment the
+	// worker dequeues a message until its turn returns. It is set in the
+	// same dispatcher.mu critical section as the dequeue, so a /stop or /new
+	// that runs under the lock either sees the turn or sees the message
+	// still queued - never a message already taken but not yet registered.
 	cancel context.CancelFunc
+	// pendingControl counts runOnWorker callers that have claimed this
+	// worker but whose fn the worker has not started yet. Guarded by
+	// dispatcher.mu. While it is above zero the worker drops (rather than
+	// runs) any message it dequeues, and refuses to reap itself, so fn can
+	// neither be preceded by a turn nor sent to a worker that has exited.
+	pendingControl int
+	// lastReply is closed once the reply goroutine spawned for this
+	// worker's most recent turn has finished; the next reply waits on it so
+	// replies reach the chat in turn order. Touched only by the worker
+	// goroutine.
+	lastReply chan struct{}
 	// busyNotified is set under dispatcher.mu the first time this worker's
 	// queue overflows, and cleared the next time it actually dequeues a
 	// message - so a burst of overflowing messages gets exactly one "still
@@ -206,13 +214,12 @@ func (d *dispatcher) pump(ctx context.Context, in <-chan channel.Inbound) {
 // the *same* mutex: dispatch holds d.mu across both the lookup and the
 // non-blocking send (safe - a buffered non-blocking send never blocks), and
 // runWorker's idle-fire branch takes d.mu, re-checks its queue is empty,
-// sets closing, deletes itself from the map, and only then releases and
-// returns. Whichever side gets the lock first wins outright: if dispatch
+// deletes itself from the map, and only then releases and returns. Whichever side gets the lock first wins outright: if dispatch
 // wins, the message is enqueued to a worker that has not yet decided to
 // exit (its own subsequent re-check under the lock will see the queue is
 // non-empty and abort the reap); if the worker wins, it is already gone from
-// the map by the time dispatch gets the lock, so `closing`/`!ok` is treated
-// as a miss and a fresh worker is spawned instead.
+// the map by the time dispatch gets the lock, so `!ok` is treated as a miss
+// and a fresh worker is spawned instead.
 func (d *dispatcher) dispatch(in channel.Inbound) {
 	in = wrapOnDone(in)
 	key := sessionKey(in.Channel, in.ChatID, in.ThreadID)
@@ -224,7 +231,7 @@ func (d *dispatcher) dispatch(in channel.Inbound) {
 		return
 	}
 	w, ok := d.workers[key]
-	if !ok || w.closing {
+	if !ok {
 		w = d.spawnWorkerLocked(key)
 	}
 	sent := trySend(w.queue, in)
@@ -321,11 +328,18 @@ func (d *dispatcher) runWorker(w *worker) {
 			if !ok {
 				return
 			}
+			// Dequeue and cancel registration are one critical section: a
+			// /stop or /new taking d.mu after this point sees the turn's
+			// cancel func, and one taking it before either cancelled the
+			// worker's previous turn or set pendingControl, in which case
+			// this message is dropped instead of run.
 			d.mu.Lock()
 			w.busyNotified = false
-			d.mu.Unlock()
-
-			if err := d.rootCtx.Err(); err != nil {
+			var dropErr error
+			var turnCtx context.Context
+			var cancel context.CancelFunc
+			switch {
+			case d.rootCtx.Err() != nil:
 				// select can pick a ready queue receive over a ready
 				// rootCtx.Done() case at random (Go's own select semantics),
 				// so a message already queued when shutdown begins can reach
@@ -333,15 +347,24 @@ func (d *dispatcher) runWorker(w *worker) {
 				// Running it would only produce a canceled-context error out
 				// of Ensure; report the same terminal signal
 				// drainQueueOnDone gives a never-dequeued message, with no
-				// log noise for what is normal shutdown behavior, and keep
-				// draining the rest of the queue instead of returning
-				// immediately.
-				callOnDone(in, err)
+				// log noise for what is normal shutdown behavior.
+				dropErr = d.rootCtx.Err()
+			case w.pendingControl > 0:
+				// A /new is waiting for this worker: this message would run
+				// against history it is about to delete.
+				dropErr = context.Canceled
+			default:
+				turnCtx, cancel = d.newTurnContext(in)
+				w.cancel = cancel
+			}
+			d.mu.Unlock()
+			if dropErr != nil {
+				callOnDone(in, dropErr)
 				continue
 			}
 
 			drainTimer(timer)
-			d.runTurn(w, in)
+			d.runTurn(w, in, turnCtx, cancel)
 			timer.Reset(d.idleTimeout)
 
 		case fn := <-w.control:
@@ -349,32 +372,31 @@ func (d *dispatcher) runWorker(w *worker) {
 
 		case <-timer.C:
 			d.mu.Lock()
-			if len(w.queue) > 0 {
-				// A message landed between the timer firing and this
-				// goroutine winning the lock (select can pick a fired timer
-				// over a ready channel receive even when both are ready).
-				// Do not reap; go back around and let the message case run.
+			if len(w.queue) > 0 || w.pendingControl > 0 {
+				// A message landed (or a runOnWorker caller claimed this
+				// worker) between the timer firing and this goroutine
+				// winning the lock (select can pick a fired timer over a
+				// ready channel receive even when both are ready). Do not
+				// reap; go back around and let that case run.
 				d.mu.Unlock()
 				timer.Reset(d.idleTimeout)
 				continue
 			}
-			w.closing = true
 			delete(d.workers, w.key)
 			d.mu.Unlock()
 			return
 
 		case <-d.rootCtx.Done():
-			// Mirror the idle-reap branch's bookkeeping: mark closing and
-			// remove this worker from the map under d.mu before draining,
-			// so a dispatch racing this exit sees `closing`/`!ok` (a miss)
-			// and spawns a fresh worker instead of enqueuing into a queue
+			// Mirror the idle-reap branch's bookkeeping: remove this worker
+			// from the map under d.mu before draining, so a dispatch racing
+			// this exit sees `!ok` (a miss) and spawns a fresh worker
+			// instead of enqueuing into a queue
 			// nothing will ever drain. The separate wg.Add/wg.Wait race -
 			// dispatch spawning a brand new worker after every existing one
 			// has already exited and drain's wg.Wait() has begun unblocking
 			// - is closed by dispatch's own d.closed check under d.mu, not
 			// by this branch; see closeForShutdown.
 			d.mu.Lock()
-			w.closing = true
 			delete(d.workers, w.key)
 			d.mu.Unlock()
 			d.drainQueueOnDone(w, d.rootCtx.Err())
@@ -445,22 +467,43 @@ func (d *dispatcher) cancelSession(key string) bool {
 // without a queued message it dropped in the meantime going on to run
 // against the history it just deleted.
 func (d *dispatcher) runOnWorker(ctx context.Context, key string, fn func()) error {
-	d.cancelSession(key)
-
 	d.mu.Lock()
 	if d.closed || d.rootCtx.Err() != nil {
 		d.mu.Unlock()
 		return d.rootCtx.Err()
 	}
 	w, ok := d.workers[key]
-	if !ok || w.closing {
+	if !ok {
 		w = d.spawnWorkerLocked(key)
 	}
+	// Claim the worker and cancel its turn in the same critical section as
+	// the lookup: the worker cannot reap itself, and cannot dequeue a
+	// message it would run, between here and picking fn up.
+	w.pendingControl++
+	if w.cancel != nil {
+		w.cancel()
+	}
 	d.mu.Unlock()
+
+	// release drops the claim exactly once, whether the worker picked fn up
+	// or this call gave up first.
+	var released bool
+	release := func() {
+		d.mu.Lock()
+		if !released {
+			released = true
+			w.pendingControl--
+		}
+		d.mu.Unlock()
+	}
+	defer release()
 
 	done := make(chan struct{})
 	wrapped := func() {
 		defer close(done)
+		// The worker is busy running fn from here on, so it can dequeue
+		// nothing else until fn returns.
+		release()
 		d.drainQueueOnDone(w, context.Canceled)
 		fn()
 	}
@@ -479,26 +522,25 @@ func (d *dispatcher) runOnWorker(ctx context.Context, key string, fn func()) err
 	}
 }
 
+// newTurnContext derives a turn's context from rootCtx, bounded by
+// in.Timeout when set.
+func (d *dispatcher) newTurnContext(in channel.Inbound) (context.Context, context.CancelFunc) {
+	if in.Timeout > 0 {
+		return context.WithTimeout(d.rootCtx, in.Timeout)
+	}
+	return context.WithCancel(d.rootCtx)
+}
+
 // runTurn runs one turn end to end and delivers the reply. It never returns
 // an error itself: every failure mode (session lookup, the turn, the send)
 // is logged and, where it affects the user, turned into a chat reply
 // instead.
-func (d *dispatcher) runTurn(w *worker, in channel.Inbound) {
-	var turnCtx context.Context
-	var cancel context.CancelFunc
-	if in.Timeout > 0 {
-		turnCtx, cancel = context.WithTimeout(d.rootCtx, in.Timeout)
-	} else {
-		turnCtx, cancel = context.WithCancel(d.rootCtx)
-	}
-	// w.cancel must be registered before the semaphore wait below: /stop can
-	// arrive while this turn is still queued behind the global concurrency
-	// cap, and w.cancel has to be set by then, or /stop finds it nil,
-	// reports "nothing running", and the turn still goes on to run once a
-	// slot frees up.
-	d.mu.Lock()
-	w.cancel = cancel
-	d.mu.Unlock()
+//
+// turnCtx and cancel come from newTurnContext, and w.cancel was already set
+// to cancel by runWorker in the same critical section that dequeued in - so
+// /stop finds the turn even while it is still queued behind the global
+// concurrency cap below.
+func (d *dispatcher) runTurn(w *worker, in channel.Inbound, turnCtx context.Context, cancel context.CancelFunc) {
 	defer func() {
 		cancel()
 		d.mu.Lock()
@@ -557,15 +599,31 @@ func (d *dispatcher) runTurn(w *worker, in channel.Inbound) {
 	// drainReplies gives its own bounded wait after wg itself has drained -
 	// otherwise a reply produced right at shutdown is dropped the instant
 	// Run returns, not merely delayed past the drain deadline.
+	//
+	// Chained per worker instead: reply N+1 waits for reply N to finish, so
+	// a long multi-chunk answer is never overtaken by the next turn's
+	// shorter one.
+	prev := w.lastReply
+	done := make(chan struct{})
+	w.lastReply = done
 	d.replyWG.Add(1)
-	go d.reply(in, deliverChatID, deliverThreadID, result)
+	go d.reply(prev, done, in, deliverChatID, deliverThreadID, result)
 }
 
 // reply delivers a turn's result, applying the same NoReply/error rules
 // regardless of whether the turn's origin (in) and its delivery target
 // (chatID/threadID, possibly overridden by in.DeliverTo) are the same chat.
-func (d *dispatcher) reply(in channel.Inbound, chatID, threadID string, result agent.Result) {
+//
+// It first waits for prev (the session's previous reply, nil for the first)
+// and closes done when finished, whichever way it returns. The wait is
+// unconditional because every reply is itself bounded by its own send
+// timeout, so the chain always unwinds.
+func (d *dispatcher) reply(prev <-chan struct{}, done chan<- struct{}, in channel.Inbound, chatID, threadID string, result agent.Result) {
 	defer d.replyWG.Done()
+	defer close(done)
+	if prev != nil {
+		<-prev
+	}
 	if d.channel == nil || result.NoReply {
 		return
 	}

@@ -772,7 +772,7 @@ func TestDispatch_DeliverTo_RoutesReplyToOverrideNotOrigin(t *testing.T) {
 		Channel:   "cron",
 		ChatID:    "job:morning-briefing",
 		Text:      "summarize today",
-		DeliverTo: channel.DeliverTarget{Channel: "telegram", ChatID: "999888"},
+		DeliverTo: channel.DeliverTarget{ChatID: "999888"},
 	}
 	d.dispatch(in)
 
@@ -799,7 +799,7 @@ func TestDispatch_NoReply_WithDeliverTo_SendsNothing(t *testing.T) {
 		Channel:   "cron",
 		ChatID:    "job:quiet-job",
 		Text:      "check something",
-		DeliverTo: channel.DeliverTarget{Channel: "telegram", ChatID: "999888"},
+		DeliverTo: channel.DeliverTarget{ChatID: "999888"},
 		OnDone:    func(error) { close(done) },
 	}
 	d.dispatch(in)
@@ -883,7 +883,7 @@ func TestDispatch_CronJobTimeout_DeliversTimeoutNotice(t *testing.T) {
 		ChatID:    "job:slow",
 		Text:      "do it",
 		Timeout:   20 * time.Millisecond,
-		DeliverTo: channel.DeliverTarget{Channel: "telegram", ChatID: "999888"},
+		DeliverTo: channel.DeliverTarget{ChatID: "999888"},
 	}
 	d.dispatch(in)
 
@@ -915,7 +915,7 @@ func TestDispatch_CronShutdownCancel_StaysSilent(t *testing.T) {
 		ChatID:    "job:slow",
 		Text:      "do it",
 		Timeout:   time.Minute,
-		DeliverTo: channel.DeliverTarget{Channel: "telegram", ChatID: "999888"},
+		DeliverTo: channel.DeliverTarget{ChatID: "999888"},
 	}
 	d.dispatch(in)
 	<-started
@@ -924,4 +924,108 @@ func TestDispatch_CronShutdownCancel_StaysSilent(t *testing.T) {
 	// Give runTurn a moment to finish and (not) reply.
 	time.Sleep(50 * time.Millisecond)
 	assert.Empty(t, ch.sentSnapshot(), "a shutdown/interactive cancellation must stay silent, not just a job timeout")
+}
+
+// --- /new against a message the worker has just dequeued ---------------------
+
+// TestRunOnWorker_MessageJustDequeuedIsCanceledNotAwaited proves a control
+// func (the /new reset) issued right after a message was handed to a parked
+// worker cancels that turn instead of waiting out its whole run. The worker
+// dequeues and registers the turn's cancel func in one critical section, so
+// runOnWorker either sees the turn to cancel or sees the message still
+// queued and drops it.
+func TestRunOnWorker_MessageJustDequeuedIsCanceledNotAwaited(t *testing.T) {
+	runner := &fakeRunner{fn: func(ctx context.Context, sessionID, userText, messageID string, onProgress agent.Progress) agent.Result {
+		if userText == "warm" {
+			return agent.Result{NoReply: true}
+		}
+		<-ctx.Done() // a turn that only ends when canceled
+		return agent.Result{Err: ctx.Err(), NoReply: true}
+	}}
+	d := newTestDispatcher(t, runner, &fakeChannel{}, time.Minute, 4)
+
+	for i := 0; i < 30; i++ {
+		chat := "reset-race-" + strconv.Itoa(i)
+		warmed := make(chan struct{})
+		warm := inboundTo(chat, "warm")
+		warm.OnDone = func(error) { close(warmed) }
+		d.dispatch(warm)
+		<-warmed
+		time.Sleep(time.Millisecond) // let the worker park in its select
+
+		d.dispatch(inboundTo(chat, "hello"))
+
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		ran := false
+		start := time.Now()
+		err := d.runOnWorker(ctx, sessionKey("telegram", chat, ""), func() { ran = true })
+		cancel()
+
+		require.NoError(t, err, "iteration %d: the reset must not wait for the uncanceled turn", i)
+		assert.True(t, ran)
+		assert.Less(t, time.Since(start), 500*time.Millisecond)
+	}
+}
+
+// TestRunOnWorker_PendingControlBlocksIdleReap proves a worker that a
+// runOnWorker caller has claimed does not reap itself before picking up the
+// caller's func - otherwise the caller blocks on a worker that is gone.
+func TestRunOnWorker_PendingControlBlocksIdleReap(t *testing.T) {
+	d := newTestDispatcher(t, &fakeRunner{fn: func(context.Context, string, string, string, agent.Progress) agent.Result {
+		return agent.Result{NoReply: true}
+	}}, &fakeChannel{}, 20*time.Millisecond, 4)
+
+	key := sessionKey("telegram", "claimed", "")
+	d.mu.Lock()
+	w := d.spawnWorkerLocked(key)
+	w.pendingControl++
+	d.mu.Unlock()
+
+	time.Sleep(150 * time.Millisecond) // several idle timeouts
+	d.mu.Lock()
+	still := d.workers[key] == w
+	w.pendingControl--
+	d.mu.Unlock()
+	assert.True(t, still, "a worker with a pending control caller must not reap itself")
+
+	waitCond(t, func() bool {
+		d.mu.Lock()
+		defer d.mu.Unlock()
+		_, ok := d.workers[key]
+		return !ok
+	}, time.Second)
+}
+
+// --- reply ordering ----------------------------------------------------------
+
+// orderChannel records the order Send calls complete in, and makes sends of
+// slowText take a while.
+type orderChannel struct {
+	fakeChannel
+	slowText string
+}
+
+func (o *orderChannel) Send(ctx context.Context, chatID, threadID, text, replyTo string) error {
+	if text == o.slowText {
+		time.Sleep(300 * time.Millisecond)
+	}
+	return o.fakeChannel.Send(ctx, chatID, threadID, text, replyTo)
+}
+
+// TestDispatch_RepliesArriveInTurnOrder proves a slow reply is not overtaken
+// by the next turn's faster one in the same session.
+func TestDispatch_RepliesArriveInTurnOrder(t *testing.T) {
+	runner := &fakeRunner{fn: func(ctx context.Context, sessionID, userText, messageID string, onProgress agent.Progress) agent.Result {
+		return agent.Result{Text: userText}
+	}}
+	ch := &orderChannel{slowText: "long answer"}
+	d := newTestDispatcher(t, runner, ch, time.Minute, 4)
+
+	d.dispatch(inboundTo("ordered", "long answer"))
+	d.dispatch(inboundTo("ordered", "short answer"))
+
+	waitCond(t, func() bool { return len(ch.sentSnapshot()) == 2 }, 3*time.Second)
+	sent := ch.sentSnapshot()
+	assert.Equal(t, "long answer", sent[0].text)
+	assert.Equal(t, "short answer", sent[1].text)
 }

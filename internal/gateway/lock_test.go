@@ -29,7 +29,7 @@ func TestAcquire_SecondCallFailsWhileHeld(t *testing.T) {
 
 	release, err := Acquire(path)
 	require.NoError(t, err)
-	defer release()
+	defer func() { _ = release() }()
 
 	_, err2 := Acquire(path)
 	require.Error(t, err2)
@@ -46,7 +46,7 @@ func TestAcquire_ExistingFileContentIsIrrelevant(t *testing.T) {
 
 	release, err := Acquire(path)
 	require.NoError(t, err, "existing file content must never block acquiring the lock")
-	defer release()
+	defer func() { _ = release() }()
 
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
@@ -85,7 +85,7 @@ func TestHeld_LiveProcess_ReportsHeld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 	release, err := Acquire(path)
 	require.NoError(t, err)
-	defer release()
+	defer func() { _ = release() }()
 
 	pid, held, err := Held(path)
 	require.NoError(t, err)
@@ -117,7 +117,7 @@ func TestHeld_ReadOnlyLockFile_StillReportsHeld(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 	release, err := Acquire(path)
 	require.NoError(t, err)
-	defer release()
+	defer func() { _ = release() }()
 
 	require.NoError(t, os.Chmod(path, 0o400))
 
@@ -131,7 +131,7 @@ func TestHeld_NeverMutatesTheLockFile(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gateway.lock")
 	release, err := Acquire(path)
 	require.NoError(t, err)
-	defer release()
+	defer func() { _ = release() }()
 
 	before, err := os.ReadFile(path)
 	require.NoError(t, err)

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"os"
 	"syscall"
+	"time"
 )
 
 // Acquire opens (creating if necessary) path and takes an exclusive,
@@ -24,7 +25,12 @@ func Acquire(path string) (release func() error, err error) {
 		return nil, fmt.Errorf("gateway: open lock file %s: %w", path, err)
 	}
 
-	if flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); flockErr != nil {
+	held, flockErr := tryFlock(int(f.Fd()), syscall.LOCK_EX, acquireAttempts)
+	if flockErr != nil {
+		f.Close()
+		return nil, fmt.Errorf("gateway: lock file %s: %w", path, flockErr)
+	}
+	if held {
 		pid, _ := readLockPID(path)
 		f.Close()
 		if pid > 0 {
@@ -80,9 +86,48 @@ func Held(path string) (pid int, held bool, err error) {
 	defer f.Close()
 
 	pid, _ = readLockPID(path)
-	if flockErr := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); flockErr != nil {
+	// A shared probe lock: it conflicts with the gateway's exclusive lock
+	// (reporting held) but not with another probe, so two concurrent
+	// `doctor`/`cron run` calls never see each other as a holder.
+	probeHeld, flockErr := tryFlock(int(f.Fd()), syscall.LOCK_SH, 1)
+	if flockErr != nil {
+		return 0, false, fmt.Errorf("gateway: probe lock file %s: %w", path, flockErr)
+	}
+	if probeHeld {
 		return pid, true, nil
 	}
 	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
 	return pid, false, nil
+}
+
+// acquireAttempts and acquireRetryDelay bound how long Acquire waits out a
+// momentary conflict - typically another process's Held probe, which takes
+// its lock for an instant - before concluding a real holder exists: about
+// 100ms in total.
+const (
+	acquireAttempts   = 5
+	acquireRetryDelay = 25 * time.Millisecond
+)
+
+// tryFlock attempts a non-blocking flock of kind (LOCK_EX or LOCK_SH) up to
+// attempts times, sleeping acquireRetryDelay between tries. held is true
+// only when the kernel reported EWOULDBLOCK on every try, meaning another
+// open file description holds a conflicting lock. Any other failure (ENOLCK
+// on a network filesystem, EBADF, ...) is returned as err: it says nothing
+// about a peer, so reporting it as "another instance" would misdirect the
+// user.
+func tryFlock(fd, kind, attempts int) (held bool, err error) {
+	for i := 0; i < attempts; i++ {
+		if i > 0 {
+			time.Sleep(acquireRetryDelay)
+		}
+		err = syscall.Flock(fd, kind|syscall.LOCK_NB)
+		if err == nil {
+			return false, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) {
+			return false, err
+		}
+	}
+	return true, nil
 }

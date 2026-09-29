@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -59,3 +60,40 @@ func TestProgressReporter_TimerFiresAfterCtxDone_SendsNothing(t *testing.T) {
 
 	assert.Empty(t, ch.sentSnapshot(), "no slow-tool notice must be sent once ctx is already done")
 }
+
+// TestProgressReporter_NoticeNeverSentAfterStopReturns proves the slow-tool
+// notice cannot land after stop() has returned (and so after the turn's
+// reply is on its way): stop waits out a notice already in flight and
+// suppresses any that has not started. The timer is set to fire right as
+// stop runs, so the callback and stop race on every iteration.
+func TestProgressReporter_NoticeNeverSentAfterStopReturns(t *testing.T) {
+	for i := 0; i < 300; i++ {
+		ch := &stopOrderChannel{}
+		p := newProgressReporter(context.Background(), ch, "100", "", testLog())
+		p.slowNoticeDelay = 50 * time.Microsecond
+		p.start()
+		p.onEvent(agent.Event{Kind: agent.EventToolStarted, ToolCallID: "call-1", ToolName: "exec"})
+
+		time.Sleep(50 * time.Microsecond)
+		p.stop()
+		ch.stopReturned.Store(true)
+
+		time.Sleep(time.Millisecond) // let a leaked callback run
+		require.False(t, ch.sentAfterStop.Load(), "iteration %d: a notice was sent after stop returned", i)
+	}
+}
+
+// stopOrderChannel flags any Send that begins after stopReturned is set.
+type stopOrderChannel struct {
+	stopReturned  atomic.Bool
+	sentAfterStop atomic.Bool
+}
+
+func (c *stopOrderChannel) Send(ctx context.Context, _, _, _, _ string) error {
+	if c.stopReturned.Load() {
+		c.sentAfterStop.Store(true)
+	}
+	return nil
+}
+
+func (c *stopOrderChannel) SendTyping(context.Context, string, string) error { return nil }

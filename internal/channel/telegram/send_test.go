@@ -1,9 +1,15 @@
 package telegram
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -106,27 +112,6 @@ func TestSendOne_400WithoutParseModeIsNotRetried(t *testing.T) {
 	assert.Equal(t, 1, calls, "a 400 with no parse_mode to drop must not be retried at all")
 }
 
-func TestSendOne_RetriesOnceOn5xxThenSucceeds(t *testing.T) {
-	calls := 0
-	api := &fakeBotAPI{
-		sendFunc: func(params *telego.SendMessageParams) (*telego.Message, error) {
-			calls++
-			if calls == 1 {
-				return nil, &ta.Error{ErrorCode: 500, Description: "Internal Server Error"}
-			}
-			return &telego.Message{MessageID: 1}, nil
-		},
-	}
-
-	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
-	start := time.Now()
-	msg, err := sendOne(context.Background(), api, params, "hi")
-	require.NoError(t, err)
-	require.NotNil(t, msg)
-	assert.Equal(t, 2, calls, "a 5xx gets exactly one bounded retry")
-	assert.GreaterOrEqual(t, time.Since(start), transientRetryDelay)
-}
-
 // TestSendOne_NetworkErrorIsNotRetried proves a raw network error (unlike a
 // 5xx, which Telegram never accepted) is not retried: Telegram may have
 // already delivered the message before the error surfaced, and Telegram has
@@ -147,26 +132,11 @@ func TestSendOne_NetworkErrorIsNotRetried(t *testing.T) {
 	assert.Equal(t, 1, calls, "a non-API network error must not be retried - Telegram may have already delivered the message")
 }
 
-func TestSendOne_GivesUpAfterOneTransientRetry(t *testing.T) {
-	calls := 0
-	api := &fakeBotAPI{
-		sendFunc: func(params *telego.SendMessageParams) (*telego.Message, error) {
-			calls++
-			return nil, &ta.Error{ErrorCode: 503, Description: "Service Unavailable"}
-		},
-	}
-
-	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
-	_, err := sendOne(context.Background(), api, params, "hi")
-	require.Error(t, err)
-	assert.Equal(t, 2, calls, "exactly one retry, not a retry storm against a persistently failing backend")
-}
-
 // --- Channel.Send thread routing / reply-without-target -------------------
 
 func TestSendText_CarriesMessageThreadID(t *testing.T) {
 	api := &fakeBotAPI{}
-	err := sendText(context.Background(), api, "100", "42", "hello", "")
+	err := sendText(context.Background(), api, discardLog(), "100", "42", "hello", "")
 	require.NoError(t, err)
 
 	params := api.lastSent()
@@ -176,7 +146,7 @@ func TestSendText_CarriesMessageThreadID(t *testing.T) {
 
 func TestSendText_EmptyThreadIDTargetsGeneralTimeline(t *testing.T) {
 	api := &fakeBotAPI{}
-	err := sendText(context.Background(), api, "100", "", "hello", "")
+	err := sendText(context.Background(), api, discardLog(), "100", "", "hello", "")
 	require.NoError(t, err)
 
 	params := api.lastSent()
@@ -188,7 +158,7 @@ func TestSendText_EmptyThreadIDTargetsGeneralTimeline(t *testing.T) {
 // HTML (the headline decision), not MarkdownV2.
 func TestSendText_UsesHTMLParseMode(t *testing.T) {
 	api := &fakeBotAPI{}
-	require.NoError(t, sendText(context.Background(), api, "100", "", "**bold**", ""))
+	require.NoError(t, sendText(context.Background(), api, discardLog(), "100", "", "**bold**", ""))
 
 	params := api.lastSent()
 	require.NotNil(t, params)
@@ -202,7 +172,7 @@ func TestSendText_UsesHTMLParseMode(t *testing.T) {
 // found".
 func TestSendText_ReplyAllowsSendingWithoutReply(t *testing.T) {
 	api := &fakeBotAPI{}
-	require.NoError(t, sendText(context.Background(), api, "100", "", "hello", "555"))
+	require.NoError(t, sendText(context.Background(), api, discardLog(), "100", "", "hello", "555"))
 
 	params := api.lastSent()
 	require.NotNil(t, params)
@@ -382,4 +352,197 @@ func TestHardCutHTMLParts_EscapeInflationNeverCrossesLimit(t *testing.T) {
 		plainTotal.WriteString(p.plain)
 	}
 	assert.Equal(t, chunk, plainTotal.String())
+}
+
+// --- real-transport 5xx retry ----------------------------------------------
+
+// testBotToken satisfies telego's token format check; the httptest servers
+// below accept any token.
+const testBotToken = "123456789:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+const okMessageJSON = `{"ok":true,"result":{"message_id":7,"date":1,"chat":{"id":100,"type":"private"}}}`
+
+// newTestBot builds a real *telego.Bot through newBot, pointed at an
+// httptest server running handler, so the production transport (and its
+// error typing) is what the test exercises.
+func newTestBot(t *testing.T, handler http.HandlerFunc) *telego.Bot {
+	t.Helper()
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	bot, err := newBot(testBotToken, srv.URL, telego.WithDiscardLogger())
+	require.NoError(t, err)
+	return bot
+}
+
+// TestSendOne_RetriesOnceOn5xxThenSucceeds drives sendOne through a real
+// bot against a server answering 502 then 200. A hand-built *ta.Error would
+// pass even if the production transport never produced one.
+func TestSendOne_RetriesOnceOn5xxThenSucceeds(t *testing.T) {
+	var calls atomic.Int32
+	bot := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if calls.Add(1) == 1 {
+			w.WriteHeader(http.StatusBadGateway)
+			_, _ = w.Write([]byte(`{"ok":false,"error_code":502,"description":"Bad Gateway"}`))
+			return
+		}
+		_, _ = w.Write([]byte(okMessageJSON))
+	})
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	start := time.Now()
+	msg, err := sendOne(context.Background(), bot, params, "hi")
+	require.NoError(t, err)
+	require.NotNil(t, msg)
+	assert.Equal(t, int32(2), calls.Load(), "a 5xx gets exactly one bounded retry")
+	assert.GreaterOrEqual(t, time.Since(start), transientRetryDelay)
+}
+
+func TestSendOne_GivesUpAfterOneTransientRetry(t *testing.T) {
+	var calls atomic.Int32
+	bot := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	_, err := sendOne(context.Background(), bot, params, "hi")
+	require.Error(t, err)
+	var apiErr *ta.Error
+	require.ErrorAs(t, err, &apiErr, "a 5xx must surface as a typed API error")
+	assert.Equal(t, http.StatusServiceUnavailable, apiErr.ErrorCode)
+	assert.Equal(t, int32(2), calls.Load(), "exactly one retry, not a retry storm against a persistently failing backend")
+}
+
+// TestAPICaller_DecodesAPIErrorBodyOnNon5xx proves a 4xx keeps its decoded
+// JSON error (retry_after included), which the 429 handling depends on.
+func TestAPICaller_DecodesAPIErrorBodyOnNon5xx(t *testing.T) {
+	bot := newTestBot(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"ok":false,"error_code":429,"description":"Too Many Requests","parameters":{"retry_after":3}}`))
+	})
+
+	_, err := bot.SendMessage(context.Background(), &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"})
+	var apiErr *ta.Error
+	require.ErrorAs(t, err, &apiErr)
+	assert.Equal(t, http.StatusTooManyRequests, apiErr.ErrorCode)
+	require.NotNil(t, apiErr.Parameters)
+	assert.Equal(t, 3, apiErr.Parameters.RetryAfter)
+}
+
+// --- retry_after beyond the caller's deadline -------------------------------
+
+func TestSendOne_HonorsRetryAfterBeyondCallerDeadline(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(*telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			if calls == 1 {
+				return nil, &ta.Error{ErrorCode: 429, Parameters: &ta.ResponseParameters{RetryAfter: 1}}
+			}
+			return &telego.Message{MessageID: 1}, nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	msg, err := sendOne(ctx, api, params, "hi")
+	require.NoError(t, err, "a flood wait longer than the reply budget must extend the budget, not drop the reply")
+	require.NotNil(t, msg)
+	assert.Equal(t, 2, calls)
+}
+
+func TestSendOne_RetryAfterOverCapIsNotWaited(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(*telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			return nil, &ta.Error{ErrorCode: 429, Parameters: &ta.ResponseParameters{RetryAfter: int(maxRetryAfter/time.Second) + 1}}
+		},
+	}
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	start := time.Now()
+	_, err := sendOne(context.Background(), api, params, "hi")
+	require.Error(t, err)
+	assert.Equal(t, 1, calls)
+	assert.Less(t, time.Since(start), time.Second)
+}
+
+func TestSendOne_CancelDuringRetryAfterStopsWaiting(t *testing.T) {
+	api := &fakeBotAPI{
+		sendFunc: func(*telego.SendMessageParams) (*telego.Message, error) {
+			return nil, &ta.Error{ErrorCode: 429, Parameters: &ta.ResponseParameters{RetryAfter: 30}}
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(50*time.Millisecond, cancel)
+
+	params := &telego.SendMessageParams{ChatID: telego.ChatID{ID: 100}, Text: "hi"}
+	start := time.Now()
+	_, err := sendOne(ctx, api, params, "hi")
+	require.ErrorIs(t, err, context.Canceled)
+	assert.Less(t, time.Since(start), 2*time.Second)
+}
+
+// TestSendText_LaterChunksSurviveAnExtendedFloodWait proves the extended
+// deadline carries over to the chunks after the one that was rate limited.
+func TestSendText_LaterChunksSurviveAnExtendedFloodWait(t *testing.T) {
+	var mu sync.Mutex
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(*telego.SendMessageParams) (*telego.Message, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if calls == 1 {
+				return nil, &ta.Error{ErrorCode: 429, Parameters: &ta.ResponseParameters{RetryAfter: 1}}
+			}
+			return &telego.Message{MessageID: calls}, nil
+		},
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+
+	text := strings.Repeat("word ", 1500) // two chunks
+	require.NoError(t, sendText(ctx, api, discardLog(), "100", "", text, ""))
+	assert.Equal(t, 3, calls, "429 retry plus two chunks")
+}
+
+// --- incomplete reply notice ------------------------------------------------
+
+func TestSendText_MidReplyFailureSendsIncompleteNotice(t *testing.T) {
+	calls := 0
+	api := &fakeBotAPI{
+		sendFunc: func(*telego.SendMessageParams) (*telego.Message, error) {
+			calls++
+			if calls == 2 {
+				return nil, &ta.Error{ErrorCode: 403, Description: "Forbidden"}
+			}
+			return &telego.Message{MessageID: calls}, nil
+		},
+	}
+	var buf bytes.Buffer
+	log := slog.New(slog.NewTextHandler(&buf, nil))
+
+	text := strings.Repeat("word ", 1500) // two chunks
+	err := sendText(context.Background(), api, log, "100", "42", text, "")
+	require.Error(t, err)
+
+	last := api.lastSent()
+	require.NotNil(t, last)
+	assert.Equal(t, incompleteReplyNotice, last.Text)
+	assert.Equal(t, 42, last.MessageThreadID, "the notice must stay in the reply's topic")
+	assert.Contains(t, buf.String(), "reply incomplete")
+}
+
+func TestSendText_FirstChunkFailureSendsNoNotice(t *testing.T) {
+	api := &fakeBotAPI{
+		sendFunc: func(*telego.SendMessageParams) (*telego.Message, error) {
+			return nil, &ta.Error{ErrorCode: 403, Description: "Forbidden"}
+		},
+	}
+	require.Error(t, sendText(context.Background(), api, discardLog(), "100", "", "hello", ""))
+	assert.Len(t, api.sent, 1, "nothing was delivered, so there is nothing to mark incomplete")
 }

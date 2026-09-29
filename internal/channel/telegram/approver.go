@@ -371,11 +371,7 @@ func (a *Approver) authorized(chat telego.Chat, userID int64) bool {
 	if !ok {
 		return false
 	}
-	allow := group.AllowFrom
-	if len(allow) == 0 {
-		allow = a.cfg.AllowFrom
-	}
-	return containsID(allow, userID)
+	return containsID(groupAllowFrom(a.cfg, group), userID)
 }
 
 func (a *Approver) answer(ctx context.Context, callbackQueryID, text string) {

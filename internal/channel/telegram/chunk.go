@@ -47,6 +47,17 @@ func split(text string, limit int) []string {
 			pieces = splitPlain(strings.Join(seg.lines, "\n"), limit)
 		}
 
+		if len(pieces) == 0 {
+			// A blank separator between two segments. It needs no chunk of
+			// its own and must not force a boundary: keep the blank line
+			// inside the pending chunk when it fits, so two short fences a
+			// blank line apart still share one message.
+			if havePending && len(pending)+1 <= limit {
+				pending += "\n"
+			}
+			continue
+		}
+
 		if len(pieces) != 1 {
 			// This segment needed splitting on its own: flush whatever
 			// small segments were pending (so they are not glued onto a

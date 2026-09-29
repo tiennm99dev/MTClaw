@@ -49,7 +49,6 @@ func TestJobsFromConfig_ConvertsEveryField(t *testing.T) {
 	assert.True(t, p.Enabled)
 	assert.False(t, p.Ephemeral)
 	assert.Equal(t, 90*time.Second, p.Timeout)
-	assert.Equal(t, "telegram", p.DeliverTo.Channel)
 	assert.Equal(t, "123", p.DeliverTo.ChatID)
 	assert.Equal(t, "job:persistent-job", p.chatID())
 

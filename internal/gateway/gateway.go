@@ -76,7 +76,7 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 
 	st, err := store.Open(context.Background(), cfg.Storage, false)
 	if err != nil {
-		release()
+		_ = release()
 		return nil, fmt.Errorf("gateway: open store: %w", err)
 	}
 
@@ -101,7 +101,7 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 	client, err := openai.New(cfg.OpenAI)
 	if err != nil {
 		st.Close()
-		release()
+		_ = release()
 		return nil, fmt.Errorf("gateway: build openai client: %w", err)
 	}
 
@@ -116,7 +116,7 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 	tgChannel, err := telegram.New(&cfg, st.Approvals(), deps, log)
 	if err != nil {
 		st.Close()
-		release()
+		_ = release()
 		return nil, fmt.Errorf("gateway: build telegram channel: %w", err)
 	}
 
@@ -129,7 +129,7 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 	registry, err := tools.New(cfg, st, mux, log)
 	if err != nil {
 		st.Close()
-		release()
+		_ = release()
 		return nil, fmt.Errorf("gateway: build tool registry: %w", err)
 	}
 
@@ -146,7 +146,7 @@ func New(cfg config.Config, log *slog.Logger) (*Gateway, error) {
 			// a Config value can reach here; this is a defensive
 			// last-resort, not the primary check.
 			st.Close()
-			release()
+			_ = release()
 			return nil, fmt.Errorf("gateway: cron.timezone: %w", err)
 		}
 		sched = cron.New(cron.JobsFromConfig(cfg.Cron), loc, st.CronRuns(), st.Sessions(), disp.dispatch, log, nil)

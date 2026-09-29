@@ -15,7 +15,6 @@ import (
 // internal/cron's scheduler is the one caller that sets it: a scheduled
 // prompt has no triggering chat at all, only a configured delivery target.
 type DeliverTarget struct {
-	Channel  string
 	ChatID   string
 	ThreadID string
 }
@@ -27,7 +26,6 @@ type Inbound struct {
 	Channel   string
 	ChatID    string
 	ThreadID  string
-	UserID    string
 	Text      string
 	MessageID string
 

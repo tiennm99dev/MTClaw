@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 	"strings"
@@ -29,6 +30,23 @@ const maxSendAttempts = 5
 // retrying a 5xx response once.
 const transientRetryDelay = 1 * time.Second
 
+// maxRetryAfter caps how long sendOne will wait out a 429's retry_after. A
+// longer flood ban is returned to the caller as an error instead of holding
+// a reply (and everything chained behind it) for minutes.
+const maxRetryAfter = 60 * time.Second
+
+// retryAfterHeadroom is the time sendOne keeps available for the retried
+// request, and for the remaining chunks of a reply, after a flood wait that
+// outlasts the caller's own deadline.
+const retryAfterHeadroom = 30 * time.Second
+
+// incompleteReplyNotice is the best-effort one-liner sent when a reply
+// stops after some, but not all, of its chunks were delivered.
+const incompleteReplyNotice = "(the reply above is incomplete: the rest could not be delivered)"
+
+// incompleteNoticeTimeout bounds that notice's own send.
+const incompleteNoticeTimeout = 5 * time.Second
+
 // htmlPart is one Telegram HTML string guaranteed to fit within the caller's
 // byte limit, paired with the plain-text source it was rendered from -
 // sendOne falls back to plain on an HTML parse-mode rejection instead of
@@ -40,13 +58,14 @@ type htmlPart struct {
 
 // sendText chunks text (see split), renders each chunk to Telegram HTML
 // (see renderHTML), and sends the result serially, falling back to no
-// parse_mode on an HTTP 400 that names parsing (or the message being too
-// long) as the problem. Only the first part carries replyTo, since a
-// multi-part reply is one logical message split across several Telegram
-// messages, not a chain of independent quotes. threadID, when non-empty, is
-// applied to every part so a forum-topic reply stays entirely inside its
-// topic.
-func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo string) error {
+// parse_mode on an HTTP 400 (see sendOne). If a chunk fails after an earlier
+// one was delivered, it makes one best-effort attempt to tell the chat the
+// reply is incomplete, and logs that. Only the first part carries replyTo,
+// since a multi-part reply is one logical message split across several
+// Telegram messages, not a chain of independent quotes. threadID, when
+// non-empty, is applied to every part so a forum-topic reply stays entirely
+// inside its topic.
+func sendText(ctx context.Context, api botAPI, log *slog.Logger, chatID, threadID, text, replyTo string) error {
 	if text == "" {
 		return nil
 	}
@@ -57,6 +76,15 @@ func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo s
 	tid := parseThreadID(threadID)
 
 	parts := renderChunks(text, DefaultChunkLimit)
+
+	// A flood wait can extend ctx (see sendOne); release those extensions
+	// when the reply is done.
+	var releases []context.CancelFunc
+	defer func() {
+		for _, release := range releases {
+			release()
+		}
+	}()
 
 	for i, part := range parts {
 		params := tu.Message(tu.ID(id), part.html).WithParseMode(telego.ModeHTML)
@@ -72,17 +100,50 @@ func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo s
 			}
 		}
 
-		if _, err := sendOne(ctx, api, params, part.plain); err != nil {
-			return fmt.Errorf("telegram: send chunk %d/%d: %w", i+1, len(parts), err)
+		_, sendCtx, release, err := sendOneExtending(ctx, api, params, part.plain)
+		if release != nil {
+			releases = append(releases, release)
+		}
+		ctx = sendCtx
+		if err != nil {
+			err = fmt.Errorf("telegram: send chunk %d/%d: %w", i+1, len(parts), err)
+			if i > 0 {
+				notifyIncomplete(ctx, api, log, id, tid, err)
+			}
+			return err
 		}
 
 		if i < len(parts)-1 {
 			if !sleepCtx(ctx, interChunkDelay) {
-				return ctx.Err()
+				err := ctx.Err()
+				notifyIncomplete(ctx, api, log, id, tid, err)
+				return err
 			}
 		}
 	}
 	return nil
+}
+
+// notifyIncomplete makes one best-effort attempt to tell the chat that a
+// reply stopped after some of its chunks were delivered, and logs the
+// outcome either way. It runs on a fresh short deadline detached from ctx,
+// which by now may already be expired, but is skipped after an outright
+// cancellation: that is a shutdown or /stop, where the user already knows.
+func notifyIncomplete(ctx context.Context, api botAPI, log *slog.Logger, chatID int64, threadID int, cause error) {
+	if errors.Is(cause, context.Canceled) {
+		return
+	}
+	noticeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), incompleteNoticeTimeout)
+	defer cancel()
+	params := tu.Message(tu.ID(chatID), incompleteReplyNotice)
+	if threadID != 0 {
+		params = params.WithMessageThreadID(threadID)
+	}
+	if _, err := api.SendMessage(noticeCtx, params); err != nil {
+		log.Error("telegram: reply incomplete and the notice failed too", "chat_id", chatID, "error", cause, "notice_error", err)
+		return
+	}
+	log.Error("telegram: reply incomplete; sent a notice", "chat_id", chatID, "error", cause)
 }
 
 // renderChunks splits text into markdown-source chunks (split) and renders
@@ -93,9 +154,9 @@ func sendText(ctx context.Context, api botAPI, chatID, threadID, text, replyTo s
 // part with no visible content once its tags are stripped (an empty fence
 // "```\n```", or a hard-cut piece that landed on whitespace) is dropped
 // instead of sent: Telegram rejects it with a 400 "message text is empty",
-// whose description names neither "parse" nor "too long", so nothing in
-// sendOne would otherwise recover from it, and every chunk after it in the
-// reply would be silently dropped along with it.
+// which sendOne's plain-text fallback cannot recover from (the plain text is
+// empty too), and every chunk after it in the reply would be dropped along
+// with it.
 func renderChunks(text string, limit int) []htmlPart {
 	var out []htmlPart
 	for _, chunk := range split(text, limit) {
@@ -227,7 +288,8 @@ func hardCutHTMLParts(chunk string, limit int) []htmlPart {
 }
 
 // sendOne sends one already-built SendMessageParams, retrying on a 429 by
-// honoring retry_after, retrying once on a 5xx API error, and falling back
+// honoring retry_after (up to maxRetryAfter), retrying once on a 5xx API
+// error, and falling back
 // to plain (unescaped, no parse_mode) text on any HTTP 400 while parse_mode
 // is set - the model's output is not reliably valid HTML (an unbalanced or
 // unsupported tag nesting, an href Telegram's parser happens to reject),
@@ -248,18 +310,57 @@ func hardCutHTMLParts(chunk string, limit int) []htmlPart {
 // idempotency key - retrying would risk sending the same message, or the
 // same approval prompt, twice.
 func sendOne(ctx context.Context, api botAPI, params *telego.SendMessageParams, plain string) (*telego.Message, error) {
+	msg, _, release, err := sendOneExtending(ctx, api, params, plain)
+	if release != nil {
+		release()
+	}
+	return msg, err
+}
+
+// sendOneExtending is sendOne, additionally returning the context the send
+// finished on and, when it had to be extended, the func that releases it.
+// A 429 whose retry_after outlasts ctx's deadline extends the deadline
+// instead of failing the reply: the caller's budget was sized for a normal
+// send, not for a flood wait Telegram explicitly asked for. The extended
+// context drops ctx's cancellation (only its deadline is being overridden),
+// which is fine for replies - their contexts are already detached from
+// shutdown - and is bounded by maxRetryAfter plus retryAfterHeadroom. The
+// caller keeps sending its remaining chunks on the returned context.
+func sendOneExtending(ctx context.Context, api botAPI, params *telego.SendMessageParams, plain string) (*telego.Message, context.Context, context.CancelFunc, error) {
+	var releases []context.CancelFunc
+	release := func() {
+		for _, r := range releases {
+			r()
+		}
+	}
+	done := func(msg *telego.Message, err error) (*telego.Message, context.Context, context.CancelFunc, error) {
+		if len(releases) == 0 {
+			return msg, ctx, nil, err
+		}
+		return msg, ctx, release, err
+	}
+
 	transientRetried := false
 	for attempt := 0; attempt < maxSendAttempts; attempt++ {
 		msg, err := api.SendMessage(ctx, params)
 		if err == nil {
-			return msg, nil
+			return done(msg, nil)
 		}
 
 		var apiErr *ta.Error
 		if errors.As(err, &apiErr) {
 			if apiErr.ErrorCode == http.StatusTooManyRequests && apiErr.Parameters != nil && apiErr.Parameters.RetryAfter > 0 {
-				if !sleepCtx(ctx, time.Duration(apiErr.Parameters.RetryAfter)*time.Second) {
-					return nil, ctx.Err()
+				wait := time.Duration(apiErr.Parameters.RetryAfter) * time.Second
+				if wait > maxRetryAfter {
+					return done(nil, err)
+				}
+				if dl, ok := ctx.Deadline(); ok && time.Until(dl) < wait+retryAfterHeadroom && ctx.Err() == nil {
+					extended, cancel := context.WithTimeout(context.WithoutCancel(ctx), wait+retryAfterHeadroom)
+					releases = append(releases, cancel)
+					ctx = extended
+				}
+				if !sleepCtx(ctx, wait) {
+					return done(nil, ctx.Err())
 				}
 				continue
 			}
@@ -273,14 +374,14 @@ func sendOne(ctx context.Context, api botAPI, params *telego.SendMessageParams, 
 			if apiErr.ErrorCode >= http.StatusInternalServerError && !transientRetried && ctx.Err() == nil {
 				transientRetried = true
 				if !sleepCtx(ctx, transientRetryDelay) {
-					return nil, ctx.Err()
+					return done(nil, ctx.Err())
 				}
 				continue
 			}
 		}
-		return nil, err
+		return done(nil, err)
 	}
-	return nil, fmt.Errorf("telegram: exceeded %d send attempts", maxSendAttempts)
+	return done(nil, fmt.Errorf("telegram: exceeded %d send attempts", maxSendAttempts))
 }
 
 // sleepCtx waits for d or ctx cancellation, whichever comes first,

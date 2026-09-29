@@ -40,6 +40,15 @@ type progressReporter struct {
 	stopTyping chan struct{}
 	typingDone chan struct{}
 
+	// noticeCtx bounds slow-tool notice sends and is canceled by stop, so a
+	// notice send still in flight is aborted rather than awaited. noticeMu
+	// serializes those sends against stop: once stop has returned, no
+	// notice is in flight and none can start - see onEvent.
+	noticeCtx    context.Context
+	noticeCancel context.CancelFunc
+	noticeMu     sync.Mutex
+	stopped      bool // guarded by noticeMu
+
 	mu    sync.Mutex
 	timer map[string]*time.Timer // toolCallID -> pending slow-notice timer
 }
@@ -48,7 +57,10 @@ type progressReporter struct {
 // it issues, so a canceled turn stops producing typing/notice traffic
 // promptly instead of lingering.
 func newProgressReporter(ctx context.Context, ch Channel, chatID, threadID string, log *slog.Logger) *progressReporter {
+	noticeCtx, noticeCancel := context.WithCancel(ctx)
 	return &progressReporter{
+		noticeCtx:       noticeCtx,
+		noticeCancel:    noticeCancel,
 		ctx:             ctx,
 		ch:              ch,
 		chatID:          chatID,
@@ -84,10 +96,16 @@ func (p *progressReporter) start() {
 }
 
 // stop ends the typing-refresh loop and cancels any pending slow-tool
-// notice timers that never fired.
+// notice timers that never fired. When it returns, no notice is in flight
+// and none will start, so nothing can be sent after the turn's reply.
 func (p *progressReporter) stop() {
 	close(p.stopTyping)
 	<-p.typingDone
+
+	p.noticeCancel() // abort a notice send already in flight, so the lock below is quick
+	p.noticeMu.Lock()
+	p.stopped = true
+	p.noticeMu.Unlock()
 
 	p.mu.Lock()
 	for id, t := range p.timer {
@@ -102,16 +120,17 @@ func (p *progressReporter) onEvent(ev agent.Event) {
 	switch ev.Kind {
 	case agent.EventToolStarted:
 		timer := time.AfterFunc(p.slowNoticeDelay, func() {
-			select {
-			case <-p.ctx.Done():
-				// The turn ended (and stop() already tried to cancel this
-				// timer) between it firing and this closure actually
-				// running - do not send a "running X..." notice after the
-				// turn's own reply already went out.
+			// Time.Stop does not wait for a callback that already started,
+			// so stop() may have run between this timer firing and this
+			// closure getting here. noticeMu makes that ordering decisive:
+			// either the notice is sent before stop() returns, or it is not
+			// sent at all - never after the turn's own reply.
+			p.noticeMu.Lock()
+			defer p.noticeMu.Unlock()
+			if p.stopped || p.ctx.Err() != nil {
 				return
-			default:
 			}
-			if err := p.ch.Send(p.ctx, p.chatID, p.threadID, fmt.Sprintf("running `%s`...", ev.ToolName), ""); err != nil {
+			if err := p.ch.Send(p.noticeCtx, p.chatID, p.threadID, fmt.Sprintf("running `%s`...", ev.ToolName), ""); err != nil {
 				p.log.Debug("gateway: send slow-tool notice failed", "tool", ev.ToolName, "error", err)
 			}
 		})

@@ -72,7 +72,7 @@ type Telegram struct {
 	mu            sync.Mutex
 	queue         []map[string]any // each already carries its own "update_id"
 	nextUpdateID  int
-	nextMessageID int
+	lastMessageID int
 	calls         []Call
 	failNextSend  *telegramFailSpec
 	wake          chan struct{} // closed and replaced on every Push, to wake a blocked getUpdates
@@ -122,7 +122,7 @@ func (s *Telegram) Push(u telego.Update) {
 	if err := json.Unmarshal(raw, &body); err != nil {
 		panic(fmt.Sprintf("fakeapi: decode pushed update: %v", err))
 	}
-	s.pushLocked(body)
+	s.push(body)
 }
 
 // PushMessage enqueues a plain inbound text message from a private chat -
@@ -130,7 +130,7 @@ func (s *Telegram) Push(u telego.Update) {
 func (s *Telegram) PushMessage(chatID, userID int64, text string) {
 	s.Push(telego.Update{
 		Message: &telego.Message{
-			MessageID: s.nextMessageIDLocked(),
+			MessageID: s.nextMessageID(),
 			Date:      time.Now().Unix(),
 			Chat:      telego.Chat{ID: chatID, Type: "private"},
 			From:      &telego.User{ID: userID, FirstName: "Test User"},
@@ -150,13 +150,8 @@ func (s *Telegram) PushMessage(chatID, userID int64, text string) {
 // round-trips through getUpdates' response body and back into the real
 // telego client.
 func (s *Telegram) PushCallback(chatID, userID int64, data string, replyToMessageID int) {
-	s.mu.Lock()
-	id := s.nextUpdateID + 1
-	s.mu.Unlock()
-
-	s.pushLocked(map[string]any{
+	s.push(map[string]any{
 		"callback_query": map[string]any{
-			"id":   fmt.Sprintf("cbq-%d", id),
 			"from": map[string]any{"id": userID, "is_bot": false, "first_name": "Test User"},
 			"message": map[string]any{
 				"message_id": replyToMessageID,
@@ -169,8 +164,10 @@ func (s *Telegram) PushCallback(chatID, userID int64, data string, replyToMessag
 	})
 }
 
-// pushLocked assigns the next update_id to body and appends it to the
-// queue, waking any getUpdates call currently blocked waiting for one.
+// push assigns the next update_id to body (and, for a callback query, the
+// matching callback id, so a concurrent push can never mislabel it) and
+// appends it to the queue, waking any getUpdates call currently blocked
+// waiting for one. It takes s.mu itself.
 // update_id is stored as float64, not int, so it has the exact same
 // dynamic type numericField later reads back - encoding/json decodes every
 // JSON number into a float64 when the target is `any` (the shape a real
@@ -178,28 +175,32 @@ func (s *Telegram) PushCallback(chatID, userID int64, data string, replyToMessag
 // that same type for every queued update, including ones (like
 // PushCallback's) that were never round-tripped through json.Unmarshal at
 // all.
-func (s *Telegram) pushLocked(body map[string]any) {
+func (s *Telegram) push(body map[string]any) {
 	s.mu.Lock()
 	s.nextUpdateID++
 	body["update_id"] = float64(s.nextUpdateID)
+	if cq, ok := body["callback_query"].(map[string]any); ok {
+		cq["id"] = fmt.Sprintf("cbq-%d", s.nextUpdateID)
+	}
 	s.queue = append(s.queue, body)
 	close(s.wake)
 	s.wake = make(chan struct{})
 	s.mu.Unlock()
 }
 
-func (s *Telegram) nextMessageIDLocked() int {
+// nextMessageID returns the next sequential message_id, taking s.mu itself.
+func (s *Telegram) nextMessageID() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.nextMessageID++
-	return s.nextMessageID
+	s.lastMessageID++
+	return s.lastMessageID
 }
 
 // FailNextSendMessage arms a one-shot failure: the next sendMessage call
 // (and only that one) answers {"ok":false,"error_code":code,"description":desc}
 // instead of the usual echoed Message. It exists to exercise the
-// MarkdownV2-to-plain-text fallback in internal/channel/telegram/send.go,
-// which only triggers on an HTTP 400 whose description contains "parse".
+// parse-mode-to-plain-text fallback in internal/channel/telegram/send.go,
+// which triggers on any HTTP 400 while parse_mode is set.
 func (s *Telegram) FailNextSendMessage(code int, desc string) {
 	s.mu.Lock()
 	s.failNextSend = &telegramFailSpec{code: code, desc: desc}
@@ -339,7 +340,7 @@ func (s *Telegram) handleSendMessage(w http.ResponseWriter, body map[string]any)
 	}
 
 	writeResult(w, map[string]any{
-		"message_id": s.nextMessageIDLocked(),
+		"message_id": s.nextMessageID(),
 		"date":       time.Now().Unix(),
 		"chat":       map[string]any{"id": ChatIDFromBody(body), "type": "private"},
 		"text":       body["text"],

@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"time"
@@ -26,6 +27,12 @@ import (
 // enough to avoid hammering the API with empty polls, short enough to
 // notice a shutdown promptly.
 const longPollTimeoutSeconds = 30
+
+// apiRequestTimeout bounds every Bot API request, including the long poll,
+// so it must exceed longPollTimeoutSeconds. The HTTP client (unlike
+// telego's default fasthttp one) also aborts a request the moment its
+// context is canceled, which is what makes shutdown and /stop prompt.
+const apiRequestTimeout = 60 * time.Second
 
 var _ channel.Channel = (*Channel)(nil)
 
@@ -58,7 +65,7 @@ type Channel struct {
 // every one-shot call site, which never runs long enough to need a poll
 // failure logged.
 func newBot(token, apiBaseURL string, logger telego.BotOption) (*telego.Bot, error) {
-	opts := []telego.BotOption{logger}
+	opts := []telego.BotOption{logger, telego.WithAPICaller(newAPICaller(&http.Client{Timeout: apiRequestTimeout}))}
 	if apiBaseURL != "" {
 		opts = append(opts, telego.WithAPIServer(apiBaseURL))
 	}
@@ -129,7 +136,7 @@ func SendOnce(ctx context.Context, token, apiBaseURL, chatID, threadID, text str
 	if err != nil {
 		return err
 	}
-	return sendText(ctx, bot, chatID, threadID, text, "")
+	return sendText(ctx, bot, slog.Default(), chatID, threadID, text, "")
 }
 
 // GetMe returns a one-shot bot's username, used by `mtclaw doctor`'s
@@ -159,7 +166,7 @@ func (c *Channel) Approver() tools.Approver { return c.approver }
 // Send delivers text to chatID, chunked and rendered as Telegram HTML with
 // a plain-text fallback on a parse-mode rejection; see send.go.
 func (c *Channel) Send(ctx context.Context, chatID, threadID, text, replyTo string) error {
-	return sendText(ctx, c.api, chatID, threadID, text, replyTo)
+	return sendText(ctx, c.api, c.log, chatID, threadID, text, replyTo)
 }
 
 // SendTyping issues one "typing" chat action. Telegram's indicator expires

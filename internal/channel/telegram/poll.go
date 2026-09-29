@@ -91,7 +91,6 @@ func (c *Channel) handleMessage(ctx context.Context, msg *telego.Message, out ch
 		Channel:   c.Name(),
 		ChatID:    chatID,
 		ThreadID:  threadID,
-		UserID:    strconv.FormatInt(fromID, 10),
 		Text:      cleanText,
 		MessageID: strconv.Itoa(msg.MessageID),
 	}

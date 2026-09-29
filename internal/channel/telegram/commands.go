@@ -30,8 +30,8 @@ var commands = [...]botCommand{
 	{"stop", "Cancel the in-flight turn, if any"},
 }
 
-// isCommand reports whether name is one of commands, and known's caller
-// treats an unmatched name as ordinary text instead.
+// isCommand reports whether name is one of commands; the caller treats an
+// unmatched name as ordinary text instead.
 func isCommand(name string) bool {
 	for _, c := range commands {
 		if c.name == name {

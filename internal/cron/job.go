@@ -46,7 +46,7 @@ func JobsFromConfig(cfg config.CronConfig) []Job {
 			Enabled:   j.Enabled,
 			Ephemeral: j.Session == "ephemeral",
 			Timeout:   j.Timeout.Std(),
-			DeliverTo: channel.DeliverTarget{Channel: j.DeliverTo.Channel, ChatID: j.DeliverTo.ChatID},
+			DeliverTo: channel.DeliverTarget{ChatID: j.DeliverTo.ChatID},
 		})
 	}
 	return jobs
