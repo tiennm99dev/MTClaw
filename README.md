@@ -28,7 +28,7 @@ toolchain that is already at least 1.25.7). No Go toolchain is required if
 you download a release binary.
 
 **From a release** (no Go toolchain needed): download the `mtclaw` binary for
-your OS/arch from the [releases page](https://github.com/tiennm99dev/MTClaw/releases)
+your OS/arch from the [releases page](https://github.com/tiennm99dev/mtclaw/releases)
 (bare binaries, not archives), verify it against the accompanying
 `SHA256SUMS`, and put it on your `PATH`. Release files are named
 `mtclaw-<tag>-<os>-<arch>` (`.exe` on Windows); rename yours to `mtclaw` and
@@ -38,7 +38,7 @@ nothing yet, build from source.
 **From source:**
 
 ```sh
-git clone https://github.com/tiennm99dev/MTClaw.git
+git clone https://github.com/tiennm99dev/mtclaw.git
 cd MTClaw
 make build      # -> bin/mtclaw, version-stamped from git
 ```
@@ -51,7 +51,7 @@ go install github.com/tiennm99/MTClaw@latest
 
 The module's import path is `github.com/tiennm99/MTClaw` - a different
 owner than the repo actually lives under
-(`github.com/tiennm99dev/MTClaw`, see the clone URL above). `go install`
+(`github.com/tiennm99dev/mtclaw`, see the clone URL above). `go install`
 resolves the import path through GitHub's own repo-rename redirect, which
 works today but is a redirect this project does not control; if it is ever
 missed, clone or download a release instead. `go install` also reports a
